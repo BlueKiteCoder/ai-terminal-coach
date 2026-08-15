@@ -1,0 +1,11 @@
+/target/
+/dist/
+.DS_Store
+.env
+.env.*
+*.log
+*.pid
+*.sock
+*.key
+*.pem
+config.toml

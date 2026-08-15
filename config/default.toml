@@ -1,0 +1,59 @@
+[ai]
+provider = "disabled"
+base_url = ""
+api_key_env = "AI_COACH_API_KEY"
+temperature = 0.2
+max_concurrent_requests = 4
+
+[ai.models]
+completion = ""
+error_analysis = ""
+chat = ""
+
+[ai.timeouts_ms]
+completion = 2500
+error_analysis = 12000
+chat = 90000
+
+[coach]
+language = "en-US"
+inline_hint = true
+auto_error_analysis = true
+
+[keybindings]
+completion = "^[\\t"
+chat = "^[/"
+toggle_coach = "Option+Space"
+
+[safety]
+enabled = true
+mode = "warn"
+
+[privacy]
+redaction = true
+capture_screen_tail = false
+redact_api_keys = true
+redact_tokens = true
+redact_passwords = true
+redact_authorization = true
+redact_cookies = true
+redact_private_keys = true
+redact_env_values = true
+replacement = "[REDACTED]"
+extra_patterns = []
+
+[context]
+max_commands = 30
+max_output_per_command = 20000
+max_total_chars = 100000
+
+[history]
+enabled = true
+max_messages = 50
+
+[window]
+width = 100
+height = 32
+x = 120
+y = 90
+terminal = "auto"

@@ -1,0 +1,408 @@
+# AI Terminal Coach
+
+[English](#english-overview) · [简体中文](#ai-terminal-coach)
+
+AI Terminal Coach 是一个只面向 macOS/Zsh 的终端协作层。它不替代 Terminal，
+不截获 Enter，也不自动执行 AI 建议；它通过 ZLE、Zsh hooks、Unix Domain
+Socket daemon 和独立 Ratatui 窗口，寄生在现有终端工作流中。
+
+```text
+Terminal.app / iTerm2 / 其他 macOS 终端
+                  │
+             Zsh + ZLE hooks
+                  │  ~/.aicoach/run/aicoach.sock
+                  ▼
+              aicoachd
+      ┌───────────┼────────────┐
+ Local Analyzer  Safety     Context
+      │            │            │
+      └──────── OpenAI-compatible API
+                  │
+              aicoach-ui
+```
+
+项目不是学习系统：没有评分、课程、复习、能力画像或知识数据库。
+
+## 功能
+
+- `preexec`/`precmd` 捕获命令、退出码、cwd 和耗时；后台异步分析，不阻塞
+  Prompt。
+- ZLE `Option+Tab` 读取并修改 `BUFFER`/`CURSOR`；用户继续输入会取消旧请求，
+  结果只有在 Buffer 未变化时才应用。
+- 在当前输入行写下问题后按 `Option+/`，把该 Buffer 作为问题发送；不会把问题
+  当作 Shell 命令执行。
+- `Option+Space` 在原终端和独立 Coach TUI 之间切换。
+- 本地分析 command-not-found、权限、文件、Git、Docker、网络、编译、SSH、包
+  管理器和拼写错误。普通成功命令不调用 AI。
+- 本地 Safety Engine 分级识别 `rm -rf /`、根目录/家目录递归删除、`mkfs`、
+  `dd`、`diskutil eraseDisk`、`git reset --hard`、`git clean -fd`、SQL DROP、
+  `chmod -R 777`、强制 kill、fork bomb、下载后直接 pipe 到 shell 等。当前行为是
+  warn；永远不代替用户执行。
+- 每个终端有独立 UUID session，独立维护最近命令、输出摘要、cwd、聊天和活动
+  请求。Context 使用字符预算、单命令预算，并按时间淘汰最旧记录；daemon 对断开的
+  session 实施一小时 TTL 和 64 个近期 session 的 LRU 上限，仍连接的 session 不淘汰。
+- OpenAI-compatible Provider 支持完整回复、SSE streaming、结构化 completion/
+  analysis、独立 fast/smart 模型、超时、并发限制、取消和有限瞬态重试。
+- 默认对 API 上行内容启用 API key/token/password/Authorization/Cookie/JWT/
+  private key/SSH key/敏感环境变量脱敏；可以关闭。
+- Provider 不可用时 daemon 自动进入 local-only 模式，Zsh 完全正常工作。
+- 界面状态、本地分析和 AI 回复支持英文与中文；全新安装默认英文。
+
+## 系统要求
+
+- macOS 13 或更新版本（Apple Silicon 与 Intel 均可由 Rust 原生构建）
+- Zsh 5.8+
+- Rust 1.85+（仅源码构建）
+- Terminal.app 或 iTerm2 可获得最佳 Coach 窗口体验
+
+核心 Shell 功能只依赖 Zsh，因此 Warp、Alacritty、Kitty、WezTerm 也可使用命令
+分析、AI completion 和快捷问答；独立窗口会回退到 Terminal.app。
+
+## 从源码安装
+
+```zsh
+cargo build --release --locked
+mkdir -p ~/.local/bin
+install -m 0755 target/release/aicoach ~/.local/bin/aicoach
+install -m 0755 target/release/aicoachd ~/.local/bin/aicoachd
+install -m 0755 target/release/aicoach-ui ~/.local/bin/aicoach-ui
+if scripts/build-macos-helper.sh target/release/aicoach-hotkey; then
+  install -m 0755 target/release/aicoach-hotkey ~/.local/bin/aicoach-hotkey
+else
+  print '未安装可选全局快捷键 helper；终端内 Option+Space 仍可用。'
+fi
+export PATH="$HOME/.local/bin:$PATH"
+aicoach install
+```
+
+请确保 `~/.local/bin` 永久位于 `PATH`（例如在 `.zshrc` 中设置）；全局快捷键 helper
+是可选项，缺少 Xcode Command Line Tools 不会影响 daemon、ZLE 或 TUI 核心功能。
+
+`aicoach install` 会：
+
+1. 创建 owner-only 的 `~/.config/aicoach` 与 `~/.aicoach`；
+2. 创建默认配置；
+3. 复制 Zsh/JXA 集成资源；
+4. 首次修改前备份 `~/.zshrc` 为 `~/.zshrc.aicoach.backup`；
+5. 幂等地加入一个有边界标记的 source block；
+6. 安装 LaunchAgent 并启动 daemon。
+
+重复执行不会重复修改 `.zshrc`。安装后打开新 Zsh，或：
+
+```zsh
+source ~/.config/aicoach/aicoach.zsh
+```
+
+## API Provider、语言与密钥
+
+仓库不内置 API endpoint、模型或密钥。默认配置为 `provider = "disabled"`，仅运行
+本地分析和安全检查，不会向外部服务发送任何内容：
+
+```toml
+[ai]
+provider = "disabled"
+base_url = ""
+api_key_env = "AI_COACH_API_KEY"
+
+[ai.models]
+completion = ""
+error_analysis = ""
+chat = ""
+
+[coach]
+language = "en-US"
+```
+
+启用兼容服务时，编辑 `~/.config/aicoach/config.toml`，一次性填写服务地址和当前账号
+有权使用的三个模型，再将 provider 改为 `openai-compatible`：
+
+```toml
+[ai]
+provider = "openai-compatible"
+base_url = "https://provider.example/v1"
+
+[ai.models]
+completion = "your-completion-model"
+error_analysis = "your-analysis-model"
+chat = "your-chat-model"
+```
+
+`base_url` 只是格式示例，不代表默认或推荐服务。项目的界面状态、本地分析和 AI
+回复支持英文与中文：`coach.language = "en-US"`（默认）或
+`coach.language = "zh-CN"`。例如切换到中文：
+
+```zsh
+aicoach config set coach.language zh-CN
+aicoach restart
+source ~/.config/aicoach/aicoach.zsh
+```
+
+切回英文时把 `zh-CN` 改为 `en-US`。新终端会自动读取最新语言设置。
+
+模型必须是当前 key 已授权的模型 ID。服务方通常提供接口或控制台列出授权模型。
+推荐把 key 放进 macOS Keychain，避免写进 `.zshrc`、TOML 或 shell history：
+
+```zsh
+aicoach config set-key
+aicoach restart
+```
+
+命令会让 `/usr/bin/security` 在终端中安全读取密钥；值不会进入命令行参数、项目
+文件或日志。删除：
+
+```zsh
+aicoach config delete-key
+```
+
+删除命令会自动刷新正在运行的 daemon，确保旧进程不继续持有该凭据。
+
+临时运行也可使用环境变量。为避免密钥进入 shell history，先关闭当前命令的历史
+记录，再在交互提示中输入（或使用 Keychain 方案）：
+
+```zsh
+read -rs 'AI_COACH_API_KEY?API key: '; print
+export AI_COACH_API_KEY
+aicoach restart
+unset AI_COACH_API_KEY
+```
+
+支持 OpenAI、DeepSeek、OpenRouter、Ollama、LM Studio 及其他兼容
+`/chat/completions` 服务：修改 `base_url` 和三个模型即可；不校验密钥的本地服务
+仍需给 `api_key_env` 设置任意非空占位值。Local-only：
+
+```zsh
+aicoach config set ai.provider disabled
+aicoach restart
+```
+
+## 快捷键
+
+| 位置 | 默认键 | 行为 |
+|---|---|---|
+| Zsh | `Option+Tab` | AI 补全/纠错/自然语言转命令，只改 Buffer |
+| Zsh | `Option+/` | 把当前 Buffer 作为问题发送并清空输入行 |
+| Zsh | `Option+Space` | 显示/隐藏 Coach 窗口 |
+| TUI | `Esc` | 返回原终端 |
+| TUI | `Option+I` | 把明确选中的建议插入原终端 Buffer，并自动返回终端 |
+| TUI | `Option+Y` | 复制所选建议 |
+| TUI | `↑/↓` | 选择建议 |
+| TUI | `Ctrl+Q` | 退出窗口 |
+
+macOS 终端需将 Option 配置为 Meta/Esc 前缀。若快捷键冲突，可在 source 之前覆盖：
+
+```zsh
+export AICOACH_COMPLETION_KEY=$'^G'
+export AICOACH_CHAT_KEY=$'^@'
+```
+
+原生 `Tab`、Enter、Ctrl-R、history、Zsh completion 均未替换。集成文件应在
+Oh My Zsh、Powerlevel10k/Starship、autosuggestions 和 syntax-highlighting 之后
+source；异步消息使用 `zle -I`、`reset-prompt`、`redisplay` 安全重绘。
+
+## 自然语言与补全示例
+
+```text
+docker ps --forma  + Option+Tab  → docker ps --format
+git pul origin main + Option+Tab → git pull origin main
+# 查看8080端口     + Option+Tab  → lsof -i :8080
+```
+
+结果结构固定为 `replace`、`insert` 或 `suggest`，不解析 Markdown 猜命令。任何
+结果都不会自动按 Enter。
+
+## Coach 窗口
+
+`aicoach-ui` 是纯 Ratatui/Crossterm 应用，不包含浏览器、Web server、Electron、
+Tauri、React 或 Vue。它自动挂到最近聚焦的 shell session，展示 cwd、最近命令、
+错误提示、建议和 streaming 对话。Chat history 默认每 session 保留 50 条，可关闭。
+
+Terminal.app/iTerm2 的窗口由 JXA (`osascript -l JavaScript`) 控制。用户可拖动、
+缩放；位置与尺寸保存在 owner-only 的 `~/.aicoach/window-state.json` 并在下次
+切换时恢复。仓库还包含 Swift/Carbon 全局 `Option+Space` helper；构建脚本在
+Swift 不可用时会回退到 Objective-C/AppKit 实现，ZLE 内的快捷键不依赖 helper。
+
+## 配置
+
+配置文件：`~/.config/aicoach/config.toml`。
+
+```zsh
+aicoach config show
+aicoach config path
+aicoach config validate
+aicoach config set privacy.redaction false
+aicoach config edit
+```
+
+Daemon 在启动时读取配置，修改 AI、隐私、上下文或 Coach 设置后请执行
+`aicoach restart`。快捷键和 Shell 本地开关由生成的 Zsh 设置加载，现有终端需重新
+`source ~/.config/aicoach/aicoach.zsh` 或打开新窗口。
+
+主要默认值见 [`config/default.toml`](config/default.toml)。上下文边界：
+
+```toml
+[context]
+max_commands = 30
+max_output_per_command = 20000
+max_total_chars = 100000
+```
+
+Daemon 不把完整 Terminal history 持久化；日志只记录请求类型、session/request ID、
+状态和错误种类，不记录命令输出、提示词、API key 或响应正文。
+
+## CLI
+
+```text
+aicoach install [--no-start] [--no-hotkey]
+aicoach uninstall [--purge]
+aicoach start | stop | restart | status [--json]
+aicoach doctor [--json]
+aicoach config show|path|validate|set|edit|set-key|delete-key
+aicoach logs [-n 100] [--follow]
+aicoach toggle [--session UUID] [--tty /dev/ttys001]
+```
+
+`uninstall` 保留配置和日志；只有显式 `--purge` 才删除它们，`.zshrc` 备份始终保留。
+
+## macOS 权限
+
+- Terminal.app/iTerm2 弹出/聚焦：首次使用可能需要在“系统设置 → 隐私与安全性 →
+  自动化”允许调用 Terminal/iTerm2。
+- JXA 查询前台窗口或可选全局 helper 可能需要“辅助功能”。拒绝权限不会影响 Shell
+  hooks、IPC 或 AI completion，只影响窗口切换。
+- Keychain：首次由 daemon wrapper 读取时 macOS 可能要求允许访问。不要选择允许
+  未知二进制访问。
+
+## 诊断与故障排查
+
+```zsh
+aicoach doctor
+aicoach status
+aicoach logs -n 200
+```
+
+- `AI credential ... is not set`：运行 `aicoach config set-key`。
+- `doctor` 默认是无网络诊断：它验证 Provider 配置和凭据是否就绪，但不会把终端
+  上下文发送到服务或主动探测模型；实际授权模型/网络状态在首次 AI 请求时确认。
+- AI 返回模型不存在：登录 Provider 查看当前 key 的授权模型，修改 `ai.models.*`。
+- `Option+…` 产生特殊字符：启用终端的 “Use Option as Meta key”。
+- `Option+Space` 被系统/其他应用占用：更换绑定或只使用终端局部快捷键。
+- API timeout：Shell 不会等待；completion 默认 2.5 秒，analysis 12 秒，chat 90 秒。
+- 交互程序（vim/ssh/python 等）：hook 只看到程序启动和最终退出，不截获内部按键。
+
+## Homebrew
+
+Formula 模板位于 [`homebrew/aicoach.rb`](homebrew/aicoach.rb)。公开仓库地址已经
+配置；创建签名、公证的 `v0.1.0` Release 后，仍需把 Formula 中的 tarball SHA256
+替换为真实值，再将 Formula 放入 tap：
+
+```zsh
+brew tap <owner>/aicoach
+brew install aicoach
+aicoach install
+```
+
+Homebrew 升级后请再次执行 `aicoach install`，刷新 LaunchAgent 指向当前 Cellar 版本
+的路径。
+
+无需二进制 Release，也可在本仓库检出目录中执行
+`brew install --HEAD ./homebrew/aicoach.rb` 从源码安装。
+
+## 开发、测试与发布
+
+```zsh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+zsh scripts/test-zsh-integration.zsh
+zsh scripts/benchmark-zsh-hooks.zsh
+cargo build --release --locked
+scripts/package-release.sh
+```
+
+测试覆盖 analyzer、safety、privacy、context、Git context、AI 合法/非法/缺字段
+JSON、timeout/cancel/retry/SSE、Unix socket、连接断开、多 session、请求取消、Zsh
+编码与 Buffer/CURSOR 修改。性能脚本实测 source、preexec、precmd，并强制本地 hook
+平均耗时低于 10ms。AI tests 使用本地 TCP mock，不调用真实 Provider。
+
+## 目录与架构
+
+```text
+crates/aicoach-core     配置、领域模型、本地分析、安全、隐私、上下文、Git
+crates/aicoach-ai       Provider trait、OpenAI-compatible JSON/SSE client
+crates/aicoach-ipc      NDJSON + Zsh tab/percent-encoded Unix socket protocol
+crates/aicoach-daemon   session/request 管理、异步编排、屏幕尾部降级采集
+crates/aicoach-cli      安装、LaunchAgent、配置、doctor、日志、窗口命令
+crates/aicoach-tui      独立 Ratatui Coach
+shell/                  ZLE widgets 与 hooks
+macos/                  可选 Carbon 全局快捷键 helper
+homebrew/               Formula 模板
+```
+
+## 已知限制
+
+- macOS Terminal API 没有可靠方式在不代理 PTY 的前提下分别获取每条命令的完整
+  stdout/stderr。Shell integration 优先使用显式输出；轻量模式会按 TTY 从
+  Terminal.app/iTerm2 异步抓取 screen tail，因此输出分类属于 best effort。此行为
+  默认关闭；只有明确接受该隐私边界时才设置
+  `privacy.capture_screen_tail = true`，捕获内容仍会先脱敏。
+- 当前安全模式只实现 `warn`；它不会拦截 Enter 或阻止用户执行已输入命令。危险的
+  AI 补全不会自动写入 Buffer，而是只显示风险提示。
+- 全局 Option+Space helper 仍依赖匹配的 macOS Command Line Tools；缺失时仍可在
+  Zsh 中切换 Coach。
+- Warp 等终端的 Shell 功能可用，但专用窗口定位/恢复仅对 Terminal.app/iTerm2
+  做了深度适配。
+- 为避免意外收集 secret，本项目不快照任意环境变量；只维护一组与终端体验有关的
+  非敏感 allowlist（locale、`TERM`/`COLORTERM` 和虚拟环境元数据），并在每次命令
+  完成时更新。
+- Formula 中的 release URL/SHA 是发布占位符，创建公开 release 后必须替换。
+- `package-release.sh` 生成当前机器架构的本地测试包；公开分发需分别在 `arm64` 和
+  `x86_64` 构建，并使用 Developer ID 完成签名、公证与 stapling。当前没有发布者
+  证书，因此不把本地 tarball 宣称为已公证的最终下载包。
+
+## 卸载
+
+```zsh
+aicoach uninstall
+```
+
+完全清理本地配置、历史与日志：
+
+```zsh
+aicoach uninstall --purge
+```
+
+## 安全边界
+
+AI 不代替终端，也不代替用户执行命令。即使建议来自结构化响应，最终也只能进入
+可见的 ZLE Buffer。执行权始终由用户保留。
+
+## 许可
+
+本项目使用 [MIT License](LICENSE) 开源。贡献指南见
+[CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## English overview
+
+AI Terminal Coach is a macOS/Zsh companion that provides local diagnostics,
+safety warnings, AI-assisted completion, quick terminal chat, and a standalone
+Ratatui Coach window. It never presses Enter or executes an AI suggestion.
+
+The repository ships with no API endpoint, model ID, or API key. The default
+provider is disabled, screen-tail capture is opt-in, and the application runs
+in local-only mode until the user explicitly configures an OpenAI-compatible
+provider. Interface messages, local analysis, and AI responses support English
+(`en-US`, the default) and Simplified Chinese (`zh-CN`).
+
+Build and install:
+
+```zsh
+cargo build --release --locked
+mkdir -p ~/.local/bin
+install -m 0755 target/release/aicoach{,d,-ui} ~/.local/bin/
+export PATH="$HOME/.local/bin:$PATH"
+aicoach install
+```
+
+See the Chinese sections above for configuration, shortcuts, privacy boundaries,
+troubleshooting, and release requirements. Licensed under the
+[MIT License](LICENSE).
