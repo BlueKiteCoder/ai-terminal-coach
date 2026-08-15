@@ -52,7 +52,7 @@ Terminal.app / iTerm2 / 其他 macOS 终端
 
 - macOS 13 或更新版本（Apple Silicon 与 Intel 均可由 Rust 原生构建）
 - Zsh 5.8+
-- Rust 1.85+（仅源码构建）
+- Rust 1.88+（仅源码构建）
 - Terminal.app 或 iTerm2 可获得最佳 Coach 窗口体验
 
 核心 Shell 功能只依赖 Zsh，因此 Warp、Alacritty、Kitty、WezTerm 也可使用命令

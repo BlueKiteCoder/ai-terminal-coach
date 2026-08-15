@@ -4,7 +4,7 @@ Thanks for helping improve AI Terminal Coach.
 
 ## Development setup
 
-The project targets macOS 13+, Zsh 5.8+, and Rust 1.85+. Fork the repository,
+The project targets macOS 13+, Zsh 5.8+, and Rust 1.88+. Fork the repository,
 create a focused branch, and keep changes scoped to one concern.
 
 Before submitting a change, run:
