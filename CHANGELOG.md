@@ -5,6 +5,11 @@ All notable user-visible changes are recorded here. This project follows
 
 ## [Unreleased]
 
+### Security
+
+- GitHub Actions are pinned to immutable commits, run on current Node 24 action releases,
+  and receive weekly Dependabot update pull requests.
+
 ### Fixed
 
 - Source Card process integration tests tolerate contended CI scheduling without changing the
