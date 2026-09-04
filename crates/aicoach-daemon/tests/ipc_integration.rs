@@ -101,6 +101,14 @@ impl AiProvider for TestProvider {
                 operation: AiOperation::Completion,
             });
         }
+        if request.buffer == "git reset " {
+            return Ok(CoreCompletionResult {
+                operation: CoreCompletionOperation::Insert,
+                command: "--hard".to_owned(),
+                cursor: request.buffer.chars().count() + 6,
+                description: "complete the reset mode".to_owned(),
+            });
+        }
         Ok(CoreCompletionResult {
             operation: CoreCompletionOperation::Replace,
             command: format!("{}-done", request.buffer),
@@ -351,6 +359,56 @@ async fn cancel_interrupts_active_completion_and_daemon_remains_responsive() {
             result: ResponseResult::Pong { .. }
         }
     ));
+    client.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn ai_insert_cannot_hide_a_dangerous_composed_command() {
+    let running = RunningDaemon::start(Arc::new(TestProvider::default())).await;
+    let client = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&client, None, "/dev/ttys008").await;
+    let mut events = client.subscribe();
+
+    let response = client
+        .send_request(
+            Some(session),
+            RequestBody::Completion(CompletionParams {
+                buffer: "git reset ".to_owned(),
+                cursor: 10,
+                cwd: PathBuf::from("/tmp"),
+            }),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Ok {
+        result: ResponseResult::Completion(completion),
+    } = response.outcome
+    else {
+        panic!("expected completion response")
+    };
+    assert_eq!(
+        completion.operation,
+        aicoach_ipc::CompletionOperation::Suggest
+    );
+    assert_eq!(completion.command, "git reset --hard");
+    assert!(
+        completion
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("Local risk: HIGH"))
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let EventBody::Hint(hint) = event.body else {
+        panic!("expected risk warning")
+    };
+    assert_eq!(hint.severity, aicoach_ipc::Severity::Error);
+    assert_eq!(hint.suggested_command.as_deref(), Some("git reset --hard"));
+
     client.close().await.unwrap();
     running.stop().await;
 }

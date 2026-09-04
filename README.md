@@ -38,6 +38,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   Prompt。
 - ZLE `Option+Tab` 读取并修改 `BUFFER`/`CURSOR`；用户继续输入会取消旧请求，
   结果只有在 Buffer 未变化时才应用。
+- 每次补全都会生成本地 **Command Patch**：显示被删除/新增的 token、AI 给出的修改
+  原因，以及对最终完整 Buffer 的风险扫描结果；`insert` 补全不会只检查新增片段。
 - 在当前输入行写下问题后按 `Option+/`，把该 Buffer 作为问题发送；不会把问题
   当作 Shell 命令执行。
 - `Option+Space` 在原终端和独立 Coach TUI 之间切换。
@@ -216,10 +218,13 @@ source；异步消息使用 `zle -I`、`reset-prompt`、`redisplay` 安全重绘
 docker ps --forma  + Option+Tab  → docker ps --format
 git pul origin main + Option+Tab → git pull origin main
 # 查看8080端口     + Option+Tab  → lsof -i :8080
+
+[AI Coach] Patch: − pul → + pull · Local risk: no known destructive pattern · Why: Fix the Git subcommand spelling
 ```
 
 结果结构固定为 `replace`、`insert` 或 `suggest`，不解析 Markdown 猜命令。任何
-结果都不会自动按 Enter。
+结果都不会自动按 Enter。Command Patch 中“未命中已知破坏性模式”只表示没有触发
+当前本地规则，不构成命令安全证明；执行权和最终判断始终属于用户。
 
 ## Coach 窗口
 
@@ -418,7 +423,7 @@ AI 不代替终端，也不代替用户执行命令。即使建议来自结构�
 ## English overview
 
 AI Terminal Coach is a macOS/Zsh companion that provides local diagnostics,
-safety warnings, AI-assisted completion, quick terminal chat, share-ready
+safety warnings, explainable token-level Command Patches, AI-assisted completion, quick terminal chat, share-ready
 privacy-scrubbed Session Capsules, and a standalone Ratatui Coach window. It
 never presses Enter or executes an AI suggestion.
 

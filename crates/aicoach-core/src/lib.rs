@@ -5,6 +5,7 @@
 //! by the daemon, CLI, IPC protocol, and TUI.
 
 pub mod analyzer;
+pub mod command_patch;
 pub mod config;
 pub mod context;
 pub mod git;
@@ -14,6 +15,7 @@ pub mod safety;
 pub mod terminal;
 
 pub use analyzer::{AnalysisCategory, LocalAnalysis, LocalAnalyzer};
+pub use command_patch::{CommandPatch, CommandPatchHunk};
 pub use config::{
     AiConfig, AiModels, AiModelsConfig, AiTimeouts, AiTimeoutsConfig, CoachConfig, Config,
     ConfigError, ContextConfig, HistoryConfig, KeybindingsConfig, PrivacyConfig, ProductPaths,

@@ -109,6 +109,7 @@ typeset -g AICOACH_COMPLETION_SNAPSHOT=$BUFFER
 _aicoach_handle_line $'COMPLETE\t'$AICOACH_SESSION_ID$'\treq-1\treplace\t18\tdocker ps --format\t修正参数'
 assert_eq "$BUFFER" 'docker ps --format'
 assert_eq "$CURSOR" '18'
+assert_eq "$last_zle_message" '[AI Coach] 修正参数'
 
 typeset -g BUFFER='echo'
 typeset -g CURSOR=${#BUFFER}
