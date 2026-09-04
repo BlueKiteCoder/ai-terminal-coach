@@ -59,11 +59,12 @@ set result [wait]
 exit [lindex $result 3]
 EXPECT
 
-rg -q '^completion = "\^\[g"$' "$test_home/.config/aicoach/config.toml"
-rg -q '^chat = "\^\[c"$' "$test_home/.config/aicoach/config.toml"
-rg -q '^risk_lens = "\^\[l"$' "$test_home/.config/aicoach/config.toml"
-rg -q "AICOACH_CONFIG_COMPLETION_KEY=\\\$'\\\\x1bg'" \
-  "$test_home/.config/aicoach/keybindings.zsh"
+typeset -g calibrated_config=$(<"$test_home/.config/aicoach/config.toml")
+[[ $calibrated_config == *'completion = "^[g"'* ]]
+[[ $calibrated_config == *'chat = "^[c"'* ]]
+[[ $calibrated_config == *'risk_lens = "^[l"'* ]]
+typeset -g generated_settings=$(<"$test_home/.config/aicoach/keybindings.zsh")
+[[ $generated_settings == *"AICOACH_CONFIG_COMPLETION_KEY=\$'\\x1bg'"* ]]
 $cli onboard --check >/dev/null
 
 builtin print 'onboarding end-to-end test: ok'
