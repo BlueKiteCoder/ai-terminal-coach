@@ -629,6 +629,7 @@ mod tests {
                     safety_rules_enabled: true,
                     rule_ids: vec!["git.reset-hard".to_owned()],
                 },
+                source_cards: Vec::new(),
                 message: "Risk Lens · HIGH\nImpact: modify Git worktree".to_owned(),
             }),
         );

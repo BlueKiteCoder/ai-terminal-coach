@@ -1,6 +1,7 @@
 use aicoach_core::{
     AnalysisCoverage, AnalysisInput, CommandPatch, EffectAction, LocalAnalyzer, PrivacyRedactor,
-    PrivilegeRequirement, RecoveryProspect, RiskLevel, SafetyEngine,
+    PrivilegeRequirement, RecoveryProspect, RiskLevel, SafetyEngine, source_card_from_output,
+    source_queries,
 };
 use std::{env, fs, path::Path, process::ExitCode};
 
@@ -44,12 +45,23 @@ fn run() -> Result<(), String> {
         .effects
         .first()
         .ok_or_else(|| "Risk Lens did not produce an effect".to_owned())?;
+    let source_query = source_queries("git reset --hard", &risk.rule_ids)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Source Cards did not plan local Git evidence".to_owned())?;
+    let source_card = source_card_from_output(
+        &source_query,
+        "usage: git reset [--hard]\n\n    --hard    reset HEAD, index and working tree\n",
+    )
+    .ok_or_else(|| "Source Cards did not parse the deterministic Git help fixture".to_owned())?;
+    let source = format!(
+        "{} · {} — {}",
+        source_card.reference, source_card.section, source_card.excerpt
+    );
     let redacted = PrivacyRedactor::default().redact("PASSWORD=hunter2-demo");
     if redacted != "PASSWORD=[REDACTED]" {
         return Err("the showcased password was not fully redacted".to_owned());
     }
-    let rules = risk.rule_ids.join(", ");
-
     let mut svg = TEMPLATE.to_owned();
     for (marker, value) in [
         ("{{DIAGNOSIS_TITLE}}", diagnosis.title.as_str()),
@@ -62,7 +74,7 @@ fn run() -> Result<(), String> {
         ("{{RISK_TARGET}}", effect.target.as_str()),
         ("{{PRIVILEGE}}", privilege(risk.privilege)),
         ("{{RECOVERY}}", recovery(risk.recovery)),
-        ("{{RULES}}", rules.as_str()),
+        ("{{SOURCE}}", source.as_str()),
         ("{{REDACTED}}", redacted.as_str()),
     ] {
         svg = svg.replace(marker, &xml_escape(value));

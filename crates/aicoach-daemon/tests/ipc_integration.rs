@@ -449,6 +449,10 @@ async fn risk_lens_is_structured_local_and_provider_free() {
     );
     assert!(result.message.contains("Risk Lens · HIGH"));
     assert!(result.message.contains("~/Downloads/cache"));
+    assert_eq!(result.source_cards.len(), 1);
+    assert_eq!(result.source_cards[0].reference, "man rm");
+    assert!(result.message.contains("Local source: man rm · -R"));
+    assert!(result.message.contains("Inference boundary:"));
     assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.completion_calls.load(Ordering::SeqCst), 0);
 
