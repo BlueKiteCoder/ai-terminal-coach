@@ -15,6 +15,11 @@ Socket daemon 和独立 Ratatui 窗口，寄生在现有终端工作流中。
 
 产品方向与可验证的里程碑见 [ROADMAP.md](ROADMAP.md)。
 
+![AI Terminal Coach：本地诊断、Risk Lens、Command Patch 与 Session Capsule 工作流](docs/assets/workflow.svg)
+
+这张演示图由真实的本地分析、安全分级、Command Patch 和隐私脱敏引擎输出生成，
+并由 CI 检查，避免文档示例与实际行为悄悄偏离。
+
 ```text
 Terminal.app / iTerm2 / 其他 macOS 终端
                   │
@@ -401,6 +406,7 @@ Homebrew 升级后请再次执行 `aicoach install`，刷新 LaunchAgent 指向�
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
+cargo run --locked -p aicoach-core --example render_demo -- --check docs/assets/workflow.svg
 zsh scripts/test-zsh-integration.zsh
 zsh scripts/test-onboarding-e2e.zsh
 zsh scripts/benchmark-zsh-hooks.zsh
@@ -413,6 +419,9 @@ JSON、timeout/cancel/retry/SSE、Unix socket、连接断开、多 session、请
 编码与 Buffer/CURSOR 修改。Onboarding E2E 在隔离的临时 HOME 和伪终端内发送真实
 Meta 字节，验证校准、落盘与 Zsh widget 绑定。性能脚本实测 source、preexec、precmd，
 并强制本地 hook 平均耗时低于 10ms。AI tests 使用本地 TCP mock，不调用真实 Provider。
+演示图不是手工绘制的静态截图；修改相关引擎行为后可运行
+`cargo run --locked -p aicoach-core --example render_demo -- docs/assets/workflow.svg`
+重新生成，CI 会拒绝过期的演示内容。
 
 ## 目录与架构
 
@@ -478,6 +487,10 @@ safety warnings, a provider-free preflight Risk Lens, explainable token-level
 Command Patches, AI-assisted completion, quick terminal chat, share-ready
 privacy-scrubbed Session Capsules, and a standalone Ratatui Coach window. It
 never presses Enter or executes an AI suggestion.
+
+The workflow image above is generated from the real local analyzer, Risk Lens,
+Command Patch, and privacy-redaction output. CI verifies the committed asset so
+the demonstration cannot silently drift away from product behavior.
 
 The repository ships with no API endpoint, model ID, or API key. The default
 provider is disabled, screen-tail capture is opt-in, and the application runs

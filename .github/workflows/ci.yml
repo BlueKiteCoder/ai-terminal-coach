@@ -21,5 +21,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: cargo run --locked -p aicoach-core --example render_demo -- --check docs/assets/workflow.svg
       - run: zsh scripts/test-zsh-integration.zsh
       - run: zsh scripts/test-onboarding-e2e.zsh
