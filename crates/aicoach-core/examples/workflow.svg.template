@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title description">
   <title id="title">AI Terminal Coach workflow</title>
-  <desc id="description">A reproducible terminal demonstration of local failure diagnosis, preflight Risk Lens, explainable Command Patch, and privacy-scrubbed Session Capsule.</desc>
+  <desc id="description">A reproducible terminal demonstration of local failure diagnosis, preflight Risk Lens with a local Source Card, explainable Command Patch, and privacy-scrubbed Session Capsule.</desc>
   <defs>
     <linearGradient id="page" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#050914"/>
@@ -80,7 +80,7 @@
     <rect x="738" y="202" width="630" height="270" rx="18" fill="url(#risk)"/>
     <circle cx="772" cy="236" r="18" fill="#3b1d2b" stroke="#fb7185"/>
     <text x="772" y="242" text-anchor="middle" class="ui" font-size="14" font-weight="700" fill="#fda4af">02</text>
-    <text x="804" y="241" class="ui label" fill="#fda4af">RISK LENS · BEFORE ENTER</text>
+    <text x="804" y="241" class="ui label" fill="#fda4af">RISK LENS + SOURCE CARD</text>
     <rect x="1282" y="221" width="62" height="30" rx="15" fill="#342238" stroke="#7e4055"/>
     <text x="1313" y="241" text-anchor="middle" class="ui label" fill="#fda4af">⌥ R</text>
     <text x="762" y="286" class="mono body"><tspan fill="#fda4af">❯</tspan> git reset --hard</text>
@@ -92,7 +92,7 @@
     <text x="864" y="388" class="ui body">{{PRIVILEGE}}</text>
     <text x="762" y="420" class="ui small">RECOVERY</text>
     <text x="858" y="420" class="ui body">{{RECOVERY}}</text>
-    <text x="762" y="450" class="mono" font-size="13" fill="#9fb2cc">evidence: {{RULES}}</text>
+    <text x="762" y="450" class="mono" font-size="12" fill="#9fb2cc">source: {{SOURCE}}</text>
   </g>
 
   <!-- 03: command patch -->

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use aicoach_core::RiskLensReport;
+use aicoach_core::{RiskLensReport, SourceCard};
 
 pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 4 * 1024 * 1024;
@@ -191,6 +191,8 @@ pub struct RiskLensParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiskLensResult {
     pub report: RiskLensReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_cards: Vec<SourceCard>,
     /// Localized, terminal-safe presentation of the structured report.
     pub message: String,
 }

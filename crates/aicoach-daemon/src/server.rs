@@ -3,6 +3,7 @@ use std::{
     io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +13,8 @@ use aicoach_core::{
     AnalysisCategory, AnalysisCoverage, AnalysisInput, AnalysisResult, CommandPatch, CommandRecord,
     CompletionOperation as CoreCompletionOperation, EffectAction, GitContext, LocalAnalyzer,
     PrivacyRedactor, PrivilegeRequirement, RecoveryProspect, RiskLensReport, RiskLevel,
-    SafetyConfig, SafetyEngine, SafetyMode, Severity as CoreSeverity, strip_terminal_sequences,
+    SafetyConfig, SafetyEngine, SafetyMode, Severity as CoreSeverity, SourceCard, SourceInvocation,
+    SourceQuery, source_card_from_output, source_queries, strip_terminal_sequences,
     try_collect_git_context,
 };
 use aicoach_ipc::{
@@ -25,8 +27,11 @@ use futures_util::StreamExt;
 use parking_lot::RwLock;
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf},
+    io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, WriteHalf,
+    },
     net::{UnixListener, UnixStream},
+    process::Command,
     sync::mpsc,
     task::JoinSet,
 };
@@ -53,6 +58,9 @@ const INLINE_HINT_TRUNCATED_SUFFIX_EN: &str = " … (open Coach for the full ana
 const INLINE_HINT_TRUNCATED_SUFFIX_ZH: &str = " …（完整分析请打开 Coach）";
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const GIT_CONTEXT_TIMEOUT: Duration = Duration::from_millis(250);
+const LOCAL_SOURCE_TIMEOUT: Duration = Duration::from_millis(800);
+const MAX_LOCAL_SOURCE_OUTPUT_BYTES: u64 = 512 * 1024;
+const MAX_LOCAL_SOURCE_CACHE_ENTRIES: usize = 64;
 
 fn configured_safety(enabled: bool) -> SafetyEngine {
     SafetyEngine::with_config(SafetyConfig {
@@ -126,6 +134,7 @@ pub struct Daemon {
     subscriptions: RwLock<HashMap<SessionId, HashSet<ConnectionId>>>,
     /// Async events are routed back to the connection that started a request.
     request_origins: RwLock<HashMap<(SessionId, aicoach_ipc::RequestId), ConnectionId>>,
+    source_card_cache: RwLock<HashMap<SourceQuery, Option<SourceCard>>>,
     shutdown: CancellationToken,
     options: DaemonOptions,
 }
@@ -141,6 +150,7 @@ impl Daemon {
             connections: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             request_origins: RwLock::new(HashMap::new()),
+            source_card_cache: RwLock::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             options,
         })
@@ -160,6 +170,7 @@ impl Daemon {
             connections: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             request_origins: RwLock::new(HashMap::new()),
+            source_card_cache: RwLock::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             options,
         })
@@ -175,6 +186,28 @@ impl Daemon {
 
     pub fn sessions(&self) -> &SessionManager {
         &self.sessions
+    }
+
+    async fn collect_source_cards(&self, command: &str, rule_ids: &[String]) -> Vec<SourceCard> {
+        let mut cards = Vec::new();
+        for query in source_queries(command, rule_ids) {
+            let cached = self.source_card_cache.read().get(&query).cloned();
+            let card = if let Some(cached) = cached {
+                cached
+            } else {
+                let collected = collect_source_card(&query).await;
+                let mut cache = self.source_card_cache.write();
+                if cache.len() >= MAX_LOCAL_SOURCE_CACHE_ENTRIES {
+                    cache.clear();
+                }
+                cache.insert(query, collected.clone());
+                collected
+            };
+            if let Some(card) = card {
+                cards.push(card);
+            }
+        }
+        cards
     }
 
     /// Binds an owner-only Unix domain socket.
@@ -650,7 +683,10 @@ impl Daemon {
                     return;
                 }
                 let report = self.safety.risk_lens(&params.buffer);
-                let result = risk_lens_result(report, &self.options.coach_language);
+                let source_cards = self
+                    .collect_source_cards(&params.buffer, &report.rule_ids)
+                    .await;
+                let result = risk_lens_result(report, source_cards, &self.options.coach_language);
                 send_response(
                     &sender,
                     Response::ok(&request, ResponseResult::RiskLens(result)),
@@ -1446,6 +1482,86 @@ impl Daemon {
     }
 }
 
+async fn collect_source_card(query: &SourceQuery) -> Option<SourceCard> {
+    let mut command = match &query.invocation {
+        SourceInvocation::CommandHelp { program, arguments } => {
+            let mut command = Command::new(program);
+            command.args(arguments);
+            command
+        }
+        SourceInvocation::ManPage { topic } => {
+            let mut command = Command::new("/usr/bin/man");
+            command.args(["-P", "/bin/cat", topic]);
+            command
+        }
+    };
+    command
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("LC_ALL", "C")
+        .env("MANPAGER", "/bin/cat")
+        .env("PAGER", "/bin/cat")
+        .env("MANWIDTH", "100")
+        .env("GIT_PAGER", "/bin/cat")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("MANOPT")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_EXEC_PATH")
+        .env_remove("GIT_WORK_TREE");
+
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let capture = async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            read_bounded_source(stdout),
+            read_bounded_source(stderr)
+        );
+        Some((status.ok()?, stdout.ok()?, stderr.ok()?))
+    };
+    let captured = if let Ok(captured) = tokio::time::timeout(LOCAL_SOURCE_TIMEOUT, capture).await {
+        captured?
+    } else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return None;
+    };
+    let (status, stdout, stderr) = captured;
+    if matches!(query.invocation, SourceInvocation::ManPage { .. }) && !status.success() {
+        return None;
+    }
+    let total_length = stdout.len().saturating_add(stderr.len()) as u64;
+    if total_length > MAX_LOCAL_SOURCE_OUTPUT_BYTES {
+        return None;
+    }
+    source_card_from_output(query, &String::from_utf8_lossy(&stdout))
+        .or_else(|| source_card_from_output(query, &String::from_utf8_lossy(&stderr)))
+}
+
+async fn read_bounded_source<R>(reader: Option<R>) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+    let mut output = Vec::new();
+    reader
+        .take(MAX_LOCAL_SOURCE_OUTPUT_BYTES + 1)
+        .read_to_end(&mut output)
+        .await?;
+    Ok(output)
+}
+
 async fn write_loop(
     mut write: WriteHalf<UnixStream>,
     mut receiver: mpsc::Receiver<Message>,
@@ -1788,18 +1904,35 @@ fn completion_patch_description(
     ))
 }
 
-fn risk_lens_result(mut report: RiskLensReport, language: &str) -> RiskLensResult {
+fn risk_lens_result(
+    mut report: RiskLensReport,
+    mut source_cards: Vec<SourceCard>,
+    language: &str,
+) -> RiskLensResult {
     for effect in &mut report.effects {
         effect.target = sanitize_inline(&effect.target, 160);
     }
     for rule_id in &mut report.rule_ids {
         *rule_id = sanitize_inline(rule_id, 80);
     }
-    let message = risk_lens_message(&report, language);
-    RiskLensResult { report, message }
+    for card in &mut source_cards {
+        card.reference = sanitize_inline(&card.reference, 120);
+        card.section = sanitize_inline(&card.section, 80);
+        card.excerpt = sanitize_inline(&card.excerpt, 320);
+    }
+    let message = risk_lens_message(&report, &source_cards, language);
+    RiskLensResult {
+        report,
+        source_cards,
+        message,
+    }
 }
 
-fn risk_lens_message(report: &RiskLensReport, language: &str) -> String {
+fn risk_lens_message(
+    report: &RiskLensReport,
+    source_cards: &[SourceCard],
+    language: &str,
+) -> String {
     use std::fmt::Write as _;
 
     let chinese = language == "zh-CN";
@@ -1826,6 +1959,16 @@ fn risk_lens_message(report: &RiskLensReport, language: &str) -> String {
     let privilege_label = if chinese { "权限" } else { "Privilege" };
     let recovery_label = if chinese { "恢复" } else { "Recovery" };
     let evidence_label = if chinese { "依据" } else { "Evidence" };
+    let source_label = if chinese {
+        "本机来源"
+    } else {
+        "Local source"
+    };
+    let boundary_label = if chinese {
+        "推断边界"
+    } else {
+        "Inference boundary"
+    };
     let mut effects = report
         .effects
         .iter()
@@ -1864,9 +2007,38 @@ fn risk_lens_message(report: &RiskLensReport, language: &str) -> String {
     } else {
         report.rule_ids.join(", ")
     };
+    let (sources, boundary) = if source_cards.is_empty() {
+        (
+            if chinese {
+                "未找到匹配的本机文档摘录".to_owned()
+            } else {
+                "no matching local documentation excerpt".to_owned()
+            },
+            if chinese {
+                "上述影响与恢复结论来自本地命令画像/规则推断".to_owned()
+            } else {
+                "impact and recovery above are local command-profile/rule inference".to_owned()
+            },
+        )
+    } else {
+        (
+            source_cards
+                .iter()
+                .take(2)
+                .map(|card| format!("{} · {} — {}", card.reference, card.section, card.excerpt))
+                .collect::<Vec<_>>()
+                .join(if chinese { "；" } else { "; " }),
+            if chinese {
+                "风险与恢复结论结合了上述本机文档和本地命令画像/规则".to_owned()
+            } else {
+                "risk and recovery combine the cited local docs with command profiles/rules"
+                    .to_owned()
+            },
+        )
+    };
     sanitize_multiline(
         &format!(
-            "{title} · {rating} · {coverage}\n{impact_label}: {effects}\n{privilege_label}: {privilege}\n{recovery_label}: {recovery}\n{evidence_label}: {evidence}"
+            "{title} · {rating} · {coverage}\n{impact_label}: {effects}\n{privilege_label}: {privilege}\n{recovery_label}: {recovery}\n{evidence_label}: {evidence}\n{source_label}: {sources}\n{boundary_label}: {boundary}"
         ),
         MAX_RISK_LENS_MESSAGE_CHARS,
     )
@@ -2447,17 +2619,46 @@ mod tests {
         assert!(description.contains("原因: 修正 Git 子命令"));
     }
 
+    #[tokio::test]
+    async fn local_source_collector_reads_allowlisted_git_help() {
+        let query = source_queries("git reset --hard", &["git.reset-hard".to_owned()])
+            .into_iter()
+            .next()
+            .expect("allowlisted source query");
+        let card = collect_source_card(&query)
+            .await
+            .expect("local git help source card");
+        assert_eq!(card.reference, "git reset -h");
+        assert_eq!(card.section, "--hard");
+        assert!(card.excerpt.contains("HEAD"));
+        assert!(card.excerpt.contains("working tree"));
+        assert!(!contains_terminal_control(&card.excerpt));
+    }
+
     #[test]
     fn risk_lens_is_localized_structured_and_honest_about_unknowns() {
-        let known = risk_lens_result(SafetyEngine::new().risk_lens("git reset --hard"), "zh-CN");
+        let known = risk_lens_result(
+            SafetyEngine::new().risk_lens("git reset --hard"),
+            vec![SourceCard {
+                origin: aicoach_core::SourceOrigin::CommandHelp,
+                reference: "git reset -h".to_owned(),
+                section: "--hard".to_owned(),
+                excerpt: "reset HEAD, index and working tree".to_owned(),
+            }],
+            "zh-CN",
+        );
         assert_eq!(known.report.level, Some(RiskLevel::High));
+        assert_eq!(known.source_cards.len(), 1);
         assert!(known.message.contains("风险透镜 · HIGH · 已识别"));
         assert!(known.message.contains("影响: 修改 Git 暂存区与当前工作树"));
         assert!(known.message.contains("恢复: 有限"));
         assert!(known.message.contains("依据: git.reset-hard"));
+        assert!(known.message.contains("本机来源: git reset -h · --hard"));
+        assert!(known.message.contains("推断边界:"));
 
         let unknown = risk_lens_result(
             SafetyEngine::new().risk_lens("company-deploy production"),
+            Vec::new(),
             "en-US",
         );
         assert_eq!(unknown.report.level, None);
@@ -2472,9 +2673,16 @@ mod tests {
                 .contains("Privilege: unknown to local rules")
         );
         assert!(unknown.message.contains("Recovery: unknown"));
+        assert!(
+            unknown
+                .message
+                .contains("Local source: no matching local documentation excerpt")
+        );
+        assert!(unknown.message.contains("Inference boundary:"));
 
         let hostile = risk_lens_result(
             SafetyEngine::new().risk_lens("rm bad\u{1b}[31m\u{202e}txt"),
+            Vec::new(),
             "en-US",
         );
         assert!(hostile.report.effects.iter().all(|effect| {

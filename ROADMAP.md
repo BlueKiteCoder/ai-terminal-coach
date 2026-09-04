@@ -41,8 +41,8 @@ workflow, and uninstall on a clean supported Mac without reading source code.
 - [x] **Risk Lens:** explicitly inspect the current ZLE buffer and show what the command can
   modify, what privileges it needs, and which parts are irreversible—without blocking Enter or
   calling an AI provider; unfamiliar commands are honestly marked unrated.
-- [ ] **Source Cards:** attach local `man`/`--help` evidence to supported command explanations so
-  users can distinguish documented behavior from model inference.
+- [x] **Source Cards:** attach bounded local `man`/allowlisted `--help` excerpts to Risk Lens
+  explanations and explicitly distinguish documented behavior from rule/profile inference.
 - [ ] One-keystroke “insert only” and “copy only” actions with a visible safety classification.
 
 Exit gate: users can understand why a suggestion changed, where its claims came from, and what

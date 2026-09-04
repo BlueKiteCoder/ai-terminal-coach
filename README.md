@@ -15,10 +15,10 @@ Socket daemon 和独立 Ratatui 窗口，寄生在现有终端工作流中。
 
 产品方向与可验证的里程碑见 [ROADMAP.md](ROADMAP.md)。
 
-![AI Terminal Coach：本地诊断、Risk Lens、Command Patch 与 Session Capsule 工作流](docs/assets/workflow.svg)
+![AI Terminal Coach：本地诊断、带 Source Cards 的 Risk Lens、Command Patch 与 Session Capsule 工作流](docs/assets/workflow.svg)
 
-这张演示图由真实的本地分析、安全分级、Command Patch 和隐私脱敏引擎输出生成，
-并由 CI 检查，避免文档示例与实际行为悄悄偏离。
+这张演示图由真实的本地分析、安全分级、Source Cards、Command Patch 和隐私脱敏
+引擎输出生成，并由 CI 检查，避免文档示例与实际行为悄悄偏离。
 
 ```text
 Terminal.app / iTerm2 / 其他 macOS 终端
@@ -46,7 +46,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
 - 每次补全都会生成本地 **Command Patch**：显示被删除/新增的 token、AI 给出的修改
   原因，以及对最终完整 Buffer 的风险扫描结果；`insert` 补全不会只检查新增片段。
 - 在执行前按 `Option+R` 打开本地 **Risk Lens**：显示命令可能影响的对象、权限需求、
-  恢复难度和命中的规则。未知命令标为“未评级”，不会伪装成低风险。
+  恢复难度和命中的规则。**Source Cards** 同时引用本机 `man`/受限命令帮助的原文
+  摘录，并明确标出哪些结论仍是规则推断；未知命令不会伪装成低风险。
 - 在当前输入行写下问题后按 `Option+/`，把该 Buffer 作为问题发送；不会把问题
   当作 Shell 命令执行。
 - `Option+Space` 在原终端和独立 Coach TUI 之间切换。
@@ -269,12 +270,19 @@ Impact: modify Git index and current worktree
 Privilege: no explicit elevation (current-user scope)
 Recovery: limited; may require backup, reflog, or remote history
 Evidence: git.reset-hard
+Local source: git reset -h · --hard — reset HEAD, index and working tree
+Inference boundary: risk and recovery combine the cited local docs with command profiles/rules
 ```
 
 它为 Git、文件操作、macOS `defaults`/`diskutil`/`launchctl`、Homebrew、常见包管理器、
 Docker 和 Kubernetes 提供本地命令画像，并叠加 Safety Engine 的破坏性规则。覆盖不完整
 时显示 `partial coverage`；无法识别的内部工具或脚本显示 `UNRATED`。这是一份影响提示，
 不是沙箱、权限模拟器或安全证明。
+
+Source Cards 不联网，也不把手册内容发给 Provider。Git 帮助只调用硬编码的 Apple
+`/usr/bin/git` 和已识别子命令；其他来源通过 `/usr/bin/man` 读取白名单页面。两者都有
+800ms 超时、512KiB 输出上限、终端控制字符清理和 64 项进程内缓存。没有找到匹配
+摘录时，界面会明确显示结论来自本地命令画像/规则推断，而不是编造文档依据。
 
 ## Coach 窗口
 
@@ -484,13 +492,14 @@ AI 不代替终端，也不代替用户执行命令。即使建议来自结构�
 
 AI Terminal Coach is a macOS/Zsh companion that provides local diagnostics,
 safety warnings, a provider-free preflight Risk Lens, explainable token-level
-Command Patches, AI-assisted completion, quick terminal chat, share-ready
-privacy-scrubbed Session Capsules, and a standalone Ratatui Coach window. It
-never presses Enter or executes an AI suggestion.
+Command Patches, local-manual Source Cards, AI-assisted completion, quick
+terminal chat, share-ready privacy-scrubbed Session Capsules, and a standalone
+Ratatui Coach window. It never presses Enter or executes an AI suggestion.
 
 The workflow image above is generated from the real local analyzer, Risk Lens,
-Command Patch, and privacy-redaction output. CI verifies the committed asset so
-the demonstration cannot silently drift away from product behavior.
+Source Card, Command Patch, and privacy-redaction output. CI verifies the
+committed asset so the demonstration cannot silently drift away from product
+behavior.
 
 The repository ships with no API endpoint, model ID, or API key. The default
 provider is disabled, screen-tail capture is opt-in, and the application runs
