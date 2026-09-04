@@ -22,6 +22,8 @@ typeset -g AICOACH_COMMAND_ID=""
 typeset -gF AICOACH_COMMAND_STARTED=0
 typeset -g AICOACH_COMPLETION_ID=""
 typeset -g AICOACH_COMPLETION_SNAPSHOT=""
+typeset -g AICOACH_RISK_LENS_ID=""
+typeset -g AICOACH_RISK_LENS_SNAPSHOT=""
 typeset -g AICOACH_CHAT_ID=""
 typeset -g AICOACH_CHAT_STREAM_CONTENT=""
 typeset -g AICOACH_CHAT_STREAM_PENDING=""
@@ -49,12 +51,14 @@ typeset -g AICOACH_LANGUAGE=${AICOACH_LANGUAGE:-en-US}
 # macOS Terminal sends Option as an Escape prefix when "Use Option as Meta key" is on.
 typeset -g AICOACH_COMPLETION_KEY=${AICOACH_COMPLETION_KEY:-$'\e\t'}
 typeset -g AICOACH_CHAT_KEY=${AICOACH_CHAT_KEY:-$'\e/'}
+typeset -g AICOACH_RISK_LENS_KEY=${AICOACH_RISK_LENS_KEY:-$'\er'}
 typeset -g AICOACH_TOGGLE_KEY=${AICOACH_TOGGLE_KEY:-$'\e '}
 # When Terminal.app's "Use Option as Meta key" setting is disabled, macOS
 # emits the native Option glyphs instead of an Escape-prefixed sequence.
 # Accept those spellings as fallbacks so the default shortcuts work without a
 # terminal-profile change. Option+Tab has no safe distinct non-Meta sequence.
 typeset -g AICOACH_CHAT_NATIVE_KEY=${AICOACH_CHAT_NATIVE_KEY:-$'÷'}
+typeset -g AICOACH_RISK_LENS_NATIVE_KEY=${AICOACH_RISK_LENS_NATIVE_KEY:-$'®'}
 typeset -g AICOACH_TOGGLE_NATIVE_KEY=${AICOACH_TOGGLE_NATIVE_KEY:-$'\u00a0'}
 typeset -gi AICOACH_SAFETY_ENABLED=${AICOACH_SAFETY_ENABLED:-1}
 typeset -gi AICOACH_INLINE_HINT=${AICOACH_INLINE_HINT:-1}
@@ -76,6 +80,8 @@ _aicoach_text() {
       generating_completion) REPLY='正在生成补全…（继续输入会自动丢弃旧结果）' ;;
       daemon_stopped) REPLY='后台服务未运行；请执行 aicoach start' ;;
       question_first) REPLY='请先在当前输入行写下问题，再按 Option+/' ;;
+      lens_empty) REPLY='请先输入要检查的命令，再按 Option+R' ;;
+      inspecting_locally) REPLY='正在本地分析命令影响…' ;;
       toggling) REPLY='正在切换 Coach 窗口…' ;;
       executable_missing) REPLY='找不到 aicoach 可执行文件' ;;
       *) REPLY=$key ;;
@@ -95,6 +101,8 @@ _aicoach_text() {
       generating_completion) REPLY='Generating completion… (continued typing discards the stale result)' ;;
       daemon_stopped) REPLY='Daemon is not running; run: aicoach start' ;;
       question_first) REPLY='Type a question in the current input line, then press Option+/' ;;
+      lens_empty) REPLY='Type a command to inspect, then press Option+R' ;;
+      inspecting_locally) REPLY='Inspecting command impact locally…' ;;
       toggling) REPLY='Toggling the Coach window…' ;;
       executable_missing) REPLY='The aicoach executable was not found' ;;
       *) REPLY=$key ;;
@@ -395,6 +403,17 @@ _aicoach_handle_line() {
           ;;
       esac
       ;;
+    LENS)
+      local request_id=${fields[3]:-} severity=${fields[4]:-unrated} message
+      local snapshot=$AICOACH_RISK_LENS_SNAPSHOT
+      _aicoach_decode "${fields[5]:-}"; message=$REPLY
+      [[ $request_id == $AICOACH_RISK_LENS_ID ]] || return 0
+      typeset -g AICOACH_RISK_LENS_ID=""
+      typeset -g AICOACH_RISK_LENS_SNAPSHOT=""
+      [[ $BUFFER == $snapshot ]] || return 0
+      [[ $severity == unrated ]] && severity=warning
+      _aicoach_notice "$severity" "$message"
+      ;;
     ANSWER)
       local request_id=${fields[3]:-} message
       [[ -z $AICOACH_CHAT_ID || $request_id == $AICOACH_CHAT_ID ]] || return 0
@@ -628,6 +647,25 @@ _aicoach_chat_widget() {
   fi
 }
 
+_aicoach_risk_lens_widget() {
+  if [[ -z ${BUFFER//[[:space:]]/} ]]; then
+    _aicoach_text lens_empty; zle -M "[AI Coach] $REPLY"
+    return 0
+  fi
+  _aicoach_request_id; typeset -g AICOACH_RISK_LENS_ID=$REPLY
+  typeset -g AICOACH_RISK_LENS_SNAPSHOT=$BUFFER
+  local encoded_cwd encoded_buffer
+  _aicoach_encode "$PWD"; encoded_cwd=$REPLY
+  _aicoach_encode "$BUFFER"; encoded_buffer=$REPLY
+  if _aicoach_send $'ZSH\tLENS\t'"$AICOACH_SESSION_ID"$'\t'"$AICOACH_RISK_LENS_ID"$'\t'"$encoded_cwd"$'\t'"$encoded_buffer"; then
+    _aicoach_text inspecting_locally; zle -M "[AI Coach] $REPLY"
+  else
+    typeset -g AICOACH_RISK_LENS_ID=""
+    typeset -g AICOACH_RISK_LENS_SNAPSHOT=""
+    _aicoach_text daemon_stopped; zle -M "[AI Coach] $REPLY"
+  fi
+}
+
 _aicoach_toggle_widget() {
   if (( $+commands[aicoach] )); then
     command aicoach toggle --session "$AICOACH_SESSION_ID" --tty "${TTY:-unknown}" >/dev/null 2>&1 &!
@@ -660,6 +698,7 @@ _aicoach_zshexit() {
 
 zle -N aicoach-complete _aicoach_complete_widget
 zle -N aicoach-chat _aicoach_chat_widget
+zle -N aicoach-risk-lens _aicoach_risk_lens_widget
 zle -N aicoach-toggle _aicoach_toggle_widget
 zle -N aicoach-apply-pending _aicoach_apply_pending_widget
 zle -N aicoach-apply-completion _aicoach_apply_completion_widget
@@ -678,6 +717,9 @@ _aicoach_bind_widget "$AICOACH_COMPLETION_KEY" aicoach-complete
 _aicoach_bind_widget "$AICOACH_CHAT_KEY" aicoach-chat
 [[ $AICOACH_CHAT_NATIVE_KEY == $AICOACH_CHAT_KEY ]] || \
   _aicoach_bind_widget "$AICOACH_CHAT_NATIVE_KEY" aicoach-chat
+_aicoach_bind_widget "$AICOACH_RISK_LENS_KEY" aicoach-risk-lens
+[[ $AICOACH_RISK_LENS_NATIVE_KEY == $AICOACH_RISK_LENS_KEY ]] || \
+  _aicoach_bind_widget "$AICOACH_RISK_LENS_NATIVE_KEY" aicoach-risk-lens
 _aicoach_bind_widget "$AICOACH_TOGGLE_KEY" aicoach-toggle
 [[ $AICOACH_TOGGLE_NATIVE_KEY == $AICOACH_TOGGLE_KEY ]] || \
   _aicoach_bind_widget "$AICOACH_TOGGLE_NATIVE_KEY" aicoach-toggle

@@ -23,6 +23,7 @@ auto_error_analysis = true
 [keybindings]
 completion = "^[\\t"
 chat = "^[/"
+risk_lens = "Option+R"
 toggle_coach = "Option+Space"
 
 [safety]

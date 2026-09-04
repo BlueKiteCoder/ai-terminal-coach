@@ -49,6 +49,10 @@ meta_chat_binding=$'emacs:\e/'
 native_chat_binding='viins:÷'
 assert_eq "${test_bindings[$meta_chat_binding]:-}" 'aicoach-chat'
 assert_eq "${test_bindings[$native_chat_binding]:-}" 'aicoach-chat'
+meta_lens_binding=$'emacs:\er'
+native_lens_binding='viins:®'
+assert_eq "${test_bindings[$meta_lens_binding]:-}" 'aicoach-risk-lens'
+assert_eq "${test_bindings[$native_lens_binding]:-}" 'aicoach-risk-lens'
 
 _aicoach_encode $'hello\t世界\n100%'
 encoded=$REPLY
@@ -126,6 +130,24 @@ typeset -g AICOACH_DEFER_INSERT=0
 _aicoach_apply_pending_inserts
 assert_eq "$BUFFER" 'printf queued'
 assert_eq "$CURSOR" '13'
+
+typeset -g sent_lens_line=""
+_aicoach_send() {
+  sent_lens_line=$1
+  return 0
+}
+typeset -g BUFFER='git reset --hard'
+typeset -g CURSOR=${#BUFFER}
+_aicoach_risk_lens_widget
+[[ $sent_lens_line == $'ZSH\tLENS\t'*$'\tgit reset --hard' ]] || {
+  builtin print -u2 -r -- 'FAIL: current ZLE buffer was not sent to the local Risk Lens'
+  test_failed=1
+}
+assert_eq "$last_zle_message" '[AI Coach] Inspecting command impact locally…'
+lens_request=$AICOACH_RISK_LENS_ID
+_aicoach_handle_line $'LENS\t'$AICOACH_SESSION_ID$'\t'$lens_request$'\thigh\tRisk Lens · HIGH%0AImpact: modify Git worktree'
+assert_eq "$AICOACH_RISK_LENS_ID" ''
+assert_eq "$BUFFER" 'git reset --hard'
 
 typeset -g sent_chat_line=""
 _aicoach_send() {

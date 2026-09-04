@@ -40,6 +40,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   结果只有在 Buffer 未变化时才应用。
 - 每次补全都会生成本地 **Command Patch**：显示被删除/新增的 token、AI 给出的修改
   原因，以及对最终完整 Buffer 的风险扫描结果；`insert` 补全不会只检查新增片段。
+- 在执行前按 `Option+R` 打开本地 **Risk Lens**：显示命令可能影响的对象、权限需求、
+  恢复难度和命中的规则。未知命令标为“未评级”，不会伪装成低风险。
 - 在当前输入行写下问题后按 `Option+/`，把该 Buffer 作为问题发送；不会把问题
   当作 Shell 命令执行。
 - `Option+Space` 在原终端和独立 Coach TUI 之间切换。
@@ -194,6 +196,7 @@ aicoach restart
 |---|---|---|
 | Zsh | `Option+Tab` | AI 补全/纠错/自然语言转命令，只改 Buffer |
 | Zsh | `Option+/` | 把当前 Buffer 作为问题发送并清空输入行 |
+| Zsh | `Option+R` | 本地检查当前命令的影响、权限和可恢复性；不修改 Buffer |
 | Zsh | `Option+Space` | 显示/隐藏 Coach 窗口 |
 | TUI | `Esc` | 返回原终端 |
 | TUI | `Option+I` | 把明确选中的建议插入原终端 Buffer，并自动返回终端 |
@@ -204,8 +207,9 @@ aicoach restart
 macOS 终端需将 Option 配置为 Meta/Esc 前缀。若快捷键冲突，可在 source 之前覆盖：
 
 ```zsh
-export AICOACH_COMPLETION_KEY=$'^G'
-export AICOACH_CHAT_KEY=$'^@'
+typeset -g AICOACH_COMPLETION_KEY=$'\eg'
+typeset -g AICOACH_CHAT_KEY=$'\ec'
+typeset -g AICOACH_RISK_LENS_KEY=$'\el'
 ```
 
 原生 `Tab`、Enter、Ctrl-R、history、Zsh completion 均未替换。集成文件应在
@@ -225,6 +229,26 @@ git pul origin main + Option+Tab → git pull origin main
 结果结构固定为 `replace`、`insert` 或 `suggest`，不解析 Markdown 猜命令。任何
 结果都不会自动按 Enter。Command Patch 中“未命中已知破坏性模式”只表示没有触发
 当前本地规则，不构成命令安全证明；执行权和最终判断始终属于用户。
+
+## Risk Lens：执行前看清影响
+
+在当前命令仍位于 ZLE 输入行时按 `Option+R`。Risk Lens 完全在本机运行，不需要 API
+Key、不调用 AI、不修改 Buffer，也不截获 Enter：
+
+```text
+git reset --hard  + Option+R
+
+[AI Coach]: Risk Lens · HIGH · recognized
+Impact: modify Git index and current worktree
+Privilege: no explicit elevation (current-user scope)
+Recovery: limited; may require backup, reflog, or remote history
+Evidence: git.reset-hard
+```
+
+它为 Git、文件操作、macOS `defaults`/`diskutil`/`launchctl`、Homebrew、常见包管理器、
+Docker 和 Kubernetes 提供本地命令画像，并叠加 Safety Engine 的破坏性规则。覆盖不完整
+时显示 `partial coverage`；无法识别的内部工具或脚本显示 `UNRATED`。这是一份影响提示，
+不是沙箱、权限模拟器或安全证明。
 
 ## Coach 窗口
 
@@ -423,7 +447,8 @@ AI 不代替终端，也不代替用户执行命令。即使建议来自结构�
 ## English overview
 
 AI Terminal Coach is a macOS/Zsh companion that provides local diagnostics,
-safety warnings, explainable token-level Command Patches, AI-assisted completion, quick terminal chat, share-ready
+safety warnings, a provider-free preflight Risk Lens, explainable token-level
+Command Patches, AI-assisted completion, quick terminal chat, share-ready
 privacy-scrubbed Session Capsules, and a standalone Ratatui Coach window. It
 never presses Enter or executes an AI suggestion.
 

@@ -9,15 +9,16 @@ use std::{
 
 use aicoach_ai::{AiProvider, ChatMessage, ChatRequest, ChatRole, CommandCompletionRequest};
 use aicoach_core::{
-    AnalysisCategory, AnalysisInput, AnalysisResult, CommandPatch, CommandRecord,
-    CompletionOperation as CoreCompletionOperation, GitContext, LocalAnalyzer, PrivacyRedactor,
-    RiskLevel, SafetyConfig, SafetyEngine, SafetyMode, Severity as CoreSeverity,
-    strip_terminal_sequences, try_collect_git_context,
+    AnalysisCategory, AnalysisCoverage, AnalysisInput, AnalysisResult, CommandPatch, CommandRecord,
+    CompletionOperation as CoreCompletionOperation, EffectAction, GitContext, LocalAnalyzer,
+    PrivacyRedactor, PrivilegeRequirement, RecoveryProspect, RiskLensReport, RiskLevel,
+    SafetyConfig, SafetyEngine, SafetyMode, Severity as CoreSeverity, strip_terminal_sequences,
+    try_collect_git_context,
 };
 use aicoach_ipc::{
     ClientCapabilities, ClientKind, CompletionOperation, CompletionResult, Event, EventBody, Hint,
-    Message, PROTOCOL_VERSION, Request, RequestBody, Response, ResponseResult, SessionContext,
-    SessionId, Severity, WireProtocol, decode_incoming, encode_outgoing,
+    Message, PROTOCOL_VERSION, Request, RequestBody, Response, ResponseResult, RiskLensResult,
+    SessionContext, SessionId, Severity, WireProtocol, decode_incoming, encode_outgoing,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -44,6 +45,7 @@ const MAX_INLINE_CHAT_CHARS: usize = 1_200;
 const MAX_INLINE_HINT_CHARS: usize = 240;
 const MAX_PATCH_SUMMARY_CHARS: usize = 220;
 const MAX_COMPLETION_DESCRIPTION_CHARS: usize = 500;
+const MAX_RISK_LENS_MESSAGE_CHARS: usize = 1_200;
 const INLINE_CHAT_TRUNCATED_SUFFIX_EN: &str =
     " … (answer truncated; open Coach for the full explanation)";
 const INLINE_CHAT_TRUNCATED_SUFFIX_ZH: &str = " …（回答较长；完整解释请打开 Coach 窗口）";
@@ -637,6 +639,23 @@ impl Daemon {
                         )
                         .await;
                 });
+            }
+            RequestBody::RiskLens(params) => {
+                let Some(session_id) = request.session_id else {
+                    send_missing_session(&sender, &request).await;
+                    return;
+                };
+                if self.sessions.context(session_id, None).is_none() {
+                    send_unknown_session(&sender, &request).await;
+                    return;
+                }
+                let report = self.safety.risk_lens(&params.buffer);
+                let result = risk_lens_result(report, &self.options.coach_language);
+                send_response(
+                    &sender,
+                    Response::ok(&request, ResponseResult::RiskLens(result)),
+                )
+                .await;
             }
             RequestBody::Cancel(params) => {
                 let Some(session_id) = request.session_id else {
@@ -1769,6 +1788,206 @@ fn completion_patch_description(
     ))
 }
 
+fn risk_lens_result(mut report: RiskLensReport, language: &str) -> RiskLensResult {
+    for effect in &mut report.effects {
+        effect.target = sanitize_inline(&effect.target, 160);
+    }
+    for rule_id in &mut report.rule_ids {
+        *rule_id = sanitize_inline(rule_id, 80);
+    }
+    let message = risk_lens_message(&report, language);
+    RiskLensResult { report, message }
+}
+
+fn risk_lens_message(report: &RiskLensReport, language: &str) -> String {
+    use std::fmt::Write as _;
+
+    let chinese = language == "zh-CN";
+    let rating = report.level.map_or_else(
+        || {
+            if chinese {
+                "未评级".to_owned()
+            } else {
+                "UNRATED".to_owned()
+            }
+        },
+        |level| level.to_string(),
+    );
+    let coverage = match (report.coverage, chinese) {
+        (AnalysisCoverage::Recognized, true) => "已识别",
+        (AnalysisCoverage::Partial, true) => "部分识别",
+        (AnalysisCoverage::Unknown, true) => "未知命令",
+        (AnalysisCoverage::Recognized, false) => "recognized",
+        (AnalysisCoverage::Partial, false) => "partial coverage",
+        (AnalysisCoverage::Unknown, false) => "unknown command",
+    };
+    let title = if chinese { "风险透镜" } else { "Risk Lens" };
+    let impact_label = if chinese { "影响" } else { "Impact" };
+    let privilege_label = if chinese { "权限" } else { "Privilege" };
+    let recovery_label = if chinese { "恢复" } else { "Recovery" };
+    let evidence_label = if chinese { "依据" } else { "Evidence" };
+    let mut effects = report
+        .effects
+        .iter()
+        .take(4)
+        .map(|effect| {
+            format!(
+                "{} {}",
+                localized_effect_action(effect.action, chinese),
+                localized_lens_target(&effect.target, chinese)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(if chinese { "；" } else { "; " });
+    if report.effects.len() > 4 {
+        let omitted = report.effects.len() - 4;
+        if chinese {
+            let _ = write!(effects, "；另有 {omitted} 项影响");
+        } else {
+            let _ = write!(effects, "; {omitted} more effect(s)");
+        }
+    }
+    let privilege = localized_privilege(report.privilege, chinese);
+    let recovery = localized_recovery(report.recovery, chinese);
+    let evidence = if !report.safety_rules_enabled {
+        if chinese {
+            "命令画像；自动破坏性规则已关闭".to_owned()
+        } else {
+            "command profile; automatic destructive-pattern rules are off".to_owned()
+        }
+    } else if report.rule_ids.is_empty() {
+        if chinese {
+            "本地命令画像；未命中破坏性规则".to_owned()
+        } else {
+            "local command profile; no destructive rule matched".to_owned()
+        }
+    } else {
+        report.rule_ids.join(", ")
+    };
+    sanitize_multiline(
+        &format!(
+            "{title} · {rating} · {coverage}\n{impact_label}: {effects}\n{privilege_label}: {privilege}\n{recovery_label}: {recovery}\n{evidence_label}: {evidence}"
+        ),
+        MAX_RISK_LENS_MESSAGE_CHARS,
+    )
+}
+
+fn localized_effect_action(action: EffectAction, chinese: bool) -> &'static str {
+    match (action, chinese) {
+        (EffectAction::NoneDetected, true) => "未检测到持久更改：",
+        (EffectAction::Read, true) => "读取",
+        (EffectAction::Create, true) => "创建",
+        (EffectAction::Modify, true) => "修改",
+        (EffectAction::Delete, true) => "删除",
+        (EffectAction::Execute, true) => "执行/打开",
+        (EffectAction::Network, true) => "访问网络或远端",
+        (EffectAction::Process, true) => "影响进程",
+        (EffectAction::System, true) => "影响系统",
+        (EffectAction::Unknown, true) => "未知影响：",
+        (EffectAction::NoneDetected, false) => "no persistent change detected:",
+        (EffectAction::Read, false) => "read",
+        (EffectAction::Create, false) => "create",
+        (EffectAction::Modify, false) => "modify",
+        (EffectAction::Delete, false) => "delete",
+        (EffectAction::Execute, false) => "execute/open",
+        (EffectAction::Network, false) => "access network/remote",
+        (EffectAction::Process, false) => "affect process",
+        (EffectAction::System, false) => "affect system",
+        (EffectAction::Unknown, false) => "unknown effects on",
+    }
+}
+
+fn localized_privilege(privilege: PrivilegeRequirement, chinese: bool) -> &'static str {
+    match (privilege, chinese) {
+        (PrivilegeRequirement::CurrentUser, true) => "未显式提权（当前用户范围）",
+        (PrivilegeRequirement::Unknown, true) => "无法从本地规则确定",
+        (PrivilegeRequirement::ElevatedLikely, true) => "很可能需要设备或管理员权限",
+        (PrivilegeRequirement::Administrator, true) => "通过 sudo 使用管理员权限",
+        (PrivilegeRequirement::CurrentUser, false) => "no explicit elevation (current-user scope)",
+        (PrivilegeRequirement::Unknown, false) => "unknown to local rules",
+        (PrivilegeRequirement::ElevatedLikely, false) => "device or elevated access likely",
+        (PrivilegeRequirement::Administrator, false) => "administrator via sudo",
+    }
+}
+
+fn localized_recovery(recovery: RecoveryProspect, chinese: bool) -> &'static str {
+    match (recovery, chinese) {
+        (RecoveryProspect::NotApplicable, true) => "检测到的操作无需回滚",
+        (RecoveryProspect::Reversible, true) => "通常可恢复，但需知道原状态",
+        (RecoveryProspect::Limited, true) => "有限；可能依赖备份、reflog 或远端历史",
+        (RecoveryProspect::Unknown, true) => "未知；执行前先确认备份和回滚方案",
+        (RecoveryProspect::Irreversible, true) => "不可逆；应按无撤销能力处理",
+        (RecoveryProspect::NotApplicable, false) => "none needed for detected effects",
+        (RecoveryProspect::Reversible, false) => "usually reversible if prior state is known",
+        (RecoveryProspect::Limited, false) => {
+            "limited; may require backup, reflog, or remote history"
+        }
+        (RecoveryProspect::Unknown, false) => "unknown; verify a backup and rollback plan first",
+        (RecoveryProspect::Irreversible, false) => "irreversible; assume there is no undo",
+    }
+}
+
+fn localized_lens_target(target: &str, chinese: bool) -> &str {
+    if !chinese {
+        return target;
+    }
+    match target {
+        "local files or process metadata" => "本地文件或进程元数据",
+        "directory contents" => "目录内容",
+        "standard input" => "标准输入",
+        "terminal output only" => "仅终端输出",
+        "supplied directories" => "指定目录",
+        "supplied paths" | "supplied filesystem paths" => "指定文件路径",
+        "destination path" => "目标路径",
+        "supplied file" | "output file data" => "指定文件内容",
+        "target processes" | "target process state" => "目标进程状态",
+        "remote resource" => "远端资源",
+        "remote-named download" => "使用远端名称保存的下载文件",
+        "downloaded file" => "下载文件",
+        "supplied application or document" => "指定应用或文档",
+        "macOS preference domain" => "macOS 偏好设置域",
+        "Homebrew packages" => "Homebrew 软件包",
+        "JavaScript dependencies" => "JavaScript 依赖",
+        "Python environment" => "Python 环境",
+        "local Docker state" => "本地 Docker 状态",
+        "Docker containers, images, or unused data" => "Docker 容器、镜像或未使用数据",
+        "Docker containers, images, volumes, or networks" => "Docker 容器、镜像、卷或网络",
+        "Docker containers, images, volumes, networks, or unused data" => {
+            "Docker 容器、镜像、卷、网络或未使用数据"
+        }
+        "Compose containers and networks (and volumes when requested)" => {
+            "Compose 容器和网络（指定时也包括卷）"
+        }
+        "local Git metadata and files" => "本地 Git 元数据与文件",
+        "Git index" => "Git 暂存区",
+        "local Git history" => "本地 Git 历史",
+        "Git index and current worktree" | "Git index and tracked worktree files" => {
+            "Git 暂存区与当前工作树"
+        }
+        "untracked files in the current worktree" | "untracked worktree files" => {
+            "当前工作树中的未跟踪文件"
+        }
+        "destination remote branch history" => "目标远端分支历史",
+        "local Git refs and possibly the worktree" => "本地 Git 引用及可能的工作树内容",
+        "current Kubernetes context" => "当前 Kubernetes 上下文",
+        "resources in the current Kubernetes context" => "当前 Kubernetes 上下文中的资源",
+        "disk and volume metadata" => "磁盘与卷元数据",
+        "disk or volume" | "disk device or volume data" => "磁盘设备或卷数据",
+        "launchd service state" | "launchd services" => "launchd 服务",
+        "effects outside the local rule set" => "本地规则集尚未覆盖的对象",
+        "command exceeds the local analysis limit" => "超过本地分析长度上限的命令",
+        "empty command buffer" => "空命令行",
+        "this Mac using downloaded shell code" => "由下载脚本控制的这台 Mac",
+        "CPU, memory, and process capacity" => "CPU、内存与进程容量",
+        "running sessions and unsaved work" => "运行中的会话与未保存内容",
+        "permissions or ownership of supplied paths" => "指定路径的权限或所有权",
+        "database and all contained objects" => "数据库及其全部对象",
+        "table definition and stored rows" => "数据表定义与已存数据",
+        "paths matched by find" => "find 匹配到的路径",
+        _ => target,
+    }
+}
+
 fn localized_local_analysis(mut result: AnalysisResult, language: &str) -> AnalysisResult {
     if language != "zh-CN" {
         return result;
@@ -1983,6 +2202,7 @@ fn request_method(body: &RequestBody) -> &'static str {
         RequestBody::CommandStarted(_) => "command_started",
         RequestBody::CommandFinished(_) => "command_finished",
         RequestBody::Completion(_) => "completion",
+        RequestBody::RiskLens(_) => "risk_lens",
         RequestBody::Cancel(_) => "cancel",
         RequestBody::Chat(_) => "chat",
         RequestBody::Context(_) => "context",
@@ -2225,6 +2445,43 @@ mod tests {
         assert!(description.contains("变更: − pul → + pull"));
         assert!(description.contains("本地风险扫描：已关闭"));
         assert!(description.contains("原因: 修正 Git 子命令"));
+    }
+
+    #[test]
+    fn risk_lens_is_localized_structured_and_honest_about_unknowns() {
+        let known = risk_lens_result(SafetyEngine::new().risk_lens("git reset --hard"), "zh-CN");
+        assert_eq!(known.report.level, Some(RiskLevel::High));
+        assert!(known.message.contains("风险透镜 · HIGH · 已识别"));
+        assert!(known.message.contains("影响: 修改 Git 暂存区与当前工作树"));
+        assert!(known.message.contains("恢复: 有限"));
+        assert!(known.message.contains("依据: git.reset-hard"));
+
+        let unknown = risk_lens_result(
+            SafetyEngine::new().risk_lens("company-deploy production"),
+            "en-US",
+        );
+        assert_eq!(unknown.report.level, None);
+        assert!(
+            unknown
+                .message
+                .contains("Risk Lens · UNRATED · unknown command")
+        );
+        assert!(
+            unknown
+                .message
+                .contains("Privilege: unknown to local rules")
+        );
+        assert!(unknown.message.contains("Recovery: unknown"));
+
+        let hostile = risk_lens_result(
+            SafetyEngine::new().risk_lens("rm bad\u{1b}[31m\u{202e}txt"),
+            "en-US",
+        );
+        assert!(hostile.report.effects.iter().all(|effect| {
+            !contains_terminal_control(&effect.target) && !effect.target.contains('\u{202e}')
+        }));
+        assert!(!hostile.message.contains('\u{1b}'));
+        assert!(!hostile.message.contains('\u{202e}'));
     }
 
     #[test]
