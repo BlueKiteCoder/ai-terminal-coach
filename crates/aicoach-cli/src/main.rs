@@ -1,5 +1,7 @@
 #![allow(clippy::items_after_statements, clippy::too_many_lines)]
 
+mod capsule;
+
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -56,6 +58,8 @@ enum Commands {
     Config(ConfigArgs),
     /// Read bounded daemon logs.
     Logs(LogsArgs),
+    /// Export a private-by-default Markdown capsule of the active terminal session.
+    Capsule(CapsuleArgs),
     /// Toggle the native Terminal.app/iTerm2 Coach window.
     Toggle(ToggleArgs),
 }
@@ -124,6 +128,25 @@ struct ToggleArgs {
     session: String,
     #[arg(long, default_value = "")]
     tty: String,
+}
+
+#[derive(Args, Debug)]
+struct CapsuleArgs {
+    /// Shell session UUID. Defaults to the most recently focused terminal.
+    #[arg(long, default_value = "")]
+    session: String,
+    /// Number of recent commands to request from the daemon.
+    #[arg(long, default_value_t = 20, value_parser = capsule::parse_capsule_limit)]
+    last: usize,
+    /// Include only commands whose exit status was non-zero.
+    #[arg(long)]
+    failed_only: bool,
+    /// Copy the generated Markdown to the macOS clipboard.
+    #[arg(long)]
+    copy: bool,
+    /// Write the generated Markdown to a private file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +244,7 @@ fn run() -> Result<()> {
         Commands::Doctor(args) => doctor(&paths, args.json),
         Commands::Config(args) => config_command(&paths, args.action),
         Commands::Logs(args) => logs(&paths, &args),
+        Commands::Capsule(args) => capsule::export(&paths, &args),
         Commands::Toggle(args) => toggle(&paths, &args),
     }
 }
@@ -387,12 +411,10 @@ fn stop(paths: &Paths) -> Result<()> {
     let _ = request_shutdown(&paths.socket);
     stop_agent(&paths.daemon_plist, DAEMON_LABEL);
     let (running, pid) = is_daemon_running(paths);
-    if running {
-        if let Some(pid) = pid {
-            let _ = Command::new("/bin/kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-        }
+    if running && let Some(pid) = pid {
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
     }
     for _ in 0..20 {
         if !is_daemon_running(paths).0 {

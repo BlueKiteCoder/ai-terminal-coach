@@ -12,7 +12,7 @@ use aicoach_core::{
     AnalysisCategory, AnalysisInput, AnalysisResult, CommandRecord,
     CompletionOperation as CoreCompletionOperation, GitContext, LocalAnalyzer, PrivacyRedactor,
     RiskLevel, SafetyConfig, SafetyEngine, SafetyMode, Severity as CoreSeverity,
-    try_collect_git_context,
+    strip_terminal_sequences, try_collect_git_context,
 };
 use aicoach_ipc::{
     ClientCapabilities, ClientKind, CompletionOperation, CompletionResult, Event, EventBody, Hint,
@@ -802,13 +802,12 @@ impl Daemon {
         if self.options.capture_screen_tail
             && job.stdout.as_deref().is_none_or(str::is_empty)
             && job.stderr.as_deref().is_none_or(str::is_empty)
+            && let Some((tty, terminal)) = self.sessions.terminal_info(job.session_id)
         {
-            if let Some((tty, terminal)) = self.sessions.terminal_info(job.session_id) {
-                job.screen_tail = capture_screen_tail(&tty, terminal.as_deref()).await;
-                if let Some(screen_tail) = job.screen_tail.as_deref() {
-                    self.sessions
-                        .record_screen_tail(job.session_id, job.command_id, screen_tail);
-                }
+            job.screen_tail = capture_screen_tail(&tty, terminal.as_deref()).await;
+            if let Some(screen_tail) = job.screen_tail.as_deref() {
+                self.sessions
+                    .record_screen_tail(job.session_id, job.command_id, screen_tail);
             }
         }
         let mut input = analysis_input(&job);
@@ -1888,94 +1887,6 @@ fn sanitize_multiline(value: &str, max_chars: usize) -> String {
         .chars()
         .take(max_chars)
         .collect()
-}
-
-#[derive(Clone, Copy)]
-enum EscapeState {
-    Text,
-    Escape,
-    Csi,
-    Osc,
-    OscEscape,
-    ControlString,
-    ControlStringEscape,
-}
-
-fn strip_terminal_sequences(value: &str, multiline: bool) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut state = EscapeState::Text;
-    for character in value.chars() {
-        state = match state {
-            EscapeState::Text => match character {
-                '\u{1b}' => EscapeState::Escape,
-                '\u{9b}' => EscapeState::Csi,
-                '\u{9d}' => EscapeState::Osc,
-                '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => EscapeState::ControlString,
-                '\n' if multiline => {
-                    output.push('\n');
-                    EscapeState::Text
-                }
-                '\t' if multiline => {
-                    output.push('\t');
-                    EscapeState::Text
-                }
-                control if is_terminal_control(control) => {
-                    if !multiline && control.is_whitespace() {
-                        output.push(' ');
-                    }
-                    EscapeState::Text
-                }
-                ordinary => {
-                    output.push(ordinary);
-                    EscapeState::Text
-                }
-            },
-            EscapeState::Escape => match character {
-                '[' => EscapeState::Csi,
-                ']' => EscapeState::Osc,
-                'P' | 'X' | '^' | '_' => EscapeState::ControlString,
-                _ => EscapeState::Text,
-            },
-            EscapeState::Csi => {
-                if character == '\u{1b}' {
-                    EscapeState::Escape
-                } else if ('@'..='~').contains(&character) {
-                    EscapeState::Text
-                } else {
-                    EscapeState::Csi
-                }
-            }
-            EscapeState::Osc => match character {
-                '\u{7}' | '\u{9c}' => EscapeState::Text,
-                '\u{1b}' => EscapeState::OscEscape,
-                _ => EscapeState::Osc,
-            },
-            EscapeState::OscEscape => {
-                if character == '\\' {
-                    EscapeState::Text
-                } else if character == '\u{1b}' {
-                    EscapeState::OscEscape
-                } else {
-                    EscapeState::Osc
-                }
-            }
-            EscapeState::ControlString => match character {
-                '\u{7}' | '\u{9c}' => EscapeState::Text,
-                '\u{1b}' => EscapeState::ControlStringEscape,
-                _ => EscapeState::ControlString,
-            },
-            EscapeState::ControlStringEscape => {
-                if character == '\\' {
-                    EscapeState::Text
-                } else if character == '\u{1b}' {
-                    EscapeState::ControlStringEscape
-                } else {
-                    EscapeState::ControlString
-                }
-            }
-        };
-    }
-    output
 }
 
 fn request_method(body: &RequestBody) -> &'static str {

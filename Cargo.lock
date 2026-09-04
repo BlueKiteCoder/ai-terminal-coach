@@ -35,6 +35,7 @@ dependencies = [
  "aicoach-core",
  "aicoach-ipc",
  "anyhow",
+ "chrono",
  "clap",
  "dirs",
  "libc",

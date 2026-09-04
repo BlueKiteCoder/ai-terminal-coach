@@ -51,13 +51,13 @@ pub fn collect_git_context(cwd: impl AsRef<Path>) -> Result<Option<GitContext>, 
 
     // `remote get-url` reads only local config and avoids sending credentials or
     // making network calls. Credentials embedded in HTTPS URLs are stripped.
-    if let Ok(remote_output) = run_git(cwd, &["remote", "get-url", "origin"]) {
-        if remote_output.status.success() {
-            let remote = String::from_utf8_lossy(&remote_output.stdout);
-            let remote = remote.trim();
-            if !remote.is_empty() {
-                context.remote = Some(sanitize_remote(remote));
-            }
+    if let Ok(remote_output) = run_git(cwd, &["remote", "get-url", "origin"])
+        && remote_output.status.success()
+    {
+        let remote = String::from_utf8_lossy(&remote_output.stdout);
+        let remote = remote.trim();
+        if !remote.is_empty() {
+            context.remote = Some(sanitize_remote(remote));
         }
     }
     Ok(Some(context))

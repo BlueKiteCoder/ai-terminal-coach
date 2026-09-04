@@ -168,16 +168,15 @@ impl Drop for IpcClient {
     fn drop(&mut self) {
         // The reader task owns one `Arc`; abort it when only that task and the
         // last public handle remain so a forgotten `close` cannot leak a socket.
-        if Arc::strong_count(&self.inner) == 2 {
-            if let Some(task) = self
+        if Arc::strong_count(&self.inner) == 2
+            && let Some(task) = self
                 .inner
                 .reader_task
                 .lock()
                 .expect("reader task mutex poisoned")
                 .take()
-            {
-                task.abort();
-            }
+        {
+            task.abort();
         }
     }
 }

@@ -1,10 +1,19 @@
 # AI Terminal Coach
 
+[![CI](https://img.shields.io/github/actions/workflow/status/BlueKiteCoder/ai-terminal-coach/ci.yml?branch=main&style=flat-square)](https://github.com/BlueKiteCoder/ai-terminal-coach/actions/workflows/ci.yml)
+![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple&style=flat-square)
+![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust&style=flat-square)
+[![MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+
 [English](#english-overview) · [简体中文](#ai-terminal-coach)
+
+**失败 → 本地诊断 → AI 协作 → 安全插入 → 一键分享排障现场。**
 
 AI Terminal Coach 是一个只面向 macOS/Zsh 的终端协作层。它不替代 Terminal，
 不截获 Enter，也不自动执行 AI 建议；它通过 ZLE、Zsh hooks、Unix Domain
 Socket daemon 和独立 Ratatui 窗口，寄生在现有终端工作流中。
+
+产品方向与可验证的里程碑见 [ROADMAP.md](ROADMAP.md)。
 
 ```text
 Terminal.app / iTerm2 / 其他 macOS 终端
@@ -45,6 +54,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   analysis、独立 fast/smart 模型、超时、并发限制、取消和有限瞬态重试。
 - 默认对 API 上行内容启用 API key/token/password/Authorization/Cookie/JWT/
   private key/SSH key/敏感环境变量脱敏；可以关闭。
+- `aicoach capsule` 把当前终端最近的命令、状态、耗时和已保留的可用输出整理成可分享的
+  Markdown。它完全在本机生成、强制脱敏并清除终端控制序列，可一键复制到剪贴板。
 - Provider 不可用时 daemon 自动进入 local-only 模式，Zsh 完全正常工作。
 - 界面状态、本地分析和 AI 回复支持英文与中文；全新安装默认英文。
 
@@ -221,6 +232,28 @@ Terminal.app/iTerm2 的窗口由 JXA (`osascript -l JavaScript`) 控制。用户
 切换时恢复。仓库还包含 Swift/Carbon 全局 `Option+Space` helper；构建脚本在
 Swift 不可用时会回退到 Objective-C/AppKit 实现，ZLE 内的快捷键不依赖 helper。
 
+## Session Capsule：一键分享排障现场
+
+当命令在本机失败、需要提交 GitHub Issue 或向同事求助时，不必手工复制散落的命令
+和输出：
+
+```zsh
+# 输出最近 20 条命令的 Markdown
+aicoach capsule
+
+# 只保留失败命令，并复制到 macOS 剪贴板
+aicoach capsule --failed-only --copy
+
+# 将最近 30 条命令写入 owner-only 文件
+aicoach capsule --last 30 --output incident.md
+```
+
+Capsule 直接读取 daemon 已经保留的有界 session context，不会发起 AI 请求，也不会
+额外扫描 Terminal history。因为结果通常会离开本机，它始终启用密钥脱敏——即使
+`privacy.redaction` 被关闭；同时把当前用户主目录替换为 `~`、移除 ANSI/OSC 等终端
+控制序列，并用动态 Markdown fence 包住不可信输出。脱敏属于防御性 best effort，
+公开分享前仍应人工检查。
+
 ## 配置
 
 配置文件：`~/.config/aicoach/config.toml`。
@@ -258,6 +291,7 @@ aicoach start | stop | restart | status [--json]
 aicoach doctor [--json]
 aicoach config show|path|validate|set|edit|set-key|delete-key
 aicoach logs [-n 100] [--follow]
+aicoach capsule [--last 20] [--failed-only] [--copy] [--output FILE]
 aicoach toggle [--session UUID] [--tty /dev/ttys001]
 ```
 
@@ -384,8 +418,9 @@ AI 不代替终端，也不代替用户执行命令。即使建议来自结构�
 ## English overview
 
 AI Terminal Coach is a macOS/Zsh companion that provides local diagnostics,
-safety warnings, AI-assisted completion, quick terminal chat, and a standalone
-Ratatui Coach window. It never presses Enter or executes an AI suggestion.
+safety warnings, AI-assisted completion, quick terminal chat, share-ready
+privacy-scrubbed Session Capsules, and a standalone Ratatui Coach window. It
+never presses Enter or executes an AI suggestion.
 
 The repository ships with no API endpoint, model ID, or API key. The default
 provider is disabled, screen-tail capture is opt-in, and the application runs

@@ -1,0 +1,47 @@
+name: Feature proposal
+description: Propose a focused improvement to a real macOS/Zsh terminal workflow
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Strong proposals start with a recurring workflow problem. AI Terminal Coach never executes suggestions or intercepts Enter, keeps the shell responsive without AI, and treats terminal context as private.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Workflow problem
+      description: What repeatedly slows you down or makes the terminal less safe?
+    validations:
+      required: true
+  - type: textarea
+    id: current_workaround
+    attributes:
+      label: Current workaround
+      description: How do you solve this today, and where does that approach break down?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed experience
+      description: Describe what the user sees and does. A short terminal example is welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: safety_privacy
+    attributes:
+      label: Safety and privacy impact
+      description: What data is read, retained, or sent to a provider? Can the feature modify files or commands?
+    validations:
+      required: true
+  - type: checkboxes
+    id: guardrails
+    attributes:
+      label: Product fit
+      options:
+        - label: The proposal keeps command execution under explicit user control.
+          required: true
+        - label: The proposal remains useful or fails safely when the AI provider is unavailable.
+          required: true

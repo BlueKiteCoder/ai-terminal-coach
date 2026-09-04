@@ -221,30 +221,30 @@ impl LocalAnalyzer {
         let tokens = shell_words::split(command).unwrap_or_default();
         let executable = effective_executable(&tokens);
 
-        if !self.missing_command.is_match(&output) {
-            if let Some(correction) = command_spelling_correction(command, &tokens) {
-                let (category, title) = match executable.as_str() {
-                    "git" => (AnalysisCategory::Git, "Git subcommand appears misspelled"),
-                    "docker" => (
-                        AnalysisCategory::Docker,
-                        "Docker argument appears misspelled",
-                    ),
-                    "brew" | "npm" | "pnpm" | "yarn" | "pip" | "pip3" => (
-                        AnalysisCategory::PackageManager,
-                        "Package-manager subcommand appears misspelled",
-                    ),
-                    _ => (AnalysisCategory::Spelling, "Command appears misspelled"),
-                };
-                return issue(
-                    category,
-                    Severity::Warning,
-                    title,
-                    "A local spelling match is available.",
-                    Some(correction),
-                    false,
-                    0.94,
-                );
-            }
+        if !self.missing_command.is_match(&output)
+            && let Some(correction) = command_spelling_correction(command, &tokens)
+        {
+            let (category, title) = match executable.as_str() {
+                "git" => (AnalysisCategory::Git, "Git subcommand appears misspelled"),
+                "docker" => (
+                    AnalysisCategory::Docker,
+                    "Docker argument appears misspelled",
+                ),
+                "brew" | "npm" | "pnpm" | "yarn" | "pip" | "pip3" => (
+                    AnalysisCategory::PackageManager,
+                    "Package-manager subcommand appears misspelled",
+                ),
+                _ => (AnalysisCategory::Spelling, "Command appears misspelled"),
+            };
+            return issue(
+                category,
+                Severity::Warning,
+                title,
+                "A local spelling match is available.",
+                Some(correction),
+                false,
+                0.94,
+            );
         }
 
         // Output-based detectors are intentionally gated on a failed exit code;
