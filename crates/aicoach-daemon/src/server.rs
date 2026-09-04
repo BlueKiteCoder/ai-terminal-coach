@@ -1483,6 +1483,13 @@ impl Daemon {
 }
 
 async fn collect_source_card(query: &SourceQuery) -> Option<SourceCard> {
+    collect_source_card_with_timeout(query, LOCAL_SOURCE_TIMEOUT).await
+}
+
+async fn collect_source_card_with_timeout(
+    query: &SourceQuery,
+    timeout: Duration,
+) -> Option<SourceCard> {
     let mut command = match &query.invocation {
         SourceInvocation::CommandHelp { program, arguments } => {
             let mut command = Command::new(program);
@@ -1528,7 +1535,7 @@ async fn collect_source_card(query: &SourceQuery) -> Option<SourceCard> {
         );
         Some((status.ok()?, stdout.ok()?, stderr.ok()?))
     };
-    let captured = if let Ok(captured) = tokio::time::timeout(LOCAL_SOURCE_TIMEOUT, capture).await {
+    let captured = if let Ok(captured) = tokio::time::timeout(timeout, capture).await {
         captured?
     } else {
         let _ = child.start_kill();
@@ -2625,7 +2632,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("allowlisted source query");
-        let card = collect_source_card(&query)
+        // The product stays within its 800ms interaction budget. This
+        // integration test gives a heavily contended CI host more time so it
+        // tests the allowlisted invocation and parser rather than scheduler
+        // latency.
+        let card = collect_source_card_with_timeout(&query, Duration::from_secs(5))
             .await
             .expect("local git help source card");
         assert_eq!(card.reference, "git reset -h");
