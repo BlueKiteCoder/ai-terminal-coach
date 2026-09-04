@@ -414,17 +414,16 @@ impl SessionManager {
         let session = state.sessions.get_mut(&session_id)?;
         session.last_accessed = Instant::now();
         let mut superseded = None;
-        if kind == ActiveRequestKind::Completion {
-            if let Some((old_id, old)) = session
+        if kind == ActiveRequestKind::Completion
+            && let Some((old_id, old)) = session
                 .active
                 .iter()
                 .find(|(_, active)| active.kind == ActiveRequestKind::Completion)
                 .map(|(id, active)| (*id, active.cancellation.clone()))
-            {
-                old.cancel();
-                session.active.remove(&old_id);
-                superseded = Some(old_id);
-            }
+        {
+            old.cancel();
+            session.active.remove(&old_id);
+            superseded = Some(old_id);
         }
         let cancellation = CancellationToken::new();
         session.active.insert(

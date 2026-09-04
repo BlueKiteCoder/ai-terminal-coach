@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use aicoach_core::{Config, ProductPaths};
+use aicoach_core::{Config, ProductPaths, strip_terminal_sequences};
 use aicoach_ipc::{
     ChatParams, ClientCapabilities, ClientKind, ContextParams, EventBody, HelloParams, Hint,
     InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION, RegisterSessionParams, Request,
@@ -1240,22 +1240,15 @@ fn extract_commands(content: &str) -> Vec<String> {
 }
 
 fn sanitize_terminal_text(value: &str, preserve_layout: bool) -> String {
-    value
-        .chars()
-        .filter_map(|character| {
-            if preserve_layout && matches!(character, '\n' | '\t') {
-                Some(character)
-            } else if character.is_control() {
-                if preserve_layout && character == '\r' {
-                    Some('\n')
-                } else {
-                    None
-                }
-            } else {
-                Some(character)
-            }
-        })
-        .collect()
+    let sanitized = strip_terminal_sequences(value, true);
+    if preserve_layout {
+        sanitized
+    } else {
+        sanitized
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect()
+    }
 }
 
 fn load_history(path: &Path, session_id: SessionId) -> Result<Vec<UiMessage>> {
@@ -1370,7 +1363,7 @@ mod tests {
     fn terminal_control_sequences_are_removed_from_display_text() {
         assert_eq!(
             sanitize_terminal_text("safe\u{1b}]52;c;owned\u{7}\nnext", true),
-            "safe]52;c;owned\nnext"
+            "safe\nnext"
         );
         assert_eq!(sanitize_terminal_text("a\nb", false), "ab");
     }

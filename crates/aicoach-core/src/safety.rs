@@ -174,10 +174,10 @@ impl SafetyEngine {
             if !args.is_empty() {
                 self.assess_source(&args.join(" "), depth + 1, assessment);
             }
-        } else if command == "xargs" {
-            if let Some(nested) = xargs_command(args) {
-                self.assess_segment(&nested, depth + 1, assessment);
-            }
+        } else if command == "xargs"
+            && let Some(nested) = xargs_command(args)
+        {
+            self.assess_segment(&nested, depth + 1, assessment);
         }
 
         match command.as_str() {

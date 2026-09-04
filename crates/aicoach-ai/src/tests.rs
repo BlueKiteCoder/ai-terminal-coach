@@ -109,20 +109,20 @@ async fn read_http_request(socket: &mut TcpStream) -> String {
             break;
         }
         bytes.extend_from_slice(&buffer[..read]);
-        if expected_length.is_none() {
-            if let Some(header_end) = find_bytes(&bytes, b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&bytes[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                expected_length = Some(header_end + 4 + content_length);
-            }
+        if expected_length.is_none()
+            && let Some(header_end) = find_bytes(&bytes, b"\r\n\r\n")
+        {
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            expected_length = Some(header_end + 4 + content_length);
         }
         if expected_length.is_some_and(|length| bytes.len() >= length) {
             break;

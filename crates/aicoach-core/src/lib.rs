@@ -11,6 +11,7 @@ pub mod git;
 pub mod models;
 pub mod privacy;
 pub mod safety;
+pub mod terminal;
 
 pub use analyzer::{AnalysisCategory, LocalAnalysis, LocalAnalyzer};
 pub use config::{
@@ -26,3 +27,4 @@ pub use models::{
 };
 pub use privacy::{PrivacyError, PrivacyRedactor};
 pub use safety::{RiskLevel, SafetyAssessment, SafetyEngine, SafetyFinding};
+pub use terminal::strip_terminal_sequences;
