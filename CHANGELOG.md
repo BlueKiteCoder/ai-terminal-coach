@@ -5,6 +5,11 @@ All notable user-visible changes are recorded here. This project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Source Card process integration tests tolerate contended CI scheduling without changing the
+  product's 800ms local-documentation timeout.
+
 ## [0.1.0] - 2026-09-04
 
 ### Added
