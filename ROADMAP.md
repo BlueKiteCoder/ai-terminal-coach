@@ -26,7 +26,8 @@ honest privacy boundary.
 - [x] **Session Capsule:** locally export a redacted, terminal-safe Markdown incident report.
 - [ ] Signed and notarized Apple Silicon and Intel release artifacts.
 - [ ] Working Homebrew tap with an upgrade-safe install flow.
-- [ ] A two-minute interactive onboarding and shortcut verifier.
+- [x] A two-minute interactive onboarding and physical shortcut verifier with safe calibration
+  and automatic live settings reload.
 - [ ] Demo assets showing the complete failure → diagnosis → fix workflow.
 
 Exit gate: a new user can install, configure, understand the safety model, experience the core

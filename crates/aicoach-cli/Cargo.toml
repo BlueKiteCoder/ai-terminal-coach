@@ -15,6 +15,7 @@ aicoach-ipc = { path = "../aicoach-ipc" }
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 dirs.workspace = true
 libc.workspace = true
 serde.workspace = true

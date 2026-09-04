@@ -62,6 +62,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   Markdown。它完全在本机生成、强制脱敏并清除终端控制序列，可一键复制到剪贴板。
 - Provider 不可用时 daemon 自动进入 local-only 模式，Zsh 完全正常工作。
 - 界面状态、本地分析和 AI 回复支持英文与中文；全新安装默认英文。
+- `aicoach onboard` 提供两分钟引导：读取终端实际发送的 Option 按键、拒绝会覆盖
+  普通输入的危险绑定、自动校准安全序列，并用干净 Zsh 实例验证每个组件确实可达。
 
 ## 系统要求
 
@@ -106,6 +108,13 @@ aicoach install
 
 ```zsh
 source ~/.config/aicoach/aicoach.zsh
+```
+
+随后运行两分钟引导。它不会执行你输入或 AI 建议的 Shell 命令，也不会为了校准
+快捷键调用 AI：
+
+```zsh
+aicoach onboard
 ```
 
 ## API Provider、语言与密钥
@@ -212,6 +221,18 @@ typeset -g AICOACH_CHAT_KEY=$'\ec'
 typeset -g AICOACH_RISK_LENS_KEY=$'\el'
 ```
 
+不同终端和键盘布局可能为同一个 Option 组合键发送不同字节。不要再靠猜测修改转义
+序列：运行 `aicoach onboard`，按提示实际按下 `Option+Tab`、`Option+/` 和
+`Option+R`。校准器只接受带 Meta 前缀或安全的 macOS 原生字符，不会把普通的
+`r`、`/`、Tab 或 Enter 绑定掉。仅检查现有安装而不读取按键或修改文件：
+
+```zsh
+aicoach onboard --check
+```
+
+CLI 生成的快捷键、语言和本地开关带有设置版本；打开过的终端会在下一个 Prompt
+自动读取变更。`.zshrc` 中 source 之前的显式覆盖仍然优先。
+
 原生 `Tab`、Enter、Ctrl-R、history、Zsh completion 均未替换。集成文件应在
 Oh My Zsh、Powerlevel10k/Starship、autosuggestions 和 syntax-highlighting 之后
 source；异步消息使用 `zle -I`、`reset-prompt`、`redisplay` 安全重绘。
@@ -296,8 +317,8 @@ aicoach config edit
 ```
 
 Daemon 在启动时读取配置，修改 AI、隐私、上下文或 Coach 设置后请执行
-`aicoach restart`。快捷键和 Shell 本地开关由生成的 Zsh 设置加载，现有终端需重新
-`source ~/.config/aicoach/aicoach.zsh` 或打开新窗口。
+`aicoach restart`。快捷键、语言和 Shell 本地开关由生成的 Zsh 设置加载，并在现有
+终端的下一个 Prompt 自动刷新；升级旧版 Shell 集成后只需新开一个终端标签页。
 
 主要默认值见 [`config/default.toml`](config/default.toml)。上下文边界：
 
@@ -315,6 +336,7 @@ Daemon 不把完整 Terminal history 持久化；日志只记录请求类型、s
 
 ```text
 aicoach install [--no-start] [--no-hotkey]
+aicoach onboard [--check] [--skip-shortcuts]
 aicoach uninstall [--purge]
 aicoach start | stop | restart | status [--json]
 aicoach doctor [--json]
@@ -339,6 +361,7 @@ aicoach toggle [--session UUID] [--tty /dev/ttys001]
 
 ```zsh
 aicoach doctor
+aicoach onboard --check
 aicoach status
 aicoach logs -n 200
 ```
@@ -348,6 +371,8 @@ aicoach logs -n 200
   上下文发送到服务或主动探测模型；实际授权模型/网络状态在首次 AI 请求时确认。
 - AI 返回模型不存在：登录 Provider 查看当前 key 的授权模型，修改 `ai.models.*`。
 - `Option+…` 产生特殊字符：启用终端的 “Use Option as Meta key”。
+- 不确定终端发送了什么：运行 `aicoach onboard` 进行实际按键校准；支持 `Esc` 跳过
+  单项，`Ctrl+C` 安全退出。
 - `Option+Space` 被系统/其他应用占用：更换绑定或只使用终端局部快捷键。
 - API timeout：Shell 不会等待；completion 默认 2.5 秒，analysis 12 秒，chat 90 秒。
 - 交互程序（vim/ssh/python 等）：hook 只看到程序启动和最终退出，不截获内部按键。
@@ -377,6 +402,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 zsh scripts/test-zsh-integration.zsh
+zsh scripts/test-onboarding-e2e.zsh
 zsh scripts/benchmark-zsh-hooks.zsh
 cargo build --release --locked
 scripts/package-release.sh
@@ -384,8 +410,9 @@ scripts/package-release.sh
 
 测试覆盖 analyzer、safety、privacy、context、Git context、AI 合法/非法/缺字段
 JSON、timeout/cancel/retry/SSE、Unix socket、连接断开、多 session、请求取消、Zsh
-编码与 Buffer/CURSOR 修改。性能脚本实测 source、preexec、precmd，并强制本地 hook
-平均耗时低于 10ms。AI tests 使用本地 TCP mock，不调用真实 Provider。
+编码与 Buffer/CURSOR 修改。Onboarding E2E 在隔离的临时 HOME 和伪终端内发送真实
+Meta 字节，验证校准、落盘与 Zsh widget 绑定。性能脚本实测 source、preexec、precmd，
+并强制本地 hook 平均耗时低于 10ms。AI tests 使用本地 TCP mock，不调用真实 Provider。
 
 ## 目录与架构
 
@@ -466,8 +493,12 @@ mkdir -p ~/.local/bin
 install -m 0755 target/release/aicoach{,d,-ui} ~/.local/bin/
 export PATH="$HOME/.local/bin:$PATH"
 aicoach install
+aicoach onboard
 ```
 
+Onboarding captures the physical Option sequences emitted by the current terminal,
+refuses unsafe bindings that would replace normal typing, and verifies the generated
+widgets in a clean Zsh process. Use `aicoach onboard --check` for a read-only check.
 See the Chinese sections above for configuration, shortcuts, privacy boundaries,
 troubleshooting, and release requirements. Licensed under the
 [MIT License](LICENSE).
