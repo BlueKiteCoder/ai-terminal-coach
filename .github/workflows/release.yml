@@ -1,0 +1,311 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - "README.md"
+      - "config/**"
+      - "crates/**"
+      - "homebrew/**"
+      - "macos/**"
+      - "scripts/**"
+      - "shell/**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to build; leave empty for a dry run of the selected ref"
+        required: false
+        type: string
+      publish:
+        description: "Sign, notarize, attest, and publish the existing tag"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  validate:
+    name: Validate release metadata and tests
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      official: ${{ steps.metadata.outputs.official }}
+      sha: ${{ steps.metadata.outputs.sha }}
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Install Rust 1.88 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: zsh scripts/check-no-secrets.sh
+
+      - name: Validate version, tag, and release ancestry
+        id: metadata
+        shell: zsh {0}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          REQUESTED_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          tag="v$version"
+          official=false
+
+          if [[ "$EVENT_NAME" == push && "$REF_TYPE" == tag ]]; then
+            tag="$REF_NAME"
+            official=true
+          elif [[ -n "${REQUESTED_TAG:-}" ]]; then
+            tag="$REQUESTED_TAG"
+          fi
+          if [[ "${REQUESTED_PUBLISH:-false}" == true ]]; then
+            [[ -n "${REQUESTED_TAG:-}" ]] || {
+              print -u2 'manual publishing requires an existing tag input'
+              exit 1
+            }
+            official=true
+          fi
+
+          scripts/verify-release-tag.sh "$tag"
+          if [[ "$official" == true ]]; then
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor HEAD origin/main || {
+              print -u2 'official releases must point to a commit already merged into main'
+              exit 1
+            }
+          fi
+
+          print -r -- "version=$version" >> "$GITHUB_OUTPUT"
+          print -r -- "tag=$tag" >> "$GITHUB_OUTPUT"
+          print -r -- "official=$official" >> "$GITHUB_OUTPUT"
+          print -r -- "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo run --locked -p aicoach-core --example render_demo -- --check docs/assets/workflow.svg
+      - run: zsh scripts/test-zsh-integration.zsh
+      - run: zsh scripts/test-onboarding-e2e.zsh
+      - run: brew style homebrew/aicoach.rb
+
+  build:
+    name: Build ${{ matrix.arch }} archive
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.sha }}
+
+      - name: Install Rust 1.88 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+
+      - name: Confirm native runner architecture
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == "${{ matrix.arch }}" ]]
+
+      - name: Import Developer ID certificate
+        if: needs.validate.outputs.official == 'true'
+        shell: zsh {0}
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$CERTIFICATE_P12_BASE64" && -n "$CERTIFICATE_PASSWORD" && -n "$SIGNING_IDENTITY" ]] || {
+            print -u2 'Developer ID secrets are incomplete; refusing an unsigned public release'
+            exit 1
+          }
+          certificate="$RUNNER_TEMP/aicoach-release.p12"
+          keychain="$RUNNER_TEMP/aicoach-signing.keychain-db"
+          keychain_password=$(uuidgen)
+          print -rn -- "$CERTIFICATE_P12_BASE64" | /usr/bin/base64 -D > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain" | grep -F -- "$SIGNING_IDENTITY"
+
+      - name: Build and verify archive
+        shell: zsh {0}
+        env:
+          AICOACH_REQUIRE_HOTKEY: "1"
+          AICOACH_REQUIRE_SIGNED: ${{ needs.validate.outputs.official == 'true' && '1' || '0' }}
+          AICOACH_SIGNING_IDENTITY: ${{ needs.validate.outputs.official == 'true' && secrets.MACOS_SIGNING_IDENTITY || '' }}
+        run: |
+          set -euo pipefail
+          scripts/package-release.sh "${{ needs.validate.outputs.version }}"
+
+      - name: Prove dry-run archives are reproducible
+        if: needs.validate.outputs.official != 'true'
+        shell: zsh {0}
+        env:
+          AICOACH_REQUIRE_HOTKEY: "1"
+        run: |
+          set -euo pipefail
+          checksum="dist/aicoach-${{ needs.validate.outputs.version }}-macos-${{ matrix.arch }}.sha256"
+          cp "$checksum" "$RUNNER_TEMP/first.sha256"
+          scripts/package-release.sh "${{ needs.validate.outputs.version }}"
+          cmp "$RUNNER_TEMP/first.sha256" "$checksum"
+
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: aicoach-${{ needs.validate.outputs.version }}-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Notarize, attest, and publish
+    if: needs.validate.outputs.official == 'true'
+    needs: [validate, build]
+    runs-on: macos-14
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: aicoach-${{ needs.validate.outputs.version }}-macos-*
+          path: dist
+          merge-multiple: true
+
+      - name: Reverify signed assets
+        shell: zsh {0}
+        env:
+          AICOACH_REQUIRE_HOTKEY: "1"
+          AICOACH_REQUIRE_SIGNED: "1"
+        run: |
+          set -euo pipefail
+          for arch in arm64 x86_64; do
+            scripts/verify-release-archive.sh \
+              "dist/aicoach-${{ needs.validate.outputs.version }}-macos-$arch.tar.gz" \
+              "${{ needs.validate.outputs.version }}" "$arch"
+            scripts/verify-release-archive.sh \
+              "dist/aicoach-${{ needs.validate.outputs.version }}-macos-$arch.zip" \
+              "${{ needs.validate.outputs.version }}" "$arch"
+          done
+
+      - name: Submit signed binaries for Apple notarization
+        shell: zsh {0}
+        env:
+          APPLE_NOTARY_API_KEY_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          [[ -n "$APPLE_NOTARY_API_KEY_BASE64" && -n "$APPLE_NOTARY_KEY_ID" && -n "$APPLE_NOTARY_ISSUER_ID" ]] || {
+            print -u2 'Apple notarization secrets are incomplete; refusing to publish'
+            exit 1
+          }
+          api_key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          print -rn -- "$APPLE_NOTARY_API_KEY_BASE64" | /usr/bin/base64 -D > "$api_key"
+          chmod 0600 "$api_key"
+          for archive in dist/*.zip; do
+            result=$(xcrun notarytool submit "$archive" \
+              --key "$api_key" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --wait --timeout 30m --output-format json)
+            print -r -- "$result"
+            status=$(print -r -- "$result" | plutil -extract status raw -o - -)
+            [[ "$status" == Accepted ]] || {
+              print -u2 -- "Apple notarization rejected ${archive:t}: $status"
+              exit 1
+            }
+          done
+
+      - name: Render stable Homebrew formula
+        shell: zsh {0}
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          source_archive="$RUNNER_TEMP/$RELEASE_TAG.tar.gz"
+          curl --fail --location --retry 3 --silent --show-error \
+            "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/$RELEASE_TAG.tar.gz" \
+            --output "$source_archive"
+          source_sha=$(/usr/bin/shasum -a 256 "$source_archive" | /usr/bin/awk '{ print $1 }')
+          scripts/render-homebrew-formula.sh "$RELEASE_TAG" "$source_sha" dist/aicoach.rb
+          brew style dist/aicoach.rb
+
+      - name: Generate GitHub artifact attestations
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/aicoach.rb
+
+      - name: Publish immutable-ready GitHub Release
+        shell: zsh {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            print -u2 -- "release $RELEASE_TAG already exists; refusing to replace published assets"
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" --draft --verify-tag \
+            --title "AI Terminal Coach $RELEASE_TAG" --generate-notes
+          gh release upload "$RELEASE_TAG" dist/*
+          gh release edit "$RELEASE_TAG" --draft=false

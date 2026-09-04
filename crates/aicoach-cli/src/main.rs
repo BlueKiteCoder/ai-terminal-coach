@@ -275,7 +275,7 @@ fn install(paths: &Paths, args: &InstallArgs) -> Result<()> {
 
     install_zshrc(paths)?;
     write_direct_daemon_plist(paths)?;
-    let cli = env::current_exe().context("locate aicoach executable")?;
+    let cli = sibling_executable("aicoach")?;
     let path_env = executable_path_env(&cli);
 
     let helper_installed = if args.no_hotkey {
@@ -1044,6 +1044,9 @@ fn secure_dir(path: &Path) -> Result<()> {
 
 fn sibling_executable(name: &str) -> Result<PathBuf> {
     let current = env::current_exe().context("locate current executable")?;
+    if let Some(candidate) = homebrew_linked_executable(&current, name) {
+        return Ok(candidate);
+    }
     if let Some(parent) = current.parent() {
         let candidate = parent.join(name);
         if candidate.is_file() {
@@ -1057,6 +1060,19 @@ fn sibling_executable(name: &str) -> Result<PathBuf> {
         "cannot find `{name}` next to {} or in PATH",
         current.display()
     )
+}
+
+/// Homebrew launches the CLI through a stable prefix symlink, but
+/// `current_exe` resolves it to a versioned Cellar path. Persisting that path
+/// in a `LaunchAgent` breaks after `brew upgrade` removes the old keg, so prefer
+/// the corresponding linked executable when it exists.
+fn homebrew_linked_executable(current: &Path, name: &str) -> Option<PathBuf> {
+    let cellar = current
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|part| part == "Cellar"))?;
+    let candidate = cellar.parent()?.join("bin").join(name);
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    (metadata.file_type().is_symlink() && candidate.is_file()).then_some(candidate)
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -1253,7 +1269,7 @@ fn delete_keychain_key(paths: &Paths) -> Result<()> {
 
 fn write_direct_daemon_plist(paths: &Paths) -> Result<()> {
     let daemon = sibling_executable("aicoachd")?;
-    let cli = env::current_exe().context("locate aicoach executable")?;
+    let cli = sibling_executable("aicoach")?;
     let plist = launch_agent_plist(
         DAEMON_LABEL,
         &daemon,
@@ -1275,7 +1291,7 @@ fn write_keychain_wrapper(paths: &Paths) -> Result<()> {
     );
     let path = paths.data_dir.join("aicoachd-keychain");
     atomic_write(&path, &wrapper, 0o700)?;
-    let cli = env::current_exe().context("locate aicoach executable")?;
+    let cli = sibling_executable("aicoach")?;
     let plist = launch_agent_plist(
         DAEMON_LABEL,
         &path,
@@ -1488,6 +1504,29 @@ mod tests {
         );
         assert_eq!(executable_name(b"/bin/sleep\n"), Some("sleep"));
         assert_eq!(executable_name(&[0xff]), None);
+    }
+
+    #[test]
+    fn homebrew_launch_agents_use_the_upgrade_stable_prefix_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path();
+        let cellar_bin = prefix.join("Cellar/aicoach/0.1.0/bin");
+        let linked_bin = prefix.join("bin");
+        fs::create_dir_all(&cellar_bin).unwrap();
+        fs::create_dir_all(&linked_bin).unwrap();
+        fs::write(cellar_bin.join("aicoachd"), "binary").unwrap();
+        symlink(cellar_bin.join("aicoachd"), linked_bin.join("aicoachd")).unwrap();
+
+        assert_eq!(
+            homebrew_linked_executable(&cellar_bin.join("aicoach"), "aicoachd"),
+            Some(linked_bin.join("aicoachd"))
+        );
+        assert_eq!(
+            homebrew_linked_executable(&cellar_bin.join("aicoach"), "missing"),
+            None
+        );
     }
 
     #[test]

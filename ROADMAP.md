@@ -67,7 +67,8 @@ inspectable, bounded, and removable.
 - [ ] A public compatibility matrix covering Terminal.app, iTerm2, Warp, WezTerm, kitty, and
   Alacritty on supported macOS releases.
 - [ ] Contributor-friendly module boundaries and protocol documentation.
-- [ ] Reproducible release automation, checksums, changelog, and upgrade notes.
+- [x] Reproducible dual-architecture release automation, archive verification, checksums,
+  changelog, upgrade notes, and fail-closed signing/notarization gates.
 - [ ] Small benchmark dashboard for shell hook latency, startup time, and binary size.
 
 Exit gate: contributors can reproduce failures, add an analyzer rule or terminal adapter, and

@@ -20,6 +20,9 @@ AI provider tests must use local mocks. Never commit API keys, credentials,
 terminal history, private repository content, local configuration, logs, or
 generated release archives.
 
+Run `zsh scripts/check-no-secrets.sh` before pushing. The same tracked-source
+credential regression check runs in CI.
+
 ## Pull requests
 
 Describe the user-visible behavior, the tests you ran, and any privacy or safety
