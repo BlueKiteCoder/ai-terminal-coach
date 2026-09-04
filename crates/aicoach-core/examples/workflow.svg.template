@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title description">
+  <title id="title">AI Terminal Coach workflow</title>
+  <desc id="description">A reproducible terminal demonstration of local failure diagnosis, preflight Risk Lens, explainable Command Patch, and privacy-scrubbed Session Capsule.</desc>
+  <defs>
+    <linearGradient id="page" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#050914"/>
+      <stop offset="0.55" stop-color="#0a1020"/>
+      <stop offset="1" stop-color="#10152a"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="risk" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fb7185" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#fbbf24" stop-opacity="0.08"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#7dd3fc" stroke-opacity="0.035" stroke-width="1"/>
+    </pattern>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#000814" flood-opacity="0.6"/>
+    </filter>
+    <style>
+      .ui { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .mono { font-family: "SFMono-Regular", Menlo, Monaco, Consolas, monospace; }
+      .card { fill: #0d1424; stroke: #263552; stroke-width: 1.5; }
+      .muted { fill: #8fa3bf; }
+      .body { fill: #d9e5f5; font-size: 17px; }
+      .small { fill: #91a5c1; font-size: 14px; letter-spacing: 0.5px; }
+      .label { font-size: 13px; font-weight: 700; letter-spacing: 1.6px; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="900" fill="url(#page)"/>
+  <rect width="1440" height="900" fill="url(#grid)"/>
+  <circle cx="1230" cy="40" r="280" fill="#7c3aed" opacity="0.06"/>
+  <circle cx="180" cy="870" r="320" fill="#06b6d4" opacity="0.05"/>
+
+  <g filter="url(#shadow)">
+    <rect x="38" y="30" width="1364" height="840" rx="24" fill="#090f1c" stroke="#33415e" stroke-width="1.5"/>
+    <path d="M38 86 H1402" stroke="#263552" stroke-width="1.5"/>
+  </g>
+  <circle cx="72" cy="58" r="7" fill="#fb7185"/>
+  <circle cx="96" cy="58" r="7" fill="#fbbf24"/>
+  <circle cx="120" cy="58" r="7" fill="#34d399"/>
+  <text x="720" y="64" text-anchor="middle" class="mono muted" font-size="14">~/project — zsh</text>
+
+  <text x="72" y="132" class="ui" font-size="34" font-weight="750" fill="url(#brand)">AI Terminal Coach</text>
+  <text x="72" y="164" class="ui muted" font-size="18">See what failed. Understand the fix. Keep the Enter key.</text>
+
+  <g class="ui label">
+    <rect x="984" y="112" width="112" height="30" rx="15" fill="#0d2e35" stroke="#155e75"/>
+    <text x="1040" y="132" text-anchor="middle" fill="#67e8f9">LOCAL FIRST</text>
+    <rect x="1108" y="112" width="126" height="30" rx="15" fill="#18263d" stroke="#3b4f73"/>
+    <text x="1171" y="132" text-anchor="middle" fill="#c4d4ea">macOS + Zsh</text>
+    <rect x="1246" y="112" width="124" height="30" rx="15" fill="#291b3e" stroke="#6d4ba0"/>
+    <text x="1308" y="132" text-anchor="middle" fill="#c4b5fd">NEVER AUTO-RUN</text>
+  </g>
+
+  <!-- 01: local diagnosis -->
+  <g>
+    <rect x="72" y="202" width="630" height="270" rx="18" class="card"/>
+    <circle cx="106" cy="236" r="18" fill="#123443" stroke="#22d3ee"/>
+    <text x="106" y="242" text-anchor="middle" class="ui" font-size="14" font-weight="700" fill="#67e8f9">01</text>
+    <text x="138" y="241" class="ui label" fill="#67e8f9">FAILURE → LOCAL DIAGNOSIS</text>
+    <text x="668" y="241" text-anchor="end" class="ui small">0 provider calls</text>
+    <rect x="96" y="260" width="582" height="76" rx="11" fill="#080d18" stroke="#202d45"/>
+    <text x="116" y="289" class="mono body"><tspan fill="#67e8f9">❯</tspan> git pul origin main</text>
+    <text x="116" y="318" class="mono" font-size="15" fill="#fb7185">git: &apos;pul&apos; is not a git command</text>
+    <text x="96" y="371" class="ui" font-size="19" font-weight="650" fill="#eef6ff">{{DIAGNOSIS_TITLE}}</text>
+    <text x="96" y="399" class="ui body">{{DIAGNOSIS_MESSAGE}}</text>
+    <rect x="96" y="420" width="582" height="34" rx="9" fill="#0b2925" stroke="#176b58"/>
+    <text x="112" y="443" class="mono" font-size="16" fill="#6ee7b7">→ {{SUGGESTION}}</text>
+  </g>
+
+  <!-- 02: Risk Lens -->
+  <g>
+    <rect x="738" y="202" width="630" height="270" rx="18" class="card"/>
+    <rect x="738" y="202" width="630" height="270" rx="18" fill="url(#risk)"/>
+    <circle cx="772" cy="236" r="18" fill="#3b1d2b" stroke="#fb7185"/>
+    <text x="772" y="242" text-anchor="middle" class="ui" font-size="14" font-weight="700" fill="#fda4af">02</text>
+    <text x="804" y="241" class="ui label" fill="#fda4af">RISK LENS · BEFORE ENTER</text>
+    <rect x="1282" y="221" width="62" height="30" rx="15" fill="#342238" stroke="#7e4055"/>
+    <text x="1313" y="241" text-anchor="middle" class="ui label" fill="#fda4af">⌥ R</text>
+    <text x="762" y="286" class="mono body"><tspan fill="#fda4af">❯</tspan> git reset --hard</text>
+    <text x="762" y="322" class="ui" font-size="22" font-weight="750" fill="#fb7185">{{RISK_LEVEL}}</text>
+    <text x="830" y="321" class="ui label" fill="#fbbf24">{{COVERAGE}}</text>
+    <text x="762" y="356" class="ui small">IMPACT</text>
+    <text x="844" y="356" class="ui body"><tspan font-weight="700" fill="#fda4af">{{RISK_ACTION}}</tspan> · {{RISK_TARGET}}</text>
+    <text x="762" y="388" class="ui small">PRIVILEGE</text>
+    <text x="864" y="388" class="ui body">{{PRIVILEGE}}</text>
+    <text x="762" y="420" class="ui small">RECOVERY</text>
+    <text x="858" y="420" class="ui body">{{RECOVERY}}</text>
+    <text x="762" y="450" class="mono" font-size="13" fill="#9fb2cc">evidence: {{RULES}}</text>
+  </g>
+
+  <!-- 03: command patch -->
+  <g>
+    <rect x="72" y="500" width="630" height="270" rx="18" class="card"/>
+    <circle cx="106" cy="534" r="18" fill="#2a2142" stroke="#a78bfa"/>
+    <text x="106" y="540" text-anchor="middle" class="ui" font-size="14" font-weight="700" fill="#c4b5fd">03</text>
+    <text x="138" y="539" class="ui label" fill="#c4b5fd">EXPLAINABLE COMMAND PATCH</text>
+    <rect x="612" y="519" width="66" height="30" rx="15" fill="#251d3a" stroke="#654b8e"/>
+    <text x="645" y="539" text-anchor="middle" class="ui label" fill="#c4b5fd">⌥ TAB</text>
+    <text x="96" y="582" class="ui small">BEFORE</text>
+    <text x="178" y="582" class="mono body">git <tspan fill="#fb7185" text-decoration="line-through">pul</tspan> origin main</text>
+    <text x="96" y="617" class="ui small">AFTER</text>
+    <text x="178" y="617" class="mono body">git <tspan fill="#6ee7b7" font-weight="700">pull</tspan> origin main</text>
+    <rect x="96" y="642" width="582" height="42" rx="10" fill="#17142b" stroke="#4c3b71"/>
+    <text x="112" y="669" class="mono" font-size="16" fill="#ddd6fe">{{PATCH}}</text>
+    <text x="96" y="716" class="ui body"><tspan fill="#6ee7b7">✓</tspan> Full resulting Buffer scanned locally</text>
+    <text x="96" y="746" class="ui" font-size="16" font-weight="650" fill="#67e8f9">Inserted visibly · never executed · Enter stays yours</text>
+  </g>
+
+  <!-- 04: session capsule -->
+  <g>
+    <rect x="738" y="500" width="630" height="270" rx="18" class="card"/>
+    <circle cx="772" cy="534" r="18" fill="#12342d" stroke="#34d399"/>
+    <text x="772" y="540" text-anchor="middle" class="ui" font-size="14" font-weight="700" fill="#6ee7b7">04</text>
+    <text x="804" y="539" class="ui label" fill="#6ee7b7">SHARE A SCRUBBED SESSION CAPSULE</text>
+    <text x="762" y="582" class="mono body"><tspan fill="#6ee7b7">❯</tspan> aicoach capsule --failed-only</text>
+    <rect x="762" y="603" width="582" height="84" rx="11" fill="#080d18" stroke="#1d413a"/>
+    <text x="782" y="633" class="mono" font-size="15" fill="#a9bad0">## Failed command · exit 1 · 138 ms</text>
+    <text x="782" y="661" class="mono" font-size="15" fill="#6ee7b7">{{REDACTED}}</text>
+    <text x="762" y="718" class="ui body"><tspan fill="#6ee7b7">✓</tspan> Owner-only Markdown · terminal controls removed</text>
+    <text x="762" y="747" class="ui" font-size="16" fill="#9fb2cc">Generated locally · review before sharing</text>
+  </g>
+
+  <path d="M182 812 H1258" stroke="#31415f" stroke-width="1.5"/>
+  <circle cx="182" cy="812" r="4" fill="#67e8f9"/>
+  <circle cx="540" cy="812" r="4" fill="#fda4af"/>
+  <circle cx="899" cy="812" r="4" fill="#c4b5fd"/>
+  <circle cx="1258" cy="812" r="4" fill="#6ee7b7"/>
+  <text x="720" y="845" text-anchor="middle" class="ui" font-size="16" fill="#91a5c1">Failure → local diagnosis → inspect impact → accept a visible patch → share safely</text>
+</svg>

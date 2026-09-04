@@ -28,7 +28,8 @@ honest privacy boundary.
 - [ ] Working Homebrew tap with an upgrade-safe install flow.
 - [x] A two-minute interactive onboarding and physical shortcut verifier with safe calibration
   and automatic live settings reload.
-- [ ] Demo assets showing the complete failure → diagnosis → fix workflow.
+- [x] A reproducible demo asset generated from the real failure diagnosis, Risk Lens,
+  Command Patch, and privacy-redaction engines, with drift detection in CI.
 
 Exit gate: a new user can install, configure, understand the safety model, experience the core
 workflow, and uninstall on a clean supported Mac without reading source code.
