@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use aicoach_core::RiskLensReport;
+
 pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 4 * 1024 * 1024;
 pub const SHELL_ENVIRONMENT_ALLOWLIST: [&str; 7] = [
@@ -181,6 +183,19 @@ pub struct CompletionParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskLensParams {
+    pub buffer: String,
+    pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskLensResult {
+    pub report: RiskLensReport,
+    /// Localized, terminal-safe presentation of the structured report.
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelParams {
     pub target_request_id: RequestId,
 }
@@ -238,6 +253,7 @@ pub enum RequestBody {
     CommandStarted(CommandStartedParams),
     CommandFinished(CommandFinishedParams),
     Completion(CompletionParams),
+    RiskLens(RiskLensParams),
     Cancel(CancelParams),
     Chat(ChatParams),
     Context(ContextParams),
@@ -340,6 +356,7 @@ pub enum ResponseResult {
     },
     Accepted,
     Completion(CompletionResult),
+    RiskLens(RiskLensResult),
     Chat {
         message: String,
     },

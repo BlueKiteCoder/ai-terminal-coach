@@ -247,6 +247,9 @@ impl Config {
         if self.keybindings.chat.trim().is_empty() {
             errors.push("keybindings.chat must not be empty".to_owned());
         }
+        if self.keybindings.risk_lens.trim().is_empty() {
+            errors.push("keybindings.risk_lens must not be empty".to_owned());
+        }
         if self.keybindings.toggle_coach.trim().is_empty() {
             errors.push("keybindings.toggle_coach must not be empty".to_owned());
         }
@@ -256,6 +259,10 @@ impl Config {
                 canonical_keybinding(&self.keybindings.completion),
             ),
             ("chat", canonical_keybinding(&self.keybindings.chat)),
+            (
+                "risk_lens",
+                canonical_keybinding(&self.keybindings.risk_lens),
+            ),
             (
                 "toggle_coach",
                 canonical_keybinding(&self.keybindings.toggle_coach),
@@ -327,6 +334,7 @@ fn canonical_keybinding(specification: &str) -> Vec<u8> {
     match specification.trim().to_ascii_lowercase().as_str() {
         "option+tab" => return vec![0x1b, b'\t'],
         "option+/" | "option+slash" => return vec![0x1b, b'/'],
+        "option+r" => return vec![0x1b, b'r'],
         "option+space" => return vec![0x1b, b' '],
         _ => {}
     }
@@ -512,6 +520,7 @@ impl Default for CoachConfig {
 pub struct KeybindingsConfig {
     pub completion: String,
     pub chat: String,
+    pub risk_lens: String,
     pub toggle_coach: String,
 }
 
@@ -520,6 +529,7 @@ impl Default for KeybindingsConfig {
         Self {
             completion: "^[\\t".to_owned(),
             chat: "^[/".to_owned(),
+            risk_lens: "Option+R".to_owned(),
             toggle_coach: "Option+Space".to_owned(),
         }
     }
@@ -713,12 +723,18 @@ mod tests {
 
                 [privacy]
                 redaction = false
+
+                [keybindings]
+                completion = "^[\\t"
+                chat = "^[/"
+                toggle_coach = "Option+Space"
             "#,
         )
         .unwrap();
         assert_eq!(config.ai.base_url, "https://example.test/v1");
         assert_eq!(config.context.max_commands, 30);
         assert!(!config.privacy.redaction);
+        assert_eq!(config.keybindings.risk_lens, "Option+R");
     }
 
     #[test]
@@ -788,6 +804,13 @@ mod tests {
         config.keybindings.chat = "^[\\t".to_owned();
         let ConfigError::Validation(errors) = config.validate().unwrap_err() else {
             panic!("expected validation failure");
+        };
+        assert!(errors.iter().any(|error| error.contains("must differ")));
+
+        let mut config = Config::default();
+        config.keybindings.risk_lens = "Option+Space".to_owned();
+        let ConfigError::Validation(errors) = config.validate().unwrap_err() else {
+            panic!("expected Risk Lens shortcut collision")
         };
         assert!(errors.iter().any(|error| error.contains("must differ")));
     }

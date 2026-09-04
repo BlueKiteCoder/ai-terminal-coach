@@ -585,7 +585,7 @@ fn assess_raw_device_redirect(segment: &str, tokens: &[String], assessment: &mut
     }
 }
 
-fn command_index(tokens: &[String]) -> Option<usize> {
+pub(crate) fn command_index(tokens: &[String]) -> Option<usize> {
     let mut index = 0;
     while index < tokens.len() {
         let token = &tokens[index];
@@ -629,7 +629,7 @@ fn command_index(tokens: &[String]) -> Option<usize> {
     None
 }
 
-fn executable_name(token: &str) -> String {
+pub(crate) fn executable_name(token: &str) -> String {
     token
         .rsplit('/')
         .next()
@@ -684,7 +684,7 @@ fn is_single_quoted_literal(segment: &str, value: &str) -> bool {
 /// Split only at unquoted shell control operators.  Keeping the original text
 /// lets findings point at the exact command and avoids interpreting quoted
 /// examples such as `echo "rm -rf /"` as executable commands.
-fn split_shell_commands(source: &str) -> Vec<String> {
+pub(crate) fn split_shell_commands(source: &str) -> Vec<String> {
     let mut commands = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -757,7 +757,7 @@ fn push_segment(commands: &mut Vec<String>, current: &mut String) {
     current.clear();
 }
 
-fn lenient_tokens(source: &str) -> Vec<String> {
+pub(crate) fn lenient_tokens(source: &str) -> Vec<String> {
     source
         .split_whitespace()
         .map(|token| token.trim_matches(['\'', '"']).to_owned())

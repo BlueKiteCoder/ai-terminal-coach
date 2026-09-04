@@ -22,7 +22,7 @@ use aicoach_ipc::{
     CancelParams, ChatParams, ClientCapabilities, ClientKind, CommandFinishedParams, CommandId,
     CommandStartedParams, CompletionParams, ContextParams, EventBody, HelloParams, IpcClient,
     PROTOCOL_VERSION, RegisterSessionParams, Request, RequestBody, Response, ResponseOutcome,
-    ResponseResult, SessionId,
+    ResponseResult, RiskLensParams, SessionId,
 };
 use async_trait::async_trait;
 use futures_util::stream;
@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 struct TestProvider {
     analysis_calls: AtomicUsize,
+    completion_calls: AtomicUsize,
     interrupt_stream: bool,
 }
 
@@ -95,6 +96,7 @@ impl AiProvider for TestProvider {
         request: CommandCompletionRequest,
         cancellation: CancellationToken,
     ) -> AiResult<CoreCompletionResult> {
+        self.completion_calls.fetch_add(1, Ordering::SeqCst);
         if request.buffer == "wait" {
             cancellation.cancelled().await;
             return Err(AiError::Cancelled {
@@ -414,6 +416,47 @@ async fn ai_insert_cannot_hide_a_dangerous_composed_command() {
 }
 
 #[tokio::test]
+async fn risk_lens_is_structured_local_and_provider_free() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start(Arc::clone(&provider)).await;
+    let client = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&client, None, "/dev/ttys009").await;
+
+    let response = client
+        .send_request(
+            Some(session),
+            RequestBody::RiskLens(RiskLensParams {
+                buffer: "sudo rm -rf ~/Downloads/cache".to_owned(),
+                cwd: PathBuf::from("/tmp"),
+            }),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Ok {
+        result: ResponseResult::RiskLens(result),
+    } = response.outcome
+    else {
+        panic!("expected risk lens response")
+    };
+    assert_eq!(result.report.level, Some(aicoach_core::RiskLevel::High));
+    assert_eq!(
+        result.report.privilege,
+        aicoach_core::PrivilegeRequirement::Administrator
+    );
+    assert_eq!(
+        result.report.recovery,
+        aicoach_core::RecoveryProspect::Irreversible
+    );
+    assert!(result.message.contains("Risk Lens · HIGH"));
+    assert!(result.message.contains("~/Downloads/cache"));
+    assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.completion_calls.load(Ordering::SeqCst), 0);
+
+    client.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn failed_command_uses_ai_after_local_trigger_and_pushes_hint() {
     let provider = Arc::new(TestProvider::default());
     let running = RunningDaemon::start(Arc::clone(&provider)).await;
@@ -694,7 +737,7 @@ async fn disabling_inline_hints_still_notifies_tui_observers() {
 }
 
 #[tokio::test]
-async fn zsh_tab_protocol_registers_and_pings() {
+async fn zsh_tab_protocol_registers_pings_and_runs_risk_lens() {
     let running = RunningDaemon::start(Arc::new(TestProvider::default())).await;
     let stream = UnixStream::connect(&running.socket).await.unwrap();
     let (read, mut write) = tokio::io::split(stream);
@@ -711,6 +754,17 @@ async fn zsh_tab_protocol_registers_and_pings() {
         .await
         .unwrap();
     assert_eq!(lines.next_line().await.unwrap().unwrap(), "PONG");
+    let lens_id = Request::new(None, RequestBody::Ping).request_id;
+    write
+        .write_all(format!("ZSH\tLENS\t{session}\t{lens_id}\t/tmp\tgit reset --hard\n").as_bytes())
+        .await
+        .unwrap();
+    let lens = lines.next_line().await.unwrap().unwrap();
+    assert!(lens.starts_with(&format!("LENS\t{session}\t{lens_id}\thigh\t")));
+    assert!(
+        lens.contains("Risk Lens · HIGH · recognized%0AImpact"),
+        "{lens}"
+    );
     drop(write);
     drop(lines);
     running.stop().await;

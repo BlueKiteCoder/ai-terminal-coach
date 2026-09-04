@@ -11,6 +11,7 @@ pub mod context;
 pub mod git;
 pub mod models;
 pub mod privacy;
+pub mod risk_lens;
 pub mod safety;
 pub mod terminal;
 
@@ -28,5 +29,9 @@ pub use models::{
     CompletionOperation, CompletionResult, GitContext, Severity, TerminalContext,
 };
 pub use privacy::{PrivacyError, PrivacyRedactor};
+pub use risk_lens::{
+    AnalysisCoverage, EffectAction, PrivilegeRequirement, RecoveryProspect, RiskEffect,
+    RiskLensReport,
+};
 pub use safety::{RiskLevel, SafetyAssessment, SafetyEngine, SafetyFinding};
 pub use terminal::strip_terminal_sequences;

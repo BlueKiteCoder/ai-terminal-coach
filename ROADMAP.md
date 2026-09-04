@@ -36,8 +36,9 @@ workflow, and uninstall on a clean supported Mac without reading source code.
 
 - [x] **Command Patch:** preview an AI completion as a token-level diff with a short reason for
   every materially changed flag, path, and subcommand, then scan the composed final buffer.
-- [ ] **Risk Lens:** explicitly inspect the current ZLE buffer and show what the command can
-  modify, what privileges it needs, and which parts are irreversible—without blocking Enter.
+- [x] **Risk Lens:** explicitly inspect the current ZLE buffer and show what the command can
+  modify, what privileges it needs, and which parts are irreversible—without blocking Enter or
+  calling an AI provider; unfamiliar commands are honestly marked unrated.
 - [ ] **Source Cards:** attach local `man`/`--help` evidence to supported command explanations so
   users can distinguish documented behavior from model inference.
 - [ ] One-keystroke “insert only” and “copy only” actions with a visible safety classification.

@@ -11,7 +11,7 @@ use crate::protocol::{
     CancelParams, ChatParams, CommandFinishedParams, CommandId, CommandStartedParams,
     CompletionOperation, CompletionParams, ContextParams, EventBody, FocusParams, InsertMode,
     Message, RegisterSessionParams, Request, RequestBody, RequestId, ResponseOutcome,
-    ResponseResult, SessionId, ShutdownParams, sanitize_shell_environment,
+    ResponseResult, RiskLensParams, SessionId, ShutdownParams, sanitize_shell_environment,
 };
 use thiserror::Error;
 
@@ -192,6 +192,17 @@ fn decode_fields(verb: &str, fields: &[String]) -> Result<Request, ZshProtocolEr
                     cursor: parse_number("cursor", &fields[2])?,
                     cwd: PathBuf::from(&fields[3]),
                     buffer: fields[4].clone(),
+                }),
+            })
+        }
+        "LENS" => {
+            expect_fields(verb, fields, 4)?;
+            Ok(Request {
+                session_id: Some(parse_id("session", &fields[0])?),
+                request_id: parse_id("request", &fields[1])?,
+                body: RequestBody::RiskLens(RiskLensParams {
+                    cwd: PathBuf::from(&fields[2]),
+                    buffer: fields[3].clone(),
                 }),
             })
         }
@@ -388,6 +399,18 @@ pub fn encode_message(message: &Message) -> Result<String, ZshProtocolError> {
                 ResponseResult::Completion(completion) => {
                     completion_fields(response.session_id, Some(response.request_id), completion)
                 }
+                ResponseResult::RiskLens(result) => vec![
+                    "LENS".to_owned(),
+                    response
+                        .session_id
+                        .map_or_else(String::new, |value| value.to_string()),
+                    response.request_id.to_string(),
+                    result.report.level.map_or_else(
+                        || "unrated".to_owned(),
+                        |level| level.to_string().to_ascii_lowercase(),
+                    ),
+                    result.message.clone(),
+                ],
                 ResponseResult::Chat { message } => vec![
                     "ANSWER".to_owned(),
                     response
@@ -502,7 +525,12 @@ fn completion_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{CompletionResult, Event, Severity};
+    use aicoach_core::{
+        AnalysisCoverage, EffectAction, PrivilegeRequirement, RecoveryProspect, RiskEffect,
+        RiskLensReport, RiskLevel,
+    };
+
+    use crate::protocol::{CompletionResult, Event, RiskLensResult, Severity};
 
     #[test]
     fn percent_encoding_round_trip_covers_frame_delimiters_and_unicode() {
@@ -525,6 +553,21 @@ mod tests {
         assert_eq!(decoded.session_id, Some(session));
         assert_eq!(decoded.request_id, request);
         assert!(matches!(decoded.body, RequestBody::Completion(_)));
+    }
+
+    #[test]
+    fn decodes_risk_lens_request() {
+        let session = SessionId::new();
+        let request = RequestId::new();
+        let line = format!("ZSH\tLENS\t{session}\t{request}\t/tmp/demo\tgit reset --hard");
+        let decoded = decode_request(&line).unwrap();
+        let RequestBody::RiskLens(params) = decoded.body else {
+            panic!("expected risk lens request")
+        };
+        assert_eq!(decoded.session_id, Some(session));
+        assert_eq!(decoded.request_id, request);
+        assert_eq!(params.buffer, "git reset --hard");
+        assert_eq!(params.cwd, PathBuf::from("/tmp/demo"));
     }
 
     #[test]
@@ -558,6 +601,40 @@ mod tests {
         assert!(encoded.starts_with(&format!("COMPLETE\t{session}\t{request}\treplace\t26\t")));
         assert_eq!(encoded.matches('\t').count(), 6);
         assert!(encoded.contains("%09"));
+    }
+
+    #[test]
+    fn encodes_multiline_risk_lens_result_for_zsh() {
+        let session = SessionId::new();
+        let request = Request::new(
+            Some(session),
+            RequestBody::RiskLens(RiskLensParams {
+                buffer: "git reset --hard".to_owned(),
+                cwd: PathBuf::from("/tmp/demo"),
+            }),
+        );
+        let request_id = request.request_id;
+        let response = crate::protocol::Response::ok(
+            &request,
+            ResponseResult::RiskLens(RiskLensResult {
+                report: RiskLensReport {
+                    level: Some(RiskLevel::High),
+                    effects: vec![RiskEffect {
+                        action: EffectAction::Modify,
+                        target: "Git worktree".to_owned(),
+                    }],
+                    privilege: PrivilegeRequirement::CurrentUser,
+                    recovery: RecoveryProspect::Limited,
+                    coverage: AnalysisCoverage::Recognized,
+                    safety_rules_enabled: true,
+                    rule_ids: vec!["git.reset-hard".to_owned()],
+                },
+                message: "Risk Lens · HIGH\nImpact: modify Git worktree".to_owned(),
+            }),
+        );
+        let encoded = encode_message(&Message::from(response)).unwrap();
+        assert!(encoded.starts_with(&format!("LENS\t{session}\t{request_id}\thigh\t")));
+        assert!(encoded.contains("%0AImpact"));
     }
 
     #[test]
