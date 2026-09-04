@@ -1,6 +1,7 @@
 # AI Terminal Coach
 
 [![CI](https://img.shields.io/github/actions/workflow/status/BlueKiteCoder/ai-terminal-coach/ci.yml?branch=main&style=flat-square)](https://github.com/BlueKiteCoder/ai-terminal-coach/actions/workflows/ci.yml)
+[![Release checks](https://img.shields.io/github/actions/workflow/status/BlueKiteCoder/ai-terminal-coach/release.yml?branch=main&label=release%20checks&style=flat-square)](https://github.com/BlueKiteCoder/ai-terminal-coach/actions/workflows/release.yml)
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple&style=flat-square)
 ![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust&style=flat-square)
 [![MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -392,21 +393,29 @@ aicoach logs -n 200
 
 ## Homebrew
 
-Formula 模板位于 [`homebrew/aicoach.rb`](homebrew/aicoach.rb)。公开仓库地址已经
-配置；创建签名、公证的 `v0.1.0` Release 后，仍需把 Formula 中的 tarball SHA256
-替换为真实值，再将 Formula 放入 tap：
+在首个签名、公证的公开 Release 和独立 tap 上线前，项目不宣称存在可用的稳定
+Homebrew 安装入口；请使用上面的“从源码安装”。
+[`homebrew/aicoach.rb`](homebrew/aicoach.rb) 是供维护者在临时 tap 中验证的 HEAD-only
+开发 Formula，而 Homebrew 6 已不接受直接从任意本地路径安装 Formula。
+
+维护者可这样测试：
 
 ```zsh
-brew tap <owner>/aicoach
-brew install aicoach
-aicoach install
+brew tap-new --no-git BlueKiteCoder/aicoach-dev
+install -m 0644 homebrew/aicoach.rb \
+  "$(brew --repository BlueKiteCoder/aicoach-dev)/Formula/aicoach.rb"
+brew install --HEAD BlueKiteCoder/aicoach-dev/aicoach
 ```
 
-Homebrew 升级后请再次执行 `aicoach install`，刷新 LaunchAgent 指向当前 Cellar 版本
-的路径。
+Formula 会先在有网络的 `fetch` 阶段缓存锁定依赖，再在无网络的安装阶段构建。生成的
+LaunchAgent 使用 Homebrew 的稳定 `bin` 链接，因此正常 `brew upgrade` 不再要求重新
+运行 `aicoach install`。源码安装到 `~/.local/bin` 的行为保持不变。
 
-无需二进制 Release，也可在本仓库检出目录中执行
-`brew install --HEAD ./homebrew/aicoach.rb` 从源码安装。
+测试完可运行 `brew untap BlueKiteCoder/aicoach-dev` 移除临时 tap。首个正式版本发布
+后，将创建 `BlueKiteCoder/homebrew-aicoach`，填入不可变 tag 源码的
+真实 SHA-256（Release 流水线会生成并证明 `aicoach.rb` 资产），再在 Apple Silicon 与
+Intel 上验证安装、升级和卸载；在此之前不把 tap 写成已经可用。完整发布流程见
+[`docs/RELEASING.md`](docs/RELEASING.md)。
 
 ## 开发、测试与发布
 
@@ -419,7 +428,8 @@ zsh scripts/test-zsh-integration.zsh
 zsh scripts/test-onboarding-e2e.zsh
 zsh scripts/benchmark-zsh-hooks.zsh
 cargo build --release --locked
-scripts/package-release.sh
+AICOACH_REQUIRE_HOTKEY=1 scripts/package-release.sh 0.1.0
+scripts/verify-release-tag.sh v0.1.0
 ```
 
 测试覆盖 analyzer、safety、privacy、context、Git context、AI 合法/非法/缺字段
@@ -461,10 +471,11 @@ homebrew/               Formula 模板
 - 为避免意外收集 secret，本项目不快照任意环境变量；只维护一组与终端体验有关的
   非敏感 allowlist（locale、`TERM`/`COLORTERM` 和虚拟环境元数据），并在每次命令
   完成时更新。
-- Formula 中的 release URL/SHA 是发布占位符，创建公开 release 后必须替换。
-- `package-release.sh` 生成当前机器架构的本地测试包；公开分发需分别在 `arm64` 和
-  `x86_64` 构建，并使用 Developer ID 完成签名、公证与 stapling。当前没有发布者
-  证书，因此不把本地 tarball 宣称为已公证的最终下载包。
+- 当前 Formula 只支持显式 `--HEAD` 源码安装；稳定 tap 必须等首个公开 tag 和真实
+  源码 SHA-256 后才能发布。
+- `package-release.sh` 生成当前机器架构、可复现但仅 ad-hoc 签名的本地测试包。公开
+  流水线会分别原生构建 `arm64`/`x86_64`，并且缺少 Developer ID 或 Apple 公证凭据
+  时拒绝发布；当前尚无正式 Release，因此不把本地包宣称为最终下载包。
 
 ## 卸载
 
