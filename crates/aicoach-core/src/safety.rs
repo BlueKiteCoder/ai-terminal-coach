@@ -96,6 +96,10 @@ impl SafetyEngine {
         Self { config }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
     pub fn assess(&self, source: &str) -> SafetyAssessment {
         if !self.config.enabled || source.trim().is_empty() {
             return SafetyAssessment::default();

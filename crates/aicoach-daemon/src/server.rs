@@ -9,7 +9,7 @@ use std::{
 
 use aicoach_ai::{AiProvider, ChatMessage, ChatRequest, ChatRole, CommandCompletionRequest};
 use aicoach_core::{
-    AnalysisCategory, AnalysisInput, AnalysisResult, CommandRecord,
+    AnalysisCategory, AnalysisInput, AnalysisResult, CommandPatch, CommandRecord,
     CompletionOperation as CoreCompletionOperation, GitContext, LocalAnalyzer, PrivacyRedactor,
     RiskLevel, SafetyConfig, SafetyEngine, SafetyMode, Severity as CoreSeverity,
     strip_terminal_sequences, try_collect_git_context,
@@ -42,6 +42,8 @@ const MAX_WIRE_LINE: usize = aicoach_ipc::DEFAULT_MAX_FRAME_LENGTH;
 const MAX_CHAT_CHARS: usize = 100_000;
 const MAX_INLINE_CHAT_CHARS: usize = 1_200;
 const MAX_INLINE_HINT_CHARS: usize = 240;
+const MAX_PATCH_SUMMARY_CHARS: usize = 220;
+const MAX_COMPLETION_DESCRIPTION_CHARS: usize = 500;
 const INLINE_CHAT_TRUNCATED_SUFFIX_EN: &str =
     " … (answer truncated; open Coach for the full explanation)";
 const INLINE_CHAT_TRUNCATED_SUFFIX_ZH: &str = " …（回答较长；完整解释请打开 Coach 窗口）";
@@ -536,7 +538,7 @@ impl Daemon {
                     ))
                     .await;
                     let description = result.message;
-                    let completion = suggestion.map_or_else(
+                    let mut completion = suggestion.map_or_else(
                         || CompletionResult {
                             operation: CompletionOperation::Suggest,
                             command: sanitize_inline(&params.buffer, MAX_WIRE_LINE),
@@ -553,6 +555,18 @@ impl Daemon {
                             operation: CompletionOperation::Replace,
                             description: Some(sanitize_inline(&description, 500)),
                         },
+                    );
+                    let candidate = completion.command.clone();
+                    let risk = self
+                        .safety
+                        .is_enabled()
+                        .then(|| self.safety.risk_level(&candidate));
+                    completion.description = completion_patch_description(
+                        &params.buffer,
+                        &candidate,
+                        completion.description.as_deref(),
+                        risk,
+                        &self.options.coach_language,
                     );
                     send_response(
                         &sender,
@@ -878,6 +892,7 @@ impl Daemon {
         mut provider_request: CommandCompletionRequest,
         cancellation: CancellationToken,
     ) {
+        let original_cursor = provider_request.cursor;
         if let Some(git) = collect_git_context_bounded(provider_request.cwd.clone()).await {
             let serialized = git_context_summary(&git);
             provider_request.context.insert(
@@ -894,6 +909,7 @@ impl Daemon {
                 match review_completion(
                     result,
                     &original_buffer,
+                    original_cursor,
                     &self.safety,
                     &self.options.coach_language,
                 ) {
@@ -1649,19 +1665,30 @@ fn completion_from_core(
 fn review_completion(
     result: aicoach_core::CompletionResult,
     original_buffer: &str,
+    original_cursor: usize,
     safety: &SafetyEngine,
     language: &str,
 ) -> Result<(CompletionResult, Option<Hint>), ()> {
     if contains_terminal_control(&result.command) {
         return Err(());
     }
+    let candidate = completion_candidate(&result, original_buffer, original_cursor);
     let mut completion = completion_from_core(result, original_buffer);
-    let assessment = safety.assess(&completion.command);
+    let assessment = safety.assess(&candidate);
+    completion.description = completion_patch_description(
+        original_buffer,
+        &candidate,
+        completion.description.as_deref(),
+        safety.is_enabled().then_some(assessment.level),
+        language,
+    );
     if !assessment.is_dangerous() {
         return Ok((completion, None));
     }
 
     completion.operation = CompletionOperation::Suggest;
+    completion.command = sanitize_inline(&candidate, MAX_WIRE_LINE);
+    completion.cursor = completion.command.chars().count();
     let message = if language == "zh-CN" {
         "此 AI 生成的命令可能造成破坏性更改，请在执行前仔细检查。".to_owned()
     } else {
@@ -1681,6 +1708,65 @@ fn review_completion(
         suggested_command: Some(completion.command.clone()),
     };
     Ok((completion, Some(warning)))
+}
+
+fn completion_candidate(
+    result: &aicoach_core::CompletionResult,
+    original_buffer: &str,
+    original_cursor: usize,
+) -> String {
+    match result.operation {
+        CoreCompletionOperation::Replace | CoreCompletionOperation::Insert => {
+            result.apply_to(original_buffer, original_cursor).0
+        }
+        CoreCompletionOperation::Suggest if !result.command.is_empty() => result.command.clone(),
+        CoreCompletionOperation::Suggest | CoreCompletionOperation::None => {
+            original_buffer.to_owned()
+        }
+    }
+}
+
+fn completion_patch_description(
+    before: &str,
+    after: &str,
+    reason: Option<&str>,
+    risk: Option<RiskLevel>,
+    language: &str,
+) -> Option<String> {
+    let patch = CommandPatch::between(before, after);
+    let reason = reason
+        .map(|value| sanitize_inline(value, 240))
+        .filter(|value| !value.is_empty());
+    if patch.is_empty() {
+        return reason;
+    }
+
+    let summary = patch.compact_summary(MAX_PATCH_SUMMARY_CHARS);
+    let risk = match (risk, language) {
+        (None, "zh-CN") => "本地风险扫描：已关闭".to_owned(),
+        (None, _) => "Local risk scan: off".to_owned(),
+        (Some(RiskLevel::Low), "zh-CN") => "本地风险：未命中已知破坏性模式".to_owned(),
+        (Some(RiskLevel::Low), _) => "Local risk: no known destructive pattern".to_owned(),
+        (Some(level), "zh-CN") => format!("本地风险：{level}"),
+        (Some(level), _) => format!("Local risk: {level}"),
+    };
+    let label = if language == "zh-CN" {
+        "变更"
+    } else {
+        "Patch"
+    };
+    let mut description = format!("{label}: {summary} · {risk}");
+    if let Some(reason) = reason {
+        let reason_label = if language == "zh-CN" { "原因" } else { "Why" };
+        description.push_str(" · ");
+        description.push_str(reason_label);
+        description.push_str(": ");
+        description.push_str(&reason);
+    }
+    Some(sanitize_inline(
+        &description,
+        MAX_COMPLETION_DESCRIPTION_CHARS,
+    ))
 }
 
 fn localized_local_analysis(mut result: AnalysisResult, language: &str) -> AnalysisResult {
@@ -2055,7 +2141,7 @@ mod tests {
                 cursor: command.chars().count(),
                 description: "generated".to_owned(),
             };
-            assert!(review_completion(result, "", &SafetyEngine::new(), "en-US").is_err());
+            assert!(review_completion(result, "", 0, &SafetyEngine::new(), "en-US").is_err());
         }
     }
 
@@ -2063,7 +2149,7 @@ mod tests {
     fn dangerous_ai_completion_is_suggestion_with_warning() {
         let result = aicoach_core::CompletionResult::replace("rm -rf /", "cleanup");
         let (completion, warning) =
-            review_completion(result, "", &SafetyEngine::new(), "en-US").unwrap();
+            review_completion(result, "", 0, &SafetyEngine::new(), "en-US").unwrap();
         assert_eq!(completion.operation, CompletionOperation::Suggest);
         assert_eq!(completion.command, "rm -rf /");
         let warning = warning.expect("dangerous command should include a warning");
@@ -2072,10 +2158,80 @@ mod tests {
     }
 
     #[test]
+    fn insert_completion_assesses_the_resulting_buffer() {
+        let original = "rm -rf ";
+        let result = aicoach_core::CompletionResult {
+            operation: CoreCompletionOperation::Insert,
+            command: "/".to_owned(),
+            cursor: original.chars().count() + 1,
+            description: "finish the path".to_owned(),
+        };
+        let (completion, warning) = review_completion(
+            result,
+            original,
+            original.chars().count(),
+            &SafetyEngine::new(),
+            "en-US",
+        )
+        .unwrap();
+
+        assert_eq!(completion.operation, CompletionOperation::Suggest);
+        assert_eq!(completion.command, "rm -rf /");
+        assert!(
+            completion
+                .description
+                .as_deref()
+                .is_some_and(|description| {
+                    description.contains("+ /") && description.contains("CRITICAL")
+                })
+        );
+        let warning = warning.expect("the composed command is destructive");
+        assert_eq!(warning.severity, Severity::Critical);
+        assert_eq!(warning.suggested_command.as_deref(), Some("rm -rf /"));
+    }
+
+    #[test]
+    fn safe_completion_explains_patch_reason_and_local_risk() {
+        let result = aicoach_core::CompletionResult::replace(
+            "git pull origin main",
+            "Fix the Git subcommand spelling",
+        );
+        let (completion, warning) = review_completion(
+            result,
+            "git pul origin main",
+            19,
+            &SafetyEngine::new(),
+            "en-US",
+        )
+        .unwrap();
+
+        assert!(warning.is_none());
+        let description = completion.description.expect("patch explanation");
+        assert!(description.contains("Patch: − pul → + pull"));
+        assert!(description.contains("Local risk: no known destructive pattern"));
+        assert!(description.contains("Why: Fix the Git subcommand spelling"));
+    }
+
+    #[test]
+    fn command_patch_is_localized_and_reports_a_disabled_scan() {
+        let description = completion_patch_description(
+            "git pul",
+            "git pull",
+            Some("修正 Git 子命令"),
+            None,
+            "zh-CN",
+        )
+        .unwrap();
+        assert!(description.contains("变更: − pul → + pull"));
+        assert!(description.contains("本地风险扫描：已关闭"));
+        assert!(description.contains("原因: 修正 Git 子命令"));
+    }
+
+    #[test]
     fn disabled_safety_keeps_generated_completion_operation() {
         let result = aicoach_core::CompletionResult::replace("rm -rf /", "cleanup");
         let (completion, warning) =
-            review_completion(result, "", &configured_safety(false), "en-US").unwrap();
+            review_completion(result, "", 0, &configured_safety(false), "en-US").unwrap();
         assert_eq!(completion.operation, CompletionOperation::Replace);
         assert!(warning.is_none());
     }
@@ -2097,7 +2253,7 @@ mod tests {
 
         let completion = aicoach_core::CompletionResult::replace("rm -rf /", "cleanup");
         let (_, warning) =
-            review_completion(completion, "", &SafetyEngine::new(), "zh-CN").unwrap();
+            review_completion(completion, "", 0, &SafetyEngine::new(), "zh-CN").unwrap();
         let warning = warning.expect("dangerous command should include a warning");
         assert!(warning.title.contains("AI 补全风险"));
         assert!(warning.message.contains("破坏性"));

@@ -34,8 +34,8 @@ workflow, and uninstall on a clean supported Mac without reading source code.
 
 ## Milestone 2 — Explainable command collaboration
 
-- [ ] **Command Patch:** preview an AI completion as a token-level diff with a short reason for
-  every changed flag, path, and subcommand.
+- [x] **Command Patch:** preview an AI completion as a token-level diff with a short reason for
+  every materially changed flag, path, and subcommand, then scan the composed final buffer.
 - [ ] **Risk Lens:** explicitly inspect the current ZLE buffer and show what the command can
   modify, what privileges it needs, and which parts are irreversible—without blocking Enter.
 - [ ] **Source Cards:** attach local `man`/`--help` evidence to supported command explanations so
