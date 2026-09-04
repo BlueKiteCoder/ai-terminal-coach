@@ -12,6 +12,11 @@ assert_eq() {
 # Load only function definitions by stubbing hook/widget registration.
 typeset -g AICOACH_TEST_MODE=1
 typeset -g last_zle_message=""
+typeset -g test_settings_dir=$(mktemp -d "${TMPDIR:-/tmp}/aicoach-zsh-test.XXXXXX")
+trap 'rm -rf -- "$test_settings_dir"' EXIT
+typeset -g AICOACH_SETTINGS_FILE=$test_settings_dir/keybindings.zsh
+typeset -g AICOACH_SETTINGS_VERSION_FILE=$test_settings_dir/keybindings.version
+builtin print -r -- '1' >| $AICOACH_SETTINGS_VERSION_FILE
 zle() {
   case ${1:-} in
     aicoach-apply-pending) _aicoach_apply_pending_widget ;;
@@ -24,8 +29,20 @@ zle() {
 typeset -gA test_bindings
 bindkey() {
   if [[ ${1:-} == -M ]]; then
-    local keymap=$2 sequence=$3 widget=$4
+    local keymap=$2
+    if [[ ${3:-} == -r ]]; then
+      local binding_key="${keymap}:${4:-}"
+      unset "test_bindings[$binding_key]"
+      return 0
+    fi
+    local sequence=$3
     local binding_key="${keymap}:${sequence}"
+    if (( $# == 3 )); then
+      [[ -n ${test_bindings[$binding_key]:-} ]] || return 1
+      builtin print -r -- "binding ${test_bindings[$binding_key]}"
+      return 0
+    fi
+    local widget=$4
     test_bindings[$binding_key]=$widget
   fi
   return 0
@@ -53,6 +70,39 @@ meta_lens_binding=$'emacs:\er'
 native_lens_binding='viins:®'
 assert_eq "${test_bindings[$meta_lens_binding]:-}" 'aicoach-risk-lens'
 assert_eq "${test_bindings[$native_lens_binding]:-}" 'aicoach-risk-lens'
+
+# Generated settings are noticed at the next prompt, old owned bindings are
+# removed, and new ones become active without restarting Zsh.
+builtin print -l -r -- \
+  "typeset -g AICOACH_CONFIG_COMPLETION_KEY=\$'\\eg'" \
+  "typeset -g AICOACH_CONFIG_CHAT_KEY=\$'\\ec'" \
+  "typeset -g AICOACH_CONFIG_RISK_LENS_KEY=\$'\\el'" \
+  "typeset -g AICOACH_CONFIG_TOGGLE_KEY=\$'\\e '" \
+  "typeset -g AICOACH_CONFIG_LANGUAGE='en-US'" \
+  "typeset -gi AICOACH_CONFIG_SAFETY_ENABLED=1" \
+  "typeset -gi AICOACH_CONFIG_INLINE_HINT=1" >| $AICOACH_SETTINGS_FILE
+builtin print -r -- '2' >| $AICOACH_SETTINGS_VERSION_FILE
+_aicoach_refresh_settings
+assert_eq "$AICOACH_COMPLETION_KEY" $'\eg'
+assert_eq "$AICOACH_CHAT_KEY" $'\ec'
+assert_eq "$AICOACH_RISK_LENS_KEY" $'\el'
+assert_eq "${test_bindings[$meta_chat_binding]:-}" ''
+new_chat_binding=$'emacs:\ec'
+assert_eq "${test_bindings[$new_chat_binding]:-}" 'aicoach-chat'
+assert_eq "$AICOACH_SETTINGS_VERSION" '2'
+
+override_binding=$(
+  AICOACH_TEST_MODE=1 \
+  AICOACH_SETTINGS_FILE=$AICOACH_SETTINGS_FILE \
+  AICOACH_SETTINGS_VERSION_FILE=$AICOACH_SETTINGS_VERSION_FILE \
+  AICOACH_CHAT_KEY=$'\ex' \
+  AICOACH_VERIFY_SCRIPT="${0:A:h:h}/shell/aicoach.zsh" \
+    /bin/zsh -dfc 'source "$AICOACH_VERIFY_SCRIPT"; bindkey -M emacs "$AICOACH_CHAT_KEY"'
+)
+[[ $override_binding == *' aicoach-chat' ]] || {
+  builtin print -u2 -r -- 'FAIL: explicit pre-source shortcut override lost precedence'
+  test_failed=1
+}
 
 _aicoach_encode $'hello\t世界\n100%'
 encoded=$REPLY

@@ -2,6 +2,11 @@
 set -euo pipefail
 
 typeset -g AICOACH_TEST_MODE=1
+typeset -g benchmark_settings_dir=$(mktemp -d "${TMPDIR:-/tmp}/aicoach-benchmark.XXXXXX")
+trap 'rm -rf -- "$benchmark_settings_dir"' EXIT
+typeset -g AICOACH_SETTINGS_FILE=$benchmark_settings_dir/keybindings.zsh
+typeset -g AICOACH_SETTINGS_VERSION_FILE=$benchmark_settings_dir/keybindings.version
+builtin print -r -- '1' >| $AICOACH_SETTINGS_VERSION_FILE
 zle() { return 0 }
 bindkey() { return 0 }
 add-zsh-hook() { return 0 }

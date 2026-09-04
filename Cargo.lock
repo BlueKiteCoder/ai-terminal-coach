@@ -37,6 +37,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "crossterm",
  "dirs",
  "libc",
  "serde",
