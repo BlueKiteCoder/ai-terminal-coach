@@ -5,6 +5,12 @@ All notable user-visible changes are recorded here. This project follows
 
 ## [Unreleased]
 
+### Added
+
+- Coach suggestions now carry an always-visible local Risk Lens badge. Insert-only and copy-only
+  receipts state the destination, classification, coverage limits, and that nothing was executed;
+  the daemon independently reclassifies terminal handoffs so a client cannot spoof a lower risk.
+
 ### Security
 
 - GitHub Actions are pinned to immutable commits, run on current Node 24 action releases,

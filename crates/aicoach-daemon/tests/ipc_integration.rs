@@ -13,16 +13,17 @@ use aicoach_ai::{
     CommandCompletionRequest,
 };
 use aicoach_core::{
-    AnalysisCategory, AnalysisInput, AnalysisResult,
+    AnalysisCategory, AnalysisCoverage, AnalysisInput, AnalysisResult,
     CompletionOperation as CoreCompletionOperation, CompletionResult as CoreCompletionResult,
-    Severity as CoreSeverity,
+    RiskLevel, Severity as CoreSeverity,
 };
 use aicoach_daemon::{Daemon, DaemonOptions};
 use aicoach_ipc::{
     CancelParams, ChatParams, ClientCapabilities, ClientKind, CommandFinishedParams, CommandId,
-    CommandStartedParams, CompletionParams, ContextParams, EventBody, HelloParams, IpcClient,
-    PROTOCOL_VERSION, RegisterSessionParams, Request, RequestBody, Response, ResponseOutcome,
-    ResponseResult, RiskLensParams, SessionId,
+    CommandStartedParams, CompletionParams, ContextParams, EventBody, HelloParams,
+    InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION, RegisterSessionParams, Request,
+    RequestBody, Response, ResponseOutcome, ResponseResult, RiskLensParams, SafetyClassification,
+    SessionId,
 };
 use async_trait::async_trait;
 use futures_util::stream;
@@ -416,6 +417,53 @@ async fn ai_insert_cannot_hide_a_dangerous_composed_command() {
 }
 
 #[tokio::test]
+async fn daemon_reclassifies_inserted_commands_before_shell_delivery() {
+    let running = RunningDaemon::start(Arc::new(TestProvider::default())).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys010").await;
+    let mut events = shell.subscribe();
+
+    let response = shell
+        .send_request(
+            Some(session),
+            RequestBody::InsertBuffer(InsertBufferParams {
+                command: "rm -rf /".to_owned(),
+                cursor: None,
+                mode: InsertMode::Replace,
+                // A client cannot downgrade the label attached to the shell event.
+                safety: Some(SafetyClassification {
+                    level: Some(RiskLevel::Low),
+                    coverage: AnalysisCoverage::Recognized,
+                    safety_rules_enabled: false,
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Accepted
+        }
+    ));
+
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let EventBody::InsertBuffer(insert) = event.body else {
+        panic!("expected shell-buffer insertion event")
+    };
+    let safety = insert.safety.expect("daemon safety classification");
+    assert_eq!(safety.level, Some(RiskLevel::Critical));
+    assert_eq!(safety.coverage, AnalysisCoverage::Recognized);
+    assert!(safety.safety_rules_enabled);
+
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn risk_lens_is_structured_local_and_provider_free() {
     let provider = Arc::new(TestProvider::default());
     let running = RunningDaemon::start(Arc::clone(&provider)).await;
@@ -606,6 +654,7 @@ async fn tui_created_session_cannot_claim_shell_buffer_ownership() {
                 command: "echo safe".to_owned(),
                 cursor: None,
                 mode: aicoach_ipc::InsertMode::Replace,
+                safety: None,
             }),
         )
         .await

@@ -173,13 +173,33 @@ _aicoach_handle_line $'COMPLETE\t'$AICOACH_SESSION_ID$'\treq-2\treplace\t8\trm -
 assert_eq "$BUFFER" 'echo'
 
 typeset -g AICOACH_DEFER_INSERT=1
-_aicoach_handle_line $'INSERT\t'$AICOACH_SESSION_ID$'\tprintf queued'
+_aicoach_handle_line $'INSERT\t'$AICOACH_SESSION_ID$'\tprintf queued\tlow\trecognized\ttrue'
 assert_eq "$BUFFER" 'echo'
 assert_eq "${AICOACH_PENDING_INSERTS[-1]:-}" 'printf queued'
 typeset -g AICOACH_DEFER_INSERT=0
 _aicoach_apply_pending_inserts
 assert_eq "$BUFFER" 'printf queued'
 assert_eq "$CURSOR" '13'
+assert_eq "$last_zle_message" '[AI Coach] Insert only · LOW · not executed; review, then press Enter'
+
+typeset -g AICOACH_DEFER_INSERT=1
+_aicoach_handle_line $'INSERT\t'$AICOACH_SESSION_ID$'\trm -rf / && company-tool deploy\tcritical\tpartial\ttrue'
+typeset -g AICOACH_DEFER_INSERT=0
+_aicoach_apply_pending_inserts
+assert_eq "$last_zle_message" '[AI Coach] Insert only · CRITICAL · partial coverage · not executed; review, then press Enter'
+
+# A new shell may briefly receive a queued frame from an older daemon during
+# an upgrade. Missing classification fields stay conservative, not LOW.
+typeset -g AICOACH_DEFER_INSERT=1
+_aicoach_handle_line $'INSERT\t'$AICOACH_SESSION_ID$'\tcompany-tool deploy'
+typeset -g AICOACH_DEFER_INSERT=0
+_aicoach_apply_pending_inserts
+assert_eq "$last_zle_message" '[AI Coach] Insert only · UNRATED · unknown command · not executed; review, then press Enter'
+
+typeset -g AICOACH_LANGUAGE='zh-CN'
+_aicoach_insert_status high partial false
+assert_eq "$last_zle_message" '[AI Coach] 仅插入 · 高风险 · 部分识别 · 破坏性规则已关闭 · 尚未执行；检查后请自行按 Enter'
+typeset -g AICOACH_LANGUAGE='en-US'
 
 typeset -g sent_lens_line=""
 _aicoach_send() {

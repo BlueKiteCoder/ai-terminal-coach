@@ -215,8 +215,8 @@ aicoach restart
 | Zsh | `Option+R` | 本地检查当前命令的影响、权限和可恢复性；不修改 Buffer |
 | Zsh | `Option+Space` | 显示/隐藏 Coach 窗口 |
 | TUI | `Esc` | 返回原终端 |
-| TUI | `Option+I` | 把明确选中的建议插入原终端 Buffer，并自动返回终端 |
-| TUI | `Option+Y` | 复制所选建议 |
+| TUI | `Option+I` | 仅把明确选中的建议插入原终端 Buffer，显示本地安全评级后返回；仍需自行按 Enter |
+| TUI | `Option+Y` | 仅复制所选建议并显示本地安全评级；不会执行命令 |
 | TUI | `↑/↓` | 选择建议 |
 | TUI | `Ctrl+Q` | 退出窗口 |
 
@@ -290,6 +290,12 @@ Source Cards 不联网，也不把手册内容发给 Provider。Git 帮助只调
 `aicoach-ui` 是纯 Ratatui/Crossterm 应用，不包含浏览器、Web server、Electron、
 Tauri、React 或 Vue。它自动挂到最近聚焦的 shell session，展示 cwd、最近命令、
 错误提示、建议和 streaming 对话。Chat history 默认每 session 保留 50 条，可关闭。
+
+每条建议旁都会先显示本地 Risk Lens 徽标，例如 `[LOW]`、`[HIGH/PARTIAL]` 或
+`[UNRATED]`；未识别和部分识别不会被伪装成低风险。`Option+I` 是 **insert only**：
+daemon 会对真正交给 ZLE 的完整命令重新评级，原终端随后显示“尚未执行”的回执，用户
+检查后仍需亲自按 Enter。`Option+Y` 是 **copy only**：只更新 macOS 剪贴板并在 Coach
+内显示评级回执。关闭破坏性规则时，徽标和回执会明确显示 `RULES OFF`。
 
 Terminal.app/iTerm2 的窗口由 JXA (`osascript -l JavaScript`) 控制。用户可拖动、
 缩放；位置与尺寸保存在 owner-only 的 `~/.aicoach/window-state.json` 并在下次
