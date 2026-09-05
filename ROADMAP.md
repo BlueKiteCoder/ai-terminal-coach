@@ -67,7 +67,8 @@ inspectable, bounded, and removable.
 - [x] Stable issue templates for bugs, terminal compatibility, feature proposals, and security.
 - [ ] A public compatibility matrix covering Terminal.app, iTerm2, Warp, WezTerm, kitty, and
   Alacritty on supported macOS releases.
-- [ ] Contributor-friendly module boundaries and protocol documentation.
+- [x] Contributor-friendly module boundaries and protocol documentation, including extension
+  recipes and explicit provider, retention, routing, and compatibility contracts.
 - [x] Reproducible dual-architecture release automation, archive verification, checksums,
   changelog, upgrade notes, and fail-closed signing/notarization gates.
 - [ ] Small benchmark dashboard for shell hook latency, startup time, and binary size.

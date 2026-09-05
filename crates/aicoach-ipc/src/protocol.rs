@@ -657,10 +657,19 @@ mod tests {
 
     #[test]
     fn request_round_trip_is_flat_and_stable() {
-        let request = Request::new(None, RequestBody::Ping);
+        let request = Request {
+            request_id: RequestId(Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap()),
+            session_id: None,
+            body: RequestBody::Ping,
+        };
         let json = serde_json::to_string(&Message::from(request.clone())).unwrap();
-        assert!(json.contains(r#""type":"request""#));
-        assert!(json.contains(r#""method":"ping""#));
+        assert_eq!(
+            json,
+            r#"{"type":"request","request_id":"00000000-0000-4000-8000-000000000001","method":"ping"}"#
+        );
+        let guide = include_str!("../../../docs/PROTOCOL.md");
+        assert!(guide.contains(&format!("Current protocol version: **{PROTOCOL_VERSION}**")));
+        assert!(guide.contains(&format!("```json\n{json}\n```")));
         assert_eq!(
             serde_json::from_str::<Message>(&json).unwrap(),
             request.into()

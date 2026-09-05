@@ -568,6 +568,10 @@ macos/                  可选 Carbon 全局快捷键 helper
 homebrew/               Formula 模板
 ```
 
+贡献者可以从 [架构与模块边界](docs/ARCHITECTURE.md) 开始，并在修改跨进程消息前阅读
+[IPC Protocol v2](docs/PROTOCOL.md)。两份文档包含本地规则、持久化数据、协议操作和
+终端适配器的扩展步骤，以及不能被弱化的隐私与执行权约束。
+
 ## 已知限制
 
 - macOS Terminal API 没有可靠方式在不代理 PTY 的前提下分别获取每条命令的完整
@@ -610,7 +614,8 @@ AI 不代替终端，也不代替用户执行命令。即使建议来自结构�
 ## 许可
 
 本项目使用 [MIT License](LICENSE) 开源。贡献指南见
-[CONTRIBUTING.md](CONTRIBUTING.md)。
+[CONTRIBUTING.md](CONTRIBUTING.md)，工程入口见
+[Architecture](docs/ARCHITECTURE.md) 与 [IPC Protocol](docs/PROTOCOL.md)。
 
 ## English overview
 
