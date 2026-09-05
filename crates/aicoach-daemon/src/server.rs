@@ -11,7 +11,8 @@ use std::{
 use aicoach_ai::{AiProvider, ChatMessage, ChatRequest, ChatRole, CommandCompletionRequest};
 use aicoach_core::{
     AnalysisCategory, AnalysisCoverage, AnalysisInput, AnalysisResult, CommandPatch, CommandRecord,
-    CompletionOperation as CoreCompletionOperation, EffectAction, FailureMemory,
+    CompletionOperation as CoreCompletionOperation, EffectAction, EnvironmentDrift,
+    EnvironmentDriftKind, EnvironmentDriftReport, EnvironmentSnapshot, FailureMemory,
     FailureMemoryOptions, FailureMemoryRecall, GitContext, LocalAnalyzer, PrivacyRedactor,
     PrivilegeRequirement, RecoveryProspect, RiskLensReport, RiskLevel, SafetyConfig, SafetyEngine,
     SafetyMode, Severity as CoreSeverity, SourceCard, SourceInvocation, SourceQuery,
@@ -52,6 +53,7 @@ const MAX_INLINE_HINT_CHARS: usize = 240;
 const MAX_PATCH_SUMMARY_CHARS: usize = 220;
 const MAX_COMPLETION_DESCRIPTION_CHARS: usize = 500;
 const MAX_RISK_LENS_MESSAGE_CHARS: usize = 1_200;
+const MAX_EVENT_HINT_CHARS: usize = 1_200;
 const INLINE_CHAT_TRUNCATED_SUFFIX_EN: &str =
     " … (answer truncated; open Coach for the full explanation)";
 const INLINE_CHAT_TRUNCATED_SUFFIX_ZH: &str = " …（回答较长；完整解释请打开 Coach 窗口）";
@@ -573,7 +575,13 @@ impl Daemon {
                     ))
                     .await;
                 }
-                if job.exit_code == 0 || !self.options.auto_error_analysis {
+                if job.exit_code == 0 {
+                    self.schedule_success_git_probe(&job);
+                    return;
+                }
+                if !self.options.auto_error_analysis {
+                    let daemon = Arc::clone(self);
+                    tokio::spawn(async move { daemon.process_environment_drift(job).await });
                     return;
                 }
                 let daemon = Arc::clone(self);
@@ -913,7 +921,7 @@ impl Daemon {
             }
         }
         let mut input = analysis_input(&job);
-        input.git = collect_git_context_bounded(job.cwd.clone()).await;
+        input.git = self.collect_and_send_environment_drift(&job).await;
         input.context.insert(
             0,
             language_preference_record(&self.language_preference(), &job.cwd),
@@ -989,6 +997,47 @@ impl Daemon {
             warn!(error = %error, "could not persist local failure memory");
         }
         observation.recall
+    }
+
+    fn schedule_success_git_probe(self: &Arc<Self>, job: &AnalysisJob) {
+        let daemon = Arc::clone(self);
+        let session_id = job.session_id;
+        let command_id = job.command_id;
+        let cwd = job.cwd.clone();
+        tokio::spawn(async move {
+            let probe = collect_git_probe(cwd).await;
+            daemon.sessions.record_success_git(
+                session_id,
+                command_id,
+                probe.observed,
+                probe.context,
+            );
+        });
+    }
+
+    async fn process_environment_drift(self: Arc<Self>, job: AnalysisJob) {
+        self.collect_and_send_environment_drift(&job).await;
+    }
+
+    async fn collect_and_send_environment_drift(&self, job: &AnalysisJob) -> Option<GitContext> {
+        let probe = collect_git_probe(job.cwd.clone()).await;
+        if let Some(previous) = job.last_success.as_ref() {
+            let current = EnvironmentSnapshot::new(&job.cwd, job.current_environment.clone())
+                .with_git_probe(probe.observed, probe.context.clone());
+            let report = EnvironmentDriftReport::between(&previous.snapshot, &current);
+            if !report.is_empty() {
+                self.send_session_event(Event::new(
+                    job.session_id,
+                    Some(job.request_id),
+                    EventBody::Hint(environment_drift_hint(
+                        &report,
+                        &self.options.coach_language,
+                    )),
+                ))
+                .await;
+            }
+        }
+        probe.context
     }
 
     async fn process_completion(
@@ -1747,22 +1796,43 @@ async fn send_unknown_session(sender: &mpsc::Sender<Message>, request: &Request)
     .await;
 }
 
-async fn collect_git_context_bounded(cwd: PathBuf) -> Option<GitContext> {
+struct GitProbe {
+    observed: bool,
+    context: Option<GitContext>,
+}
+
+async fn collect_git_probe(cwd: PathBuf) -> GitProbe {
     if cwd.as_os_str().is_empty() {
-        return None;
+        return GitProbe {
+            observed: false,
+            context: None,
+        };
     }
     let collection = tokio::task::spawn_blocking(move || try_collect_git_context(cwd));
     match tokio::time::timeout(GIT_CONTEXT_TIMEOUT, collection).await {
-        Ok(Ok(context)) => context,
+        Ok(Ok(context)) => GitProbe {
+            observed: true,
+            context,
+        },
         Ok(Err(error)) => {
             debug!(error = %error, "Git context collector task failed");
-            None
+            GitProbe {
+                observed: false,
+                context: None,
+            }
         }
         Err(_) => {
             debug!("Git context collection exceeded its latency budget");
-            None
+            GitProbe {
+                observed: false,
+                context: None,
+            }
         }
     }
+}
+
+async fn collect_git_context_bounded(cwd: PathBuf) -> Option<GitContext> {
+    collect_git_probe(cwd).await.context
 }
 
 fn git_context_summary(git: &GitContext) -> String {
@@ -1850,6 +1920,95 @@ fn failure_memory_hint(recall: &FailureMemoryRecall, language: &str) -> Hint {
         message,
         suggested_command: recall.reusable.then(|| recall.successful_follow_up.clone()),
     }
+}
+
+fn environment_drift_hint(report: &EnvironmentDriftReport, language: &str) -> Hint {
+    let chinese = language == "zh-CN";
+    let mut lines = report
+        .changes
+        .iter()
+        .map(|change| {
+            let label = drift_label(change.kind, chinese);
+            let before = drift_value(change, change.before.as_deref(), chinese);
+            let after = drift_value(change, change.after.as_deref(), chinese);
+            format!("- {label}: {before} → {after}")
+        })
+        .collect::<Vec<_>>();
+    lines.push(
+        localized_text(
+            language,
+            "Local metadata comparison only; no file contents were read and this comparison was not sent to AI.",
+            "仅比较本机元数据；未读取文件内容，也未把这份对比发送给 AI。",
+        )
+        .to_owned(),
+    );
+    Hint {
+        severity: Severity::Warning,
+        title: localized_text(
+            language,
+            "Environment changed since the last success",
+            "环境自上次成功后发生变化",
+        )
+        .to_owned(),
+        message: lines.join("\n"),
+        suggested_command: None,
+    }
+}
+
+fn drift_label(kind: EnvironmentDriftKind, chinese: bool) -> &'static str {
+    match (kind, chinese) {
+        (EnvironmentDriftKind::WorkingDirectory, false) => "Working directory",
+        (EnvironmentDriftKind::WorkingDirectory, true) => "工作目录",
+        (EnvironmentDriftKind::PythonEnvironment, false) => "Python virtual environment",
+        (EnvironmentDriftKind::PythonEnvironment, true) => "Python 虚拟环境",
+        (EnvironmentDriftKind::CondaEnvironment, false) => "Conda environment",
+        (EnvironmentDriftKind::CondaEnvironment, true) => "Conda 环境",
+        (EnvironmentDriftKind::GitRepository, false) => "Git repository",
+        (EnvironmentDriftKind::GitRepository, true) => "Git 仓库",
+        (EnvironmentDriftKind::GitBranch, false) => "Git branch",
+        (EnvironmentDriftKind::GitBranch, true) => "Git 分支",
+        (EnvironmentDriftKind::GitWorktree, false) => "Git worktree",
+        (EnvironmentDriftKind::GitWorktree, true) => "Git 工作区",
+    }
+}
+
+fn drift_value(change: &EnvironmentDrift, value: Option<&str>, chinese: bool) -> String {
+    let Some(value) = value else {
+        return match (change.kind, chinese) {
+            (EnvironmentDriftKind::GitRepository, false) => "outside a repository".to_owned(),
+            (EnvironmentDriftKind::GitRepository, true) => "不在仓库中".to_owned(),
+            (_, false) => "inactive".to_owned(),
+            (_, true) => "未启用".to_owned(),
+        };
+    };
+    let mut value = value.to_owned();
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        if !home.is_empty() && home != "/" {
+            value = value.replace(home.as_ref(), "~");
+        }
+    }
+    if chinese && change.kind == EnvironmentDriftKind::GitWorktree {
+        value = value
+            .replace("clean", "干净")
+            .replace("modified", "已修改")
+            .replace("staged", "已暂存")
+            .replace("untracked", "未跟踪")
+            .replace("conflicted", "冲突")
+            .replace("ahead", "领先")
+            .replace("behind", "落后");
+    }
+    bounded_display_value(&value, 80)
+}
+
+fn bounded_display_value(value: &str, limit: usize) -> String {
+    let safe = strip_terminal_sequences(value, false);
+    if safe.chars().count() <= limit {
+        return safe;
+    }
+    let mut output: String = safe.chars().take(limit.saturating_sub(1)).collect();
+    output.push('…');
+    output
 }
 
 fn completion_from_core(
@@ -2336,9 +2495,9 @@ fn sanitize_event(mut event: Event, inline: bool) -> Event {
         EventBody::Hint(mut hint) => {
             hint.title = sanitize_inline(&hint.title, 120);
             hint.message = if inline {
-                sanitize_inline(&hint.message, 500)
+                sanitize_inline(&hint.message, MAX_EVENT_HINT_CHARS)
             } else {
-                sanitize_multiline(&hint.message, 500)
+                sanitize_multiline(&hint.message, MAX_EVENT_HINT_CHARS)
             };
             hint.suggested_command = hint
                 .suggested_command
@@ -2587,6 +2746,33 @@ mod tests {
         let hint = bounded_hint(&analysis, INLINE_HINT_TRUNCATED_SUFFIX_EN);
         assert_eq!(hint.chars().count(), MAX_INLINE_HINT_CHARS);
         assert!(hint.ends_with(INLINE_HINT_TRUNCATED_SUFFIX_EN));
+    }
+
+    #[test]
+    fn environment_drift_hint_is_localized_and_terminal_safe() {
+        let report = EnvironmentDriftReport {
+            changes: vec![
+                EnvironmentDrift {
+                    kind: EnvironmentDriftKind::WorkingDirectory,
+                    before: Some("/tmp/old\u{1b}[31m".to_owned()),
+                    after: Some("/tmp/new\nspoof".to_owned()),
+                },
+                EnvironmentDrift {
+                    kind: EnvironmentDriftKind::GitWorktree,
+                    before: Some("clean".to_owned()),
+                    after: Some("2 modified, 1 staged".to_owned()),
+                },
+            ],
+        };
+
+        let hint = environment_drift_hint(&report, "zh-CN");
+        assert_eq!(hint.title, "环境自上次成功后发生变化");
+        assert!(hint.message.contains("工作目录"));
+        assert!(hint.message.contains("2 已修改, 1 已暂存"));
+        assert!(hint.message.contains("未把这份对比发送给 AI"));
+        assert!(!hint.message.contains('\u{1b}'));
+        assert!(!hint.message.contains("\nspoof\n"));
+        assert!(hint.suggested_command.is_none());
     }
 
     #[test]

@@ -21,4 +21,7 @@ pub mod state;
 
 pub use runtime::{RuntimeFileError, RuntimeFiles, write_active_session};
 pub use server::{Daemon, DaemonError, DaemonOptions};
-pub use state::{ActiveRequestKind, AnalysisJob, ConnectionId, SessionLimits, SessionManager};
+pub use state::{
+    ActiveRequestKind, AnalysisJob, ConnectionId, SessionLimits, SessionManager,
+    SuccessfulCommandBaseline,
+};

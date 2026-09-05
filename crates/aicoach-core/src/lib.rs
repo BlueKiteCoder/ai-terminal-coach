@@ -8,6 +8,7 @@ pub mod analyzer;
 pub mod command_patch;
 pub mod config;
 pub mod context;
+pub mod environment_drift;
 pub mod failure_memory;
 pub mod git;
 pub mod models;
@@ -25,6 +26,9 @@ pub use config::{
     ProductPaths, SafetyConfig, SafetyMode, WindowConfig,
 };
 pub use context::ContextManager;
+pub use environment_drift::{
+    EnvironmentDrift, EnvironmentDriftKind, EnvironmentDriftReport, EnvironmentSnapshot,
+};
 pub use failure_memory::{
     FailureFingerprint, FailureMemory, FailureMemoryError, FailureMemoryObservation,
     FailureMemoryOptions, FailureMemoryRecall, FailureMemorySnapshot,
