@@ -193,6 +193,32 @@ impl RunningDaemon {
         }
     }
 
+    async fn start_local_only(provider: Arc<TestProvider>) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coach.sock");
+        let daemon = Daemon::new(
+            provider,
+            DaemonOptions {
+                capture_screen_tail: false,
+                auto_error_analysis: false,
+                active_state_dir: Some(directory.path().to_owned()),
+                ..DaemonOptions::default()
+            },
+        );
+        let server = Arc::clone(&daemon);
+        let server_socket = socket.clone();
+        let task = tokio::spawn(async move {
+            server.serve_path(server_socket, false).await.unwrap();
+        });
+        wait_for_socket(&socket).await;
+        Self {
+            directory,
+            socket,
+            daemon,
+            task,
+        }
+    }
+
     async fn stop(self) {
         self.daemon.request_shutdown();
         tokio::time::timeout(Duration::from_secs(2), self.task)
@@ -266,6 +292,27 @@ async fn complete_command(
     exit_code: i32,
     stderr: Option<&str>,
 ) {
+    complete_command_at(
+        shell,
+        session,
+        command,
+        exit_code,
+        stderr,
+        Path::new("/tmp/private-project"),
+        BTreeMap::new(),
+    )
+    .await;
+}
+
+async fn complete_command_at(
+    shell: &IpcClient,
+    session: SessionId,
+    command: &str,
+    exit_code: i32,
+    stderr: Option<&str>,
+    cwd: &Path,
+    environment: BTreeMap<String, String>,
+) {
     let command_id = CommandId::new();
     shell
         .send_request(
@@ -273,7 +320,7 @@ async fn complete_command(
             RequestBody::CommandStarted(CommandStartedParams {
                 command_id,
                 command: command.to_owned(),
-                cwd: PathBuf::from("/tmp/private-project"),
+                cwd: cwd.to_owned(),
                 started_at_unix_ms: None,
             }),
         )
@@ -290,7 +337,7 @@ async fn complete_command(
                 stdout: None,
                 stderr: stderr.map(ToOwned::to_owned),
                 duration_ms: Some(1),
-                environment: BTreeMap::new(),
+                environment,
             }),
         )
         .await
@@ -680,6 +727,125 @@ async fn recurring_failure_recalls_redacted_local_follow_up_without_provider() {
     assert!(!encoded.contains("customer-secret-project"));
     assert!(!encoded.contains("private diagnostic"));
     assert!(!encoded.contains("opaque-test-value"));
+
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn environment_drift_compares_with_last_success_without_calling_provider() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start_local_only(Arc::clone(&provider)).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys017").await;
+    let mut events = shell.subscribe();
+
+    complete_command_at(
+        &shell,
+        session,
+        "cargo check",
+        0,
+        None,
+        Path::new("/tmp/drift-old"),
+        BTreeMap::from([(
+            "VIRTUAL_ENV".to_owned(),
+            "/Users/alice/project/.venv".to_owned(),
+        )]),
+    )
+    .await;
+    complete_command_at(
+        &shell,
+        session,
+        "cargo test",
+        1,
+        Some("test failed"),
+        Path::new("/tmp/drift-new"),
+        BTreeMap::from([
+            ("CONDA_DEFAULT_ENV".to_owned(), "ml".to_owned()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_owned(),
+                "never-retain".to_owned(),
+            ),
+        ]),
+    )
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let EventBody::Hint(hint) = event.body else {
+        panic!("expected environment-drift hint")
+    };
+    assert_eq!(hint.title, "Environment changed since the last success");
+    assert!(hint.message.contains("Working directory"));
+    assert!(hint.message.contains("Python virtual environment"));
+    assert!(hint.message.contains("Conda environment"));
+    assert!(hint.message.contains("no file contents were read"));
+    assert!(hint.message.contains("was not sent to AI"));
+    assert!(!hint.message.contains("never-retain"));
+    assert!(hint.suggested_command.is_none());
+    assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
+
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn environment_drift_reports_a_real_git_branch_change() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start_local_only(Arc::clone(&provider)).await;
+    let repository = tempfile::tempdir().unwrap();
+    let initialized = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys018").await;
+    let mut events = shell.subscribe();
+    complete_command_at(
+        &shell,
+        session,
+        "git status",
+        0,
+        None,
+        repository.path(),
+        BTreeMap::new(),
+    )
+    .await;
+    // The success snapshot is enriched asynchronously, with a 250 ms hard
+    // deadline. Waiting past that bound makes the branch assertion stable.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let switched = std::process::Command::new("git")
+        .args(["symbolic-ref", "HEAD", "refs/heads/feature"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    assert!(switched.success());
+    complete_command_at(
+        &shell,
+        session,
+        "cargo test",
+        1,
+        Some("test failed"),
+        repository.path(),
+        BTreeMap::new(),
+    )
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let EventBody::Hint(hint) = event.body else {
+        panic!("expected environment-drift hint")
+    };
+    assert!(hint.message.contains("Git branch: main → feature"));
+    assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
 
     shell.close().await.unwrap();
     running.stop().await;

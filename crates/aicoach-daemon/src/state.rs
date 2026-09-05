@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use aicoach_core::{EnvironmentSnapshot, GitContext};
 use aicoach_ipc::{
     CommandFinishedParams, CommandId, CommandStartedParams, ContextCommand, RegisterSessionParams,
     RequestId, SessionContext, SessionId, sanitize_shell_environment,
@@ -74,7 +75,14 @@ pub struct AnalysisJob {
     pub screen_tail: Option<String>,
     pub current_environment: BTreeMap<String, String>,
     pub environment_changes: BTreeMap<String, Option<String>>,
+    pub last_success: Option<SuccessfulCommandBaseline>,
     pub context: Vec<ContextCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessfulCommandBaseline {
+    pub command_id: CommandId,
+    pub snapshot: EnvironmentSnapshot,
 }
 
 #[derive(Debug)]
@@ -103,6 +111,7 @@ struct Session {
     commands: VecDeque<ContextCommand>,
     chat: VecDeque<(bool, String)>,
     active: HashMap<RequestId, ActiveRequest>,
+    last_success: Option<SuccessfulCommandBaseline>,
     last_accessed: Instant,
 }
 
@@ -151,6 +160,7 @@ impl SessionManager {
             commands: VecDeque::new(),
             chat: VecDeque::new(),
             active: HashMap::new(),
+            last_success: None,
             last_accessed: now,
         });
         session.tty = params.tty;
@@ -192,6 +202,7 @@ impl SessionManager {
             commands: VecDeque::new(),
             chat: VecDeque::new(),
             active: HashMap::new(),
+            last_success: None,
             last_accessed: now,
         });
         if let Some(session) = state.sessions.get_mut(&session_id) {
@@ -273,6 +284,13 @@ impl SessionManager {
             changes
         };
         let current_environment = session.environment.clone();
+        if params.exit_code == 0 {
+            session.last_success = Some(SuccessfulCommandBaseline {
+                command_id: params.command_id,
+                snapshot: EnvironmentSnapshot::new(&cwd, current_environment.clone()),
+            });
+        }
+        let last_success = session.last_success.clone();
 
         let stderr = params
             .stderr
@@ -311,8 +329,33 @@ impl SessionManager {
                 .map(|value| truncate_tail(&value, self.limits.max_output_per_command)),
             current_environment,
             environment_changes,
+            last_success,
             context: session.commands.iter().cloned().collect(),
         })
+    }
+
+    /// Enrich the most recent successful command with an asynchronous Git
+    /// probe. A stale probe can never overwrite a newer success baseline.
+    pub fn record_success_git(
+        &self,
+        session_id: SessionId,
+        command_id: CommandId,
+        observed: bool,
+        git: Option<GitContext>,
+    ) -> bool {
+        let mut state = self.state.lock();
+        let Some(session) = state.sessions.get_mut(&session_id) else {
+            return false;
+        };
+        let Some(baseline) = session.last_success.as_mut() else {
+            return false;
+        };
+        if baseline.command_id != command_id {
+            return false;
+        }
+        baseline.snapshot.git_observed = observed;
+        baseline.snapshot.git = git;
+        true
     }
 
     /// Attach a best-effort screen tail to the matching context record after
@@ -860,5 +903,177 @@ mod tests {
         assert_eq!(context.environment, job.current_environment);
         assert!(!context.environment.contains_key("AWS_SECRET_ACCESS_KEY"));
         assert!(!context.environment.contains_key("API_TOKEN"));
+    }
+
+    #[test]
+    fn failed_command_receives_the_latest_successful_environment_baseline() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let session = SessionId::new();
+        let mut params = registration(session);
+        params.environment = BTreeMap::from([
+            ("VIRTUAL_ENV".to_owned(), "/work/old/.venv".to_owned()),
+            ("API_TOKEN".to_owned(), "must-not-be-retained".to_owned()),
+        ]);
+        manager.register(ConnectionId::new(), params);
+
+        let successful = CommandId::new();
+        assert!(manager.start_command(
+            session,
+            CommandStartedParams {
+                command_id: successful,
+                command: "cargo check".to_owned(),
+                cwd: PathBuf::from("/work/old"),
+                started_at_unix_ms: None,
+            },
+        ));
+        manager
+            .finish_command(
+                session,
+                RequestId::new(),
+                CommandFinishedParams {
+                    command_id: successful,
+                    command: None,
+                    cwd: None,
+                    exit_code: 0,
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: Some(10),
+                    environment: BTreeMap::from([(
+                        "VIRTUAL_ENV".to_owned(),
+                        "/work/old/.venv".to_owned(),
+                    )]),
+                },
+                None,
+            )
+            .unwrap();
+
+        let failed = CommandId::new();
+        assert!(manager.start_command(
+            session,
+            CommandStartedParams {
+                command_id: failed,
+                command: "cargo test".to_owned(),
+                cwd: PathBuf::from("/work/new"),
+                started_at_unix_ms: None,
+            },
+        ));
+        let job = manager
+            .finish_command(
+                session,
+                RequestId::new(),
+                CommandFinishedParams {
+                    command_id: failed,
+                    command: None,
+                    cwd: None,
+                    exit_code: 1,
+                    stdout: None,
+                    stderr: Some("failed".to_owned()),
+                    duration_ms: Some(20),
+                    environment: BTreeMap::from([
+                        ("CONDA_DEFAULT_ENV".to_owned(), "ml".to_owned()),
+                        ("AWS_SECRET_ACCESS_KEY".to_owned(), "secret".to_owned()),
+                    ]),
+                },
+                None,
+            )
+            .unwrap();
+
+        let baseline = job.last_success.expect("successful baseline");
+        assert_eq!(baseline.command_id, successful);
+        assert_eq!(baseline.snapshot.cwd, PathBuf::from("/work/old"));
+        assert_eq!(
+            baseline.snapshot.environment,
+            BTreeMap::from([("VIRTUAL_ENV".to_owned(), "/work/old/.venv".to_owned())])
+        );
+        assert!(!baseline.snapshot.environment.contains_key("API_TOKEN"));
+        assert!(
+            !baseline
+                .snapshot
+                .environment
+                .contains_key("AWS_SECRET_ACCESS_KEY")
+        );
+    }
+
+    #[test]
+    fn stale_git_probe_cannot_overwrite_a_newer_successful_baseline() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let session = SessionId::new();
+        manager.register(ConnectionId::new(), registration(session));
+
+        let first = CommandId::new();
+        let second = CommandId::new();
+        for (command_id, command) in [(first, "true"), (second, "pwd")] {
+            assert!(manager.start_command(
+                session,
+                CommandStartedParams {
+                    command_id,
+                    command: command.to_owned(),
+                    cwd: PathBuf::from("/work/repo"),
+                    started_at_unix_ms: None,
+                },
+            ));
+            manager
+                .finish_command(
+                    session,
+                    RequestId::new(),
+                    CommandFinishedParams {
+                        command_id,
+                        command: None,
+                        cwd: None,
+                        exit_code: 0,
+                        stdout: None,
+                        stderr: None,
+                        duration_ms: Some(1),
+                        environment: BTreeMap::new(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+
+        let stale_git = GitContext {
+            repo_root: PathBuf::from("/work/stale"),
+            branch: Some("stale".to_owned()),
+            ..GitContext::default()
+        };
+        let current_git = GitContext {
+            repo_root: PathBuf::from("/work/repo"),
+            branch: Some("main".to_owned()),
+            ..GitContext::default()
+        };
+        assert!(!manager.record_success_git(session, first, true, Some(stale_git)));
+        assert!(manager.record_success_git(session, second, true, Some(current_git.clone())));
+
+        let failed = CommandId::new();
+        assert!(manager.start_command(
+            session,
+            CommandStartedParams {
+                command_id: failed,
+                command: "false".to_owned(),
+                cwd: PathBuf::from("/work/repo"),
+                started_at_unix_ms: None,
+            },
+        ));
+        let job = manager
+            .finish_command(
+                session,
+                RequestId::new(),
+                CommandFinishedParams {
+                    command_id: failed,
+                    command: None,
+                    cwd: None,
+                    exit_code: 1,
+                    stdout: None,
+                    stderr: Some("failed".to_owned()),
+                    duration_ms: Some(1),
+                    environment: BTreeMap::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let baseline = job.last_success.expect("successful baseline");
+        assert_eq!(baseline.command_id, second);
+        assert!(baseline.snapshot.git_observed);
+        assert_eq!(baseline.snapshot.git, Some(current_git));
     }
 }

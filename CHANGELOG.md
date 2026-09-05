@@ -12,6 +12,8 @@ All notable user-visible changes are recorded here. This project follows
   the daemon independently reclassifies terminal handoffs so a client cannot spoof a lower risk.
 - Failure Fingerprints locally recognize recurring failures and surface the redacted command that
   next succeeded last time, with bounded retention plus `aicoach memory status|list|clear` controls.
+- Environment Drift Lens compares a failed command with the latest success in the same session and
+  surfaces only changed cwd, Python/Conda activation, and bounded Git metadata without AI access.
 
 ### Security
 
@@ -19,6 +21,8 @@ All notable user-visible changes are recorded here. This project follows
   and receive weekly Dependabot update pull requests.
 - Failure memory never persists the failed command, diagnostic output, cwd, or session ID; it is
   owner-only, force-redacted independently of provider settings, and never added to AI prompts.
+- Environment Drift baselines remain in daemon memory, read no repository file contents, omit
+  incomplete Git probes, and never add their comparison report to provider prompts.
 
 ### Fixed
 

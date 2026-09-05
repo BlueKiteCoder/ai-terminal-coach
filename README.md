@@ -58,6 +58,9 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   管理器和拼写错误。普通成功命令不调用 AI。
 - **Failure Fingerprints** 在本机识别重复失败，并提示上次同类失败之后的下一条成功
   命令。提示明确标记为时间关联而非确定因果；识别、保存和召回均不调用 AI。
+- **Environment Drift Lens** 在失败时对比当前状态与本 session 最近一次成功命令：
+  工作目录、Python/Conda 环境，以及可安全观察到的 Git 仓库、分支和工作区计数；只在
+  本机显示变化，不读取文件内容，也不把对比报告加入 AI 请求。
 - 本地 Safety Engine 分级识别 `rm -rf /`、根目录/家目录递归删除、`mkfs`、
   `dd`、`diskutil eraseDisk`、`git reset --hard`、`git clean -fd`、SQL DROP、
   `chmod -R 777`、强制 kill、fork bomb、下载后直接 pipe 到 shell 等。当前行为是
@@ -349,6 +352,17 @@ aicoach memory list --json
 aicoach memory clear           # 删除全部记录；必要时安全重启 daemon
 ```
 
+## Environment Drift Lens：先问“环境变了什么”
+
+同一条命令昨天成功、今天失败，问题经常不在命令本身，而在运行环境。每次成功命令后，
+daemon 会在内存中保留一个有界快照；下一次命令失败时，它只显示发生变化的项目：cwd、
+`VIRTUAL_ENV`、`CONDA_DEFAULT_ENV`，以及 Git 仓库根目录、分支、detached HEAD 和
+modified/staged/untracked/conflict/ahead/behind 计数。没有变化就保持安静。
+
+这个 Lens 不读取仓库文件内容，不保存命令输出，也不声称变化就是失败原因。基线仅属于
+当前 daemon session，不写入 Failure Fingerprints 文件；Git 探针超时或尚未完成时会省略
+该项，不会猜测结果。对比报告只发给当前终端/Coach 界面，不会加入 provider prompt。
+
 ## 配置
 
 配置文件：`~/.config/aicoach/config.toml`。
@@ -545,8 +559,8 @@ AI Terminal Coach is a macOS/Zsh companion that provides local diagnostics,
 safety warnings, a provider-free preflight Risk Lens, explainable token-level
 Command Patches, local-manual Source Cards, AI-assisted completion, quick
 terminal chat, share-ready privacy-scrubbed Session Capsules, local-only Failure
-Fingerprints, and a standalone Ratatui Coach window. It never presses Enter or
-executes an AI suggestion.
+Fingerprints, a provider-free Environment Drift Lens, and a standalone Ratatui
+Coach window. It never presses Enter or executes an AI suggestion.
 
 The workflow image above is generated from the real local analyzer, Risk Lens,
 Source Card, Command Patch, and privacy-redaction output. CI verifies the
@@ -566,6 +580,12 @@ output, cwd, or session ID. It is never added to provider prompts and can be
 inspected or removed with `aicoach memory list` / `aicoach memory clear`.
 Redaction is defensive best effort; `privacy.extra_patterns` also applies to
 this store when project-specific strings need additional coverage.
+
+Environment Drift Lens compares only the current failure with the latest success
+in the same daemon session. It reports changed cwd, Python/Conda activation and
+bounded Git metadata. The baseline is memory-only, file contents are not read,
+incomplete Git probes are omitted, and the comparison is never added to an AI
+provider request.
 
 Build and install:
 
