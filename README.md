@@ -28,10 +28,12 @@ Terminal.app / iTerm2 / 其他 macOS 终端
                   │  ~/.aicoach/run/aicoach.sock
                   ▼
               aicoachd
-      ┌───────────┼────────────┐
- Local Analyzer  Safety     Context
-      │            │            │
-      └──────── OpenAI-compatible API
+      ┌───────────┼────────────┬────────────┐
+ Local Analyzer  Safety     Context    Local Memory
+      │            │            │        never uploaded
+      └────────────┴────────────┘
+                   │ redacted, opt-in
+          OpenAI-compatible API
                   │
               aicoach-ui
 ```
@@ -54,6 +56,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
 - `Option+Space` 在原终端和独立 Coach TUI 之间切换。
 - 本地分析 command-not-found、权限、文件、Git、Docker、网络、编译、SSH、包
   管理器和拼写错误。普通成功命令不调用 AI。
+- **Failure Fingerprints** 在本机识别重复失败，并提示上次同类失败之后的下一条成功
+  命令。提示明确标记为时间关联而非确定因果；识别、保存和召回均不调用 AI。
 - 本地 Safety Engine 分级识别 `rm -rf /`、根目录/家目录递归删除、`mkfs`、
   `dd`、`diskutil eraseDisk`、`git reset --hard`、`git clean -fd`、SQL DROP、
   `chmod -R 777`、强制 kill、fork bomb、下载后直接 pipe 到 shell 等。当前行为是
@@ -324,6 +328,27 @@ Capsule 直接读取 daemon 已经保留的有界 session context，不会发起
 控制序列，并用动态 Markdown fence 包住不可信输出。脱敏属于防御性 best effort，
 公开分享前仍应人工检查。
 
+## Failure Fingerprints：越用越懂当前这台 Mac
+
+当一条命令失败后，daemon 会在当前 session 内等待下一条非观察型成功命令；同一失败
+以后再次出现时，Coach 会显示“上次出现后，下一条成功命令是……”。它不会声称该命令
+一定是修复原因。召回命令在进入 Coach 建议列表时仍会经过本地 Risk Lens，仍然只允许
+用户检查、插入或复制，绝不自动执行。
+
+持久化文件是 owner-only 的 `~/.aicoach/failure-memory.json`。它默认最多保留 128 条、
+30 天，只包含失败形状的 SHA-256、可执行程序族、次数、时间和强制脱敏后的成功后续
+命令；**不保存失败命令、stdout/stderr、cwd 或 session ID**，也不把这些长期记忆加入
+AI 请求。即使 `privacy.redaction = false`，此处的内置密钥脱敏仍然开启，且继续应用
+`privacy.extra_patterns`。脱敏是防御性 best effort，无法理解所有业务敏感字符串；可用
+自定义规则补充，并随时通过下面的命令审查或清空。
+
+```zsh
+aicoach memory status          # 数据边界、数量、路径与保留策略
+aicoach memory list            # 查看全部已脱敏记录
+aicoach memory list --json
+aicoach memory clear           # 删除全部记录；必要时安全重启 daemon
+```
+
 ## 配置
 
 配置文件：`~/.config/aicoach/config.toml`。
@@ -347,10 +372,17 @@ Daemon 在启动时读取配置，修改 AI、隐私、上下文或 Coach 设置
 max_commands = 30
 max_output_per_command = 20000
 max_total_chars = 100000
+
+[memory]
+enabled = true
+max_entries = 128
+retention_days = 30
+resolution_window_minutes = 10
 ```
 
-Daemon 不把完整 Terminal history 持久化；日志只记录请求类型、session/request ID、
-状态和错误种类，不记录命令输出、提示词、API key 或响应正文。
+Daemon 不把完整 Terminal history 持久化；Failure Fingerprints 的例外边界如上所述，
+可完整查看和删除。日志只记录请求类型、session/request ID、状态和错误种类，不记录
+命令输出、提示词、API key 或响应正文。
 
 ## CLI
 
@@ -363,10 +395,12 @@ aicoach doctor [--json]
 aicoach config show|path|validate|set|edit|set-key|delete-key
 aicoach logs [-n 100] [--follow]
 aicoach capsule [--last 20] [--failed-only] [--copy] [--output FILE]
+aicoach memory [status [--json] | list [--json] | clear]
 aicoach toggle [--session UUID] [--tty /dev/ttys001]
 ```
 
-`uninstall` 保留配置和日志；只有显式 `--purge` 才删除它们，`.zshrc` 备份始终保留。
+`uninstall` 保留配置、Failure Fingerprints 和日志；只有显式 `--purge` 才删除它们，
+`.zshrc` 备份始终保留。也可以只用 `aicoach memory clear` 删除 Failure Fingerprints。
 
 ## macOS 权限
 
@@ -510,8 +544,9 @@ AI 不代替终端，也不代替用户执行命令。即使建议来自结构�
 AI Terminal Coach is a macOS/Zsh companion that provides local diagnostics,
 safety warnings, a provider-free preflight Risk Lens, explainable token-level
 Command Patches, local-manual Source Cards, AI-assisted completion, quick
-terminal chat, share-ready privacy-scrubbed Session Capsules, and a standalone
-Ratatui Coach window. It never presses Enter or executes an AI suggestion.
+terminal chat, share-ready privacy-scrubbed Session Capsules, local-only Failure
+Fingerprints, and a standalone Ratatui Coach window. It never presses Enter or
+executes an AI suggestion.
 
 The workflow image above is generated from the real local analyzer, Risk Lens,
 Source Card, Command Patch, and privacy-redaction output. CI verifies the
@@ -523,6 +558,14 @@ provider is disabled, screen-tail capture is opt-in, and the application runs
 in local-only mode until the user explicitly configures an OpenAI-compatible
 provider. Interface messages, local analysis, and AI responses support English
 (`en-US`, the default) and Simplified Chinese (`zh-CN`).
+
+Failure Fingerprints retain at most 128 entries for 30 days by default. The
+owner-only store contains a hash of the normalized failure shape and the
+always-redacted next successful command—never the failed command, diagnostic
+output, cwd, or session ID. It is never added to provider prompts and can be
+inspected or removed with `aicoach memory list` / `aicoach memory clear`.
+Redaction is defensive best effort; `privacy.extra_patterns` also applies to
+this store when project-specific strings need additional coverage.
 
 Build and install:
 

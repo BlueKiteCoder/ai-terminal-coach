@@ -15,7 +15,7 @@ use aicoach_ai::{
 use aicoach_core::{
     AnalysisCategory, AnalysisCoverage, AnalysisInput, AnalysisResult,
     CompletionOperation as CoreCompletionOperation, CompletionResult as CoreCompletionResult,
-    RiskLevel, Severity as CoreSeverity,
+    FailureMemoryOptions, PrivacyRedactor, RiskLevel, Severity as CoreSeverity,
 };
 use aicoach_daemon::{Daemon, DaemonOptions};
 use aicoach_ipc::{
@@ -122,7 +122,7 @@ impl AiProvider for TestProvider {
 }
 
 struct RunningDaemon {
-    _directory: TempDir,
+    directory: TempDir,
     socket: PathBuf,
     daemon: Arc<Daemon>,
     task: JoinHandle<()>,
@@ -152,7 +152,41 @@ impl RunningDaemon {
         });
         wait_for_socket(&socket).await;
         Self {
-            _directory: directory,
+            directory,
+            socket,
+            daemon,
+            task,
+        }
+    }
+
+    async fn start_with_failure_memory(provider: Arc<TestProvider>) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coach.sock");
+        let daemon = Daemon::new(
+            provider,
+            DaemonOptions {
+                capture_screen_tail: false,
+                auto_error_analysis: false,
+                active_state_dir: Some(directory.path().to_owned()),
+                failure_memory: Some(FailureMemoryOptions {
+                    path: directory.path().join("failure-memory.json"),
+                    home_dir: PathBuf::from("/Users/alice"),
+                    max_entries: 16,
+                    retention: Duration::from_secs(30 * 24 * 60 * 60),
+                    resolution_window: Duration::from_secs(10 * 60),
+                    redactor: PrivacyRedactor::default(),
+                }),
+                ..DaemonOptions::default()
+            },
+        );
+        let server = Arc::clone(&daemon);
+        let server_socket = socket.clone();
+        let task = tokio::spawn(async move {
+            server.serve_path(server_socket, false).await.unwrap();
+        });
+        wait_for_socket(&socket).await;
+        Self {
+            directory,
             socket,
             daemon,
             task,
@@ -223,6 +257,44 @@ async fn register(client: &IpcClient, requested: Option<SessionId>, tty: &str) -
         panic!("expected registration response")
     };
     session_id
+}
+
+async fn complete_command(
+    shell: &IpcClient,
+    session: SessionId,
+    command: &str,
+    exit_code: i32,
+    stderr: Option<&str>,
+) {
+    let command_id = CommandId::new();
+    shell
+        .send_request(
+            Some(session),
+            RequestBody::CommandStarted(CommandStartedParams {
+                command_id,
+                command: command.to_owned(),
+                cwd: PathBuf::from("/tmp/private-project"),
+                started_at_unix_ms: None,
+            }),
+        )
+        .await
+        .unwrap();
+    shell
+        .send_request(
+            Some(session),
+            RequestBody::CommandFinished(CommandFinishedParams {
+                command_id,
+                command: None,
+                cwd: None,
+                exit_code,
+                stdout: None,
+                stderr: stderr.map(ToOwned::to_owned),
+                duration_ms: Some(1),
+                environment: BTreeMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -553,6 +625,62 @@ async fn failed_command_uses_ai_after_local_trigger_and_pushes_hint() {
     };
     assert_eq!(hint.message, "provider analyzed failure");
     assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 1);
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn recurring_failure_recalls_redacted_local_follow_up_without_provider() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start_with_failure_memory(Arc::clone(&provider)).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys016").await;
+    let mut events = shell.subscribe();
+
+    complete_command(
+        &shell,
+        session,
+        "zztool customer-secret-project",
+        1,
+        Some("private diagnostic customer-123"),
+    )
+    .await;
+    complete_command(
+        &shell,
+        session,
+        "TOKEN=opaque-test-value zztool --repair",
+        0,
+        None,
+    )
+    .await;
+    complete_command(
+        &shell,
+        session,
+        "zztool customer-secret-project",
+        1,
+        Some("private diagnostic customer-123"),
+    )
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let EventBody::Hint(hint) = event.body else {
+        panic!("expected failure-memory hint")
+    };
+    assert_eq!(hint.title, "Previous local follow-up");
+    assert!(hint.message.contains("[REDACTED]"));
+    assert!(!hint.message.contains("opaque-test-value"));
+    assert!(hint.suggested_command.is_none());
+    assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
+
+    let encoded =
+        std::fs::read_to_string(running.directory.path().join("failure-memory.json")).unwrap();
+    assert!(!encoded.contains("customer-secret-project"));
+    assert!(!encoded.contains("private diagnostic"));
+    assert!(!encoded.contains("opaque-test-value"));
+
     shell.close().await.unwrap();
     running.stop().await;
 }

@@ -10,11 +10,15 @@ All notable user-visible changes are recorded here. This project follows
 - Coach suggestions now carry an always-visible local Risk Lens badge. Insert-only and copy-only
   receipts state the destination, classification, coverage limits, and that nothing was executed;
   the daemon independently reclassifies terminal handoffs so a client cannot spoof a lower risk.
+- Failure Fingerprints locally recognize recurring failures and surface the redacted command that
+  next succeeded last time, with bounded retention plus `aicoach memory status|list|clear` controls.
 
 ### Security
 
 - GitHub Actions are pinned to immutable commits, run on current Node 24 action releases,
   and receive weekly Dependabot update pull requests.
+- Failure memory never persists the failed command, diagnostic output, cwd, or session ID; it is
+  owner-only, force-redacted independently of provider settings, and never added to AI prompts.
 
 ### Fixed
 

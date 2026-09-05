@@ -52,6 +52,12 @@ max_total_chars = 100000
 enabled = true
 max_messages = 50
 
+[memory]
+enabled = true
+max_entries = 128
+retention_days = 30
+resolution_window_minutes = 10
+
 [window]
 width = 100
 height = 32

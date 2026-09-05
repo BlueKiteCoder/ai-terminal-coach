@@ -11,11 +11,11 @@ use std::{
 use aicoach_ai::{AiProvider, ChatMessage, ChatRequest, ChatRole, CommandCompletionRequest};
 use aicoach_core::{
     AnalysisCategory, AnalysisCoverage, AnalysisInput, AnalysisResult, CommandPatch, CommandRecord,
-    CompletionOperation as CoreCompletionOperation, EffectAction, GitContext, LocalAnalyzer,
-    PrivacyRedactor, PrivilegeRequirement, RecoveryProspect, RiskLensReport, RiskLevel,
-    SafetyConfig, SafetyEngine, SafetyMode, Severity as CoreSeverity, SourceCard, SourceInvocation,
-    SourceQuery, source_card_from_output, source_queries, strip_terminal_sequences,
-    try_collect_git_context,
+    CompletionOperation as CoreCompletionOperation, EffectAction, FailureMemory,
+    FailureMemoryOptions, FailureMemoryRecall, GitContext, LocalAnalyzer, PrivacyRedactor,
+    PrivilegeRequirement, RecoveryProspect, RiskLensReport, RiskLevel, SafetyConfig, SafetyEngine,
+    SafetyMode, Severity as CoreSeverity, SourceCard, SourceInvocation, SourceQuery,
+    source_card_from_output, source_queries, strip_terminal_sequences, try_collect_git_context,
 };
 use aicoach_ipc::{
     ClientCapabilities, ClientKind, CompletionOperation, CompletionResult, Event, EventBody, Hint,
@@ -25,7 +25,7 @@ use aicoach_ipc::{
 };
 use chrono::Utc;
 use futures_util::StreamExt;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tokio::{
     io::{
@@ -70,6 +70,19 @@ fn configured_safety(enabled: bool) -> SafetyEngine {
     })
 }
 
+fn initialize_failure_memory(options: &DaemonOptions) -> Option<FailureMemory> {
+    let settings = options.failure_memory.clone()?;
+    match FailureMemory::load(settings) {
+        Ok(memory) => Some(memory),
+        Err(error) => {
+            // A malformed file is intentionally left untouched for inspection
+            // or explicit removal through `aicoach memory clear`.
+            warn!(error = %error, "local failure memory is unavailable");
+            None
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DaemonError {
     #[error("socket I/O error: {0}")]
@@ -90,6 +103,7 @@ pub struct DaemonOptions {
     pub auto_error_analysis: bool,
     pub inline_hint: bool,
     pub safety_enabled: bool,
+    pub failure_memory: Option<FailureMemoryOptions>,
 }
 
 impl Default for DaemonOptions {
@@ -104,6 +118,7 @@ impl Default for DaemonOptions {
             auto_error_analysis: true,
             inline_hint: true,
             safety_enabled: true,
+            failure_memory: None,
         }
     }
 }
@@ -136,6 +151,7 @@ pub struct Daemon {
     /// Async events are routed back to the connection that started a request.
     request_origins: RwLock<HashMap<(SessionId, aicoach_ipc::RequestId), ConnectionId>>,
     source_card_cache: RwLock<HashMap<SourceQuery, Option<SourceCard>>>,
+    failure_memory: Mutex<Option<FailureMemory>>,
     shutdown: CancellationToken,
     options: DaemonOptions,
 }
@@ -143,6 +159,7 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(provider: Arc<dyn AiProvider>, options: DaemonOptions) -> Arc<Self> {
         let safety = configured_safety(options.safety_enabled);
+        let failure_memory = initialize_failure_memory(&options);
         Arc::new(Self {
             provider,
             analyzer: Arc::new(LocalAnalyzer::with_safety(safety.clone())),
@@ -152,6 +169,7 @@ impl Daemon {
             subscriptions: RwLock::new(HashMap::new()),
             request_origins: RwLock::new(HashMap::new()),
             source_card_cache: RwLock::new(HashMap::new()),
+            failure_memory: Mutex::new(failure_memory),
             shutdown: CancellationToken::new(),
             options,
         })
@@ -163,6 +181,7 @@ impl Daemon {
         options: DaemonOptions,
     ) -> Arc<Self> {
         let safety = configured_safety(options.safety_enabled);
+        let failure_memory = initialize_failure_memory(&options);
         Arc::new(Self {
             provider,
             analyzer: Arc::new(analyzer),
@@ -172,6 +191,7 @@ impl Daemon {
             subscriptions: RwLock::new(HashMap::new()),
             request_origins: RwLock::new(HashMap::new()),
             source_card_cache: RwLock::new(HashMap::new()),
+            failure_memory: Mutex::new(failure_memory),
             shutdown: CancellationToken::new(),
             options,
         })
@@ -545,6 +565,14 @@ impl Daemon {
                     return;
                 };
                 send_accepted(&sender, &request).await;
+                if let Some(recall) = self.observe_failure_memory(&job) {
+                    self.send_session_event(Event::new(
+                        job.session_id,
+                        Some(job.request_id),
+                        EventBody::Hint(failure_memory_hint(&recall, &self.options.coach_language)),
+                    ))
+                    .await;
+                }
                 if job.exit_code == 0 || !self.options.auto_error_analysis {
                     return;
                 }
@@ -941,6 +969,26 @@ impl Daemon {
         }
         self.sessions.end_request(job.session_id, job.request_id);
         self.unroute_request(job.session_id, job.request_id);
+    }
+
+    fn observe_failure_memory(&self, job: &AnalysisJob) -> Option<FailureMemoryRecall> {
+        let mut memory = self.failure_memory.lock();
+        let memory = memory.as_mut()?;
+        let observation = memory.observe(
+            job.session_id.0,
+            &job.command,
+            job.exit_code,
+            job.stdout.as_deref(),
+            job.stderr.as_deref(),
+            Utc::now().timestamp_millis(),
+        );
+        if observation.changed
+            && let Err(error) = memory.persist()
+        {
+            // Failure-memory errors never include command text or diagnostics.
+            warn!(error = %error, "could not persist local failure memory");
+        }
+        observation.recall
     }
 
     async fn process_completion(
@@ -1780,6 +1828,27 @@ fn hint_from_analysis(result: &AnalysisResult, language: &str) -> Hint {
         title: result.title.clone(),
         message: bounded_hint(&result.message, hint_truncated_suffix(language)),
         suggested_command: result.suggested_command.clone(),
+    }
+}
+
+fn failure_memory_hint(recall: &FailureMemoryRecall, language: &str) -> Hint {
+    let message = if language == "zh-CN" {
+        format!(
+            "这个 {} 失败指纹已在本机出现 {} 次。上次出现后，下一条成功命令是：\n$ {}\n这只是时间上的关联，不代表已确认的修复因果。",
+            recall.command_family, recall.occurrences, recall.successful_follow_up
+        )
+    } else {
+        format!(
+            "This {} failure fingerprint has appeared locally {} times. After the previous occurrence, the next successful command was:\n$ {}\nThis is a time-based association, not a confirmed causal fix.",
+            recall.command_family, recall.occurrences, recall.successful_follow_up
+        )
+    };
+    Hint {
+        severity: Severity::Info,
+        title: localized_text(language, "Previous local follow-up", "上次的本机后续操作")
+            .to_owned(),
+        message,
+        suggested_command: recall.reusable.then(|| recall.successful_follow_up.clone()),
     }
 }
 
