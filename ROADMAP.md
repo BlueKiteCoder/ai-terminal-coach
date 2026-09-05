@@ -65,6 +65,8 @@ inspectable, bounded, and removable.
 ## Milestone 4 — Open-source growth infrastructure
 
 - [x] Stable issue templates for bugs, terminal compatibility, feature proposals, and security.
+- [x] A provider-free, path-free Support Report that turns real terminal tests into reviewable
+  compatibility evidence without collecting terminal content.
 - [ ] A public compatibility matrix covering Terminal.app, iTerm2, Warp, WezTerm, kitty, and
   Alacritty on supported macOS releases.
 - [x] Contributor-friendly module boundaries and protocol documentation, including extension

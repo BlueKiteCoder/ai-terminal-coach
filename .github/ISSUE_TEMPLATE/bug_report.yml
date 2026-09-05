@@ -71,8 +71,7 @@ body:
     id: diagnostics
     attributes:
       label: Sanitized diagnostics
-      description: Paste the relevant, reviewed portion of `aicoach doctor` and optionally a reviewed Session Capsule. Do not paste an API key or full unreviewed logs.
-      render: shell
+      description: Paste the reviewed output of `aicoach support` and optionally a reviewed Session Capsule. The support report omits private paths and terminal content; never paste an API key or full unreviewed logs.
   - type: checkboxes
     id: privacy
     attributes:

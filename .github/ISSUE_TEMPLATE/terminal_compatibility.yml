@@ -1,0 +1,66 @@
+name: Terminal compatibility report
+description: Contribute an evidence-based macOS terminal capability result
+title: "[Compatibility]: "
+labels:
+  - documentation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Compatibility claims require a real test on a supported Mac. Run `aicoach support --copy`, paste the report below, tick only the manual checks you personally completed, and review everything before publishing. The generated report makes no AI or network request and excludes terminal content and private paths.
+  - type: dropdown
+    id: terminal
+    attributes:
+      label: Terminal application
+      options:
+        - Terminal.app
+        - iTerm2
+        - Warp
+        - WezTerm
+        - kitty
+        - Alacritty
+        - Visual Studio Code
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: terminal_version
+    attributes:
+      label: Terminal version
+      description: Use the terminal's About window; do not include a device or organization name.
+    validations:
+      required: true
+  - type: textarea
+    id: support_report
+    attributes:
+      label: AI Terminal Coach support report
+      description: Paste the complete, reviewed output of `aicoach support`.
+      placeholder: "# AI Terminal Coach Support Report"
+    validations:
+      required: true
+  - type: checkboxes
+    id: capabilities
+    attributes:
+      label: Manually verified capabilities
+      description: Leave an item unticked when the provider was disabled, the shortcut was intentionally changed, or you did not test it.
+      options:
+        - label: Option+Tab showed an insert-only completion and did not execute it.
+        - label: Option+/ showed a progressively streaming answer.
+        - label: Option+R opened the provider-free Risk Lens.
+        - label: Option+Space toggled the Coach window or its documented fallback.
+        - label: Normal typing and Enter behaved exactly as before installation.
+          required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Terminal-specific setup and observations
+      description: Mention Option/Meta settings, changed bindings, window fallback behavior, and any feature that did not work. Do not paste terminal history or logs.
+  - type: checkboxes
+    id: evidence
+    attributes:
+      label: Evidence and privacy confirmation
+      options:
+        - label: I ran this test on the terminal and macOS version shown above; this is not an assumption from documentation.
+          required: true
+        - label: I reviewed the report and removed any information I do not want to publish.
+          required: true

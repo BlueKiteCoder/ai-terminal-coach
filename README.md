@@ -74,6 +74,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   private key/SSH key/敏感环境变量脱敏；可以关闭。
 - `aicoach capsule` 把当前终端最近的命令、状态、耗时和已保留的可用输出整理成可分享的
   Markdown。它完全在本机生成、强制脱敏并清除终端控制序列，可一键复制到剪贴板。
+- `aicoach support` 生成适合公开 issue 的中英文 Markdown，只输出 allowlist 系统类别和
+  无正文能力状态，不包含私有路径或终端内容；配套模板把真实终端测试变成兼容性证据。
 - **Session Checkpoints** 可以给当前排障过程命名、记录最终解决方案，并让 Capsule 自动
   聚焦检查点之后的命令；检查点只存在于当前 daemon 内存，且不会加入 AI 请求。
 - aicoach data 给出不含正文的完整本地数据清单，并能精确清除单个 session、聊天历史、
@@ -463,6 +465,7 @@ aicoach onboard [--check] [--skip-shortcuts]
 aicoach uninstall [--purge]
 aicoach start | stop | restart | status [--json]
 aicoach doctor [--json]
+aicoach support [--copy] [--output FILE]
 aicoach config show|path|validate|set|edit|set-key|delete-key
 aicoach logs [-n 100] [--follow]
 aicoach capsule [--last 20] [--failed-only] [--copy] [--output FILE]
@@ -492,6 +495,14 @@ aicoach onboard --check
 aicoach status
 aicoach logs -n 200
 ```
+
+公开提交问题或兼容性结果前，运行 `aicoach support --copy`。它在本机生成 Markdown，
+不会调用 AI 或网络；报告不会包含用户名、主机名、路径、session ID、命令、聊天、
+输出、日志、Provider endpoint、模型名或凭据；只保留版本、架构、终端类别、配置类别和
+能力检查结果。输出仍应在发布前人工检查。专门的 Compatibility issue 模板要求贡献者
+只勾选自己在真实 Mac/终端上亲自验证过的能力，因此不会把文档推测冒充兼容性结论。
+不带参数时报告写到 stdout；`--copy` 写入剪贴板，`--output FILE` 创建权限为 `0600`
+的文件。显式导出的文件由用户管理，不属于 `aicoach data clear` 的删除范围。
 
 - `AI credential ... is not set`：运行 `aicoach config set-key`。
 - `doctor` 默认是无网络诊断：它验证 Provider 配置和凭据是否就绪，但不会把终端
@@ -632,8 +643,8 @@ safety warnings, a provider-free preflight Risk Lens, explainable token-level
 Command Patches, local-manual Source Cards, AI-assisted completion, quick
 terminal chat, share-ready privacy-scrubbed Session Capsules, local-only Failure
 Fingerprints, memory-only Session Checkpoints, a provider-free Environment Drift
-Lens, and a standalone Ratatui Coach window. It never presses Enter or executes
-an AI suggestion.
+Lens, a public-safe local Support Report, and a standalone Ratatui Coach window.
+It never presses Enter or executes an AI suggestion.
 
 The workflow image above is generated from the real local analyzer, Risk Lens,
 Source Card, Command Patch, and privacy-redaction output. CI verifies the
@@ -687,6 +698,9 @@ aicoach onboard
 Onboarding captures the physical Option sequences emitted by the current terminal,
 refuses unsafe bindings that would replace normal typing, and verifies the generated
 widgets in a clean Zsh process. Use `aicoach onboard --check` for a read-only check.
+Use `aicoach support --copy` to generate a Markdown report for public issues without
+including usernames, paths, sessions, terminal content, logs, endpoints, models, or
+credentials; no provider or network request is made.
 See the Chinese sections above for configuration, shortcuts, privacy boundaries,
 troubleshooting, and release requirements. Licensed under the
 [MIT License](LICENSE).
