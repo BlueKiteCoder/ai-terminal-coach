@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -7,8 +7,9 @@ use std::{
 
 use aicoach_core::{EnvironmentSnapshot, GitContext, strip_terminal_sequences};
 use aicoach_ipc::{
-    CommandFinishedParams, CommandId, CommandStartedParams, ContextCommand, RegisterSessionParams,
-    RequestId, SessionCheckpoint, SessionContext, SessionId, sanitize_shell_environment,
+    CommandFinishedParams, CommandId, CommandStartedParams, ContextCommand, DataRemovalSummary,
+    RegisterSessionParams, RequestId, SessionCheckpoint, SessionContext, SessionDataLimits,
+    SessionDataSummary, SessionId, sanitize_shell_environment,
 };
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -82,6 +83,21 @@ pub struct AnalysisJob {
     pub context: Vec<ContextCommand>,
 }
 
+#[derive(Debug)]
+pub enum FinishCommand {
+    Recorded(Box<AnalysisJob>),
+    Discarded,
+}
+
+impl FinishCommand {
+    pub fn into_recorded(self) -> Option<AnalysisJob> {
+        match self {
+            Self::Recorded(job) => Some(*job),
+            Self::Discarded => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuccessfulCommandBaseline {
     pub command_id: CommandId,
@@ -119,6 +135,7 @@ struct Session {
     environment: BTreeMap<String, String>,
     connection_id: Option<ConnectionId>,
     started: HashMap<CommandId, StartedCommand>,
+    discarded_commands: HashSet<CommandId>,
     commands: VecDeque<ContextCommand>,
     chat: VecDeque<(bool, String)>,
     active: HashMap<RequestId, ActiveRequest>,
@@ -169,6 +186,7 @@ impl SessionManager {
             environment: environment.clone(),
             connection_id: Some(connection_id),
             started: HashMap::new(),
+            discarded_commands: HashSet::new(),
             commands: VecDeque::new(),
             chat: VecDeque::new(),
             active: HashMap::new(),
@@ -212,6 +230,7 @@ impl SessionManager {
             environment,
             connection_id: None,
             started: HashMap::new(),
+            discarded_commands: HashSet::new(),
             commands: VecDeque::new(),
             chat: VecDeque::new(),
             active: HashMap::new(),
@@ -273,10 +292,13 @@ impl SessionManager {
         request_id: RequestId,
         params: CommandFinishedParams,
         screen_tail: Option<String>,
-    ) -> Option<AnalysisJob> {
+    ) -> Option<FinishCommand> {
         let mut state = self.state.lock();
         let session = state.sessions.get_mut(&session_id)?;
         session.last_accessed = Instant::now();
+        if session.discarded_commands.remove(&params.command_id) {
+            return Some(FinishCommand::Discarded);
+        }
         let next_environment = sanitize_shell_environment(params.environment);
         let started = session.started.remove(&params.command_id);
         let command = params
@@ -329,7 +351,7 @@ impl SessionManager {
         session.commands.push_back(record);
         trim_context(session, &self.limits);
 
-        Some(AnalysisJob {
+        Some(FinishCommand::Recorded(Box::new(AnalysisJob {
             session_id,
             request_id,
             command_id: params.command_id,
@@ -345,7 +367,7 @@ impl SessionManager {
             environment_changes,
             last_success,
             context: session.commands.iter().cloned().collect(),
-        })
+        })))
     }
 
     /// Enrich the most recent successful command with an asynchronous Git
@@ -458,6 +480,92 @@ impl SessionManager {
         session.last_accessed = Instant::now();
         session.checkpoint = None;
         Ok(None)
+    }
+
+    pub fn data_inventory(&self) -> Vec<SessionDataSummary> {
+        let state = self.state.lock();
+        let mut sessions = state
+            .sessions
+            .values()
+            .map(session_data_summary)
+            .collect::<Vec<_>>();
+        sessions.sort_unstable_by_key(|session| session.session_id);
+        sessions
+    }
+
+    pub fn data_limits(&self) -> SessionDataLimits {
+        SessionDataLimits {
+            max_commands_per_session: self.limits.max_commands,
+            max_output_chars_per_command: self.limits.max_output_per_command,
+            max_total_context_chars_per_session: self.limits.max_total_chars,
+            chat_history_enabled: self.limits.history_enabled,
+            max_chat_messages_per_session: self.limits.max_chat_messages,
+            max_sessions: self.limits.max_sessions,
+            disconnected_session_ttl_seconds: self.limits.disconnected_session_ttl.as_secs(),
+        }
+    }
+
+    pub fn clear_session_data(
+        &self,
+        session_id: SessionId,
+        discard_in_flight: bool,
+    ) -> Option<DataRemovalSummary> {
+        let mut state = self.state.lock();
+        let session = state.sessions.get_mut(&session_id)?;
+        let removed = clear_transient_session_data(session, discard_in_flight);
+        session.last_accessed = Instant::now();
+        Some(removed)
+    }
+
+    pub fn clear_chat_history(&self) -> (Vec<SessionId>, DataRemovalSummary) {
+        let mut state = self.state.lock();
+        // Every open Coach window must receive the clear event, including a
+        // window that loaded persisted history before this daemon retained any
+        // chat for the session. Otherwise that window could write deleted
+        // history back to disk when it exits.
+        let mut affected = state.sessions.keys().copied().collect::<Vec<_>>();
+        let mut removed = DataRemovalSummary::default();
+        for session in state.sessions.values_mut() {
+            let chat_requests = session
+                .active
+                .iter()
+                .filter_map(|(request_id, request)| {
+                    (request.kind == ActiveRequestKind::Chat)
+                        .then_some((*request_id, request.cancellation.clone()))
+                })
+                .collect::<Vec<_>>();
+            if !session.chat.is_empty() || !chat_requests.is_empty() {
+                removed.sessions_affected += 1;
+            }
+            removed.chat_messages += session.chat.len();
+            removed.active_ai_requests += chat_requests.len();
+            session.chat.clear();
+            for (request_id, cancellation) in chat_requests {
+                cancellation.cancel();
+                session.active.remove(&request_id);
+            }
+            session.last_accessed = Instant::now();
+        }
+        affected.sort_unstable();
+        (affected, removed)
+    }
+
+    pub fn clear_all_transient(
+        &self,
+        discard_in_flight: bool,
+    ) -> (Vec<SessionId>, DataRemovalSummary) {
+        let mut state = self.state.lock();
+        let mut affected = state.sessions.keys().copied().collect::<Vec<_>>();
+        let mut removed = DataRemovalSummary::default();
+        for session in state.sessions.values_mut() {
+            accumulate_removed(
+                &mut removed,
+                clear_transient_session_data(session, discard_in_flight),
+            );
+            session.last_accessed = Instant::now();
+        }
+        affected.sort_unstable();
+        (affected, removed)
     }
 
     /// Attach a best-effort screen tail to the matching context record after
@@ -701,6 +809,71 @@ fn bounded_checkpoint_text(value: &str, multiline: bool, max_chars: usize) -> Op
         return None;
     }
     Some(safe.chars().take(max_chars).collect())
+}
+
+fn session_data_summary(session: &Session) -> SessionDataSummary {
+    SessionDataSummary {
+        session_id: session.id,
+        connected: session.connection_id.is_some(),
+        command_records: session.commands.len(),
+        chat_messages: session.chat.len(),
+        environment_values: session.environment.len(),
+        checkpoint_present: session.checkpoint.is_some(),
+        environment_baseline_present: session.last_success.is_some(),
+        in_flight_commands: session.started.len(),
+        discarded_finish_markers: session.discarded_commands.len(),
+        active_ai_requests: session.active.len(),
+        pending_failure: false,
+    }
+}
+
+fn clear_transient_session_data(
+    session: &mut Session,
+    discard_in_flight: bool,
+) -> DataRemovalSummary {
+    let removed = DataRemovalSummary {
+        sessions_affected: 1,
+        command_records: session.commands.len(),
+        chat_messages: session.chat.len(),
+        environment_values: session.environment.len(),
+        checkpoints: usize::from(session.checkpoint.is_some()),
+        environment_baselines: usize::from(session.last_success.is_some()),
+        in_flight_commands: session.started.len(),
+        active_ai_requests: session.active.len(),
+        ..DataRemovalSummary::default()
+    };
+    if discard_in_flight {
+        session
+            .discarded_commands
+            .extend(session.started.keys().copied());
+    }
+    for request in session.active.values() {
+        request.cancellation.cancel();
+    }
+    session.started.clear();
+    session.commands.clear();
+    session.chat.clear();
+    session.active.clear();
+    session.environment.clear();
+    session.cwd = PathBuf::new();
+    session.checkpoint = None;
+    session.last_success = None;
+    removed
+}
+
+fn accumulate_removed(total: &mut DataRemovalSummary, removed: DataRemovalSummary) {
+    total.sessions_affected += removed.sessions_affected;
+    total.command_records += removed.command_records;
+    total.chat_messages += removed.chat_messages;
+    total.persisted_chat_messages += removed.persisted_chat_messages;
+    total.failure_fingerprints += removed.failure_fingerprints;
+    total.environment_values += removed.environment_values;
+    total.checkpoints += removed.checkpoints;
+    total.environment_baselines += removed.environment_baselines;
+    total.in_flight_commands += removed.in_flight_commands;
+    total.active_ai_requests += removed.active_ai_requests;
+    total.pending_failures += removed.pending_failures;
+    total.source_card_cache_entries += removed.source_card_cache_entries;
 }
 
 fn sole_started_command_id(session: &Session) -> Option<CommandId> {
@@ -1000,6 +1173,8 @@ mod tests {
                 },
                 None,
             )
+            .unwrap()
+            .into_recorded()
             .unwrap();
 
         assert_eq!(
@@ -1063,6 +1238,8 @@ mod tests {
                 },
                 None,
             )
+            .unwrap()
+            .into_recorded()
             .unwrap();
 
         let failed = CommandId::new();
@@ -1094,6 +1271,8 @@ mod tests {
                 },
                 None,
             )
+            .unwrap()
+            .into_recorded()
             .unwrap();
 
         let baseline = job.last_success.expect("successful baseline");
@@ -1188,6 +1367,8 @@ mod tests {
                 },
                 None,
             )
+            .unwrap()
+            .into_recorded()
             .unwrap();
         let baseline = job.last_success.expect("successful baseline");
         assert_eq!(baseline.command_id, second);
@@ -1318,5 +1499,133 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.resolved_after_command_id, Some(start_cli));
         assert_eq!(checkpoint.resolution_command_id, Some(resolve_cli));
+    }
+
+    #[test]
+    fn session_data_clear_cancels_and_discards_every_transient_category() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let session = SessionId::new();
+        let mut params = registration(session);
+        params.environment = BTreeMap::from([("LANG".to_owned(), "en_US.UTF-8".to_owned())]);
+        manager.register(ConnectionId::new(), params);
+
+        let completed = CommandId::new();
+        assert!(manager.start_command(
+            session,
+            CommandStartedParams {
+                command_id: completed,
+                command: "cargo check".to_owned(),
+                cwd: PathBuf::from("/work/private"),
+                started_at_unix_ms: None,
+            },
+        ));
+        manager
+            .finish_command(
+                session,
+                RequestId::new(),
+                CommandFinishedParams {
+                    command_id: completed,
+                    command: None,
+                    cwd: None,
+                    exit_code: 0,
+                    stdout: Some("private output".to_owned()),
+                    stderr: None,
+                    duration_ms: Some(1),
+                    environment: BTreeMap::new(),
+                },
+                None,
+            )
+            .unwrap()
+            .into_recorded()
+            .unwrap();
+        manager
+            .start_checkpoint(session, "private checkpoint", 10, false)
+            .unwrap();
+        assert!(manager.push_chat(session, true, "private chat".to_owned()));
+        let (cancellation, _) = manager
+            .begin_request(session, RequestId::new(), ActiveRequestKind::Chat)
+            .unwrap();
+        let clearing = CommandId::new();
+        assert!(manager.start_command(
+            session,
+            CommandStartedParams {
+                command_id: clearing,
+                command: "aicoach data clear session".to_owned(),
+                cwd: PathBuf::from("/work/private"),
+                started_at_unix_ms: None,
+            },
+        ));
+
+        let before = manager.data_inventory().pop().unwrap();
+        assert_eq!(before.command_records, 1);
+        assert_eq!(before.chat_messages, 1);
+        assert_eq!(before.environment_values, 1);
+        assert!(before.checkpoint_present);
+        assert!(before.environment_baseline_present);
+        assert_eq!(before.in_flight_commands, 1);
+        assert_eq!(before.active_ai_requests, 1);
+
+        let removed = manager.clear_session_data(session, true).unwrap();
+        assert_eq!(removed.sessions_affected, 1);
+        assert_eq!(removed.command_records, 1);
+        assert_eq!(removed.chat_messages, 1);
+        assert_eq!(removed.environment_values, 1);
+        assert_eq!(removed.checkpoints, 1);
+        assert_eq!(removed.environment_baselines, 1);
+        assert_eq!(removed.in_flight_commands, 1);
+        assert_eq!(removed.active_ai_requests, 1);
+        assert!(cancellation.is_cancelled());
+
+        let finish = manager
+            .finish_command(
+                session,
+                RequestId::new(),
+                CommandFinishedParams {
+                    command_id: clearing,
+                    command: None,
+                    cwd: None,
+                    exit_code: 0,
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: Some(1),
+                    environment: BTreeMap::new(),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(matches!(finish, FinishCommand::Discarded));
+        let context = manager.context(session, None).unwrap();
+        assert!(context.cwd.as_os_str().is_empty());
+        assert!(context.environment.is_empty());
+        assert!(context.commands.is_empty());
+        assert!(context.checkpoint.is_none());
+
+        let after = manager.data_inventory().pop().unwrap();
+        assert!(after.connected);
+        assert_eq!(after.command_records, 0);
+        assert_eq!(after.chat_messages, 0);
+        assert_eq!(after.environment_values, 0);
+        assert!(!after.checkpoint_present);
+        assert!(!after.environment_baseline_present);
+        assert_eq!(after.in_flight_commands, 0);
+        assert_eq!(after.active_ai_requests, 0);
+    }
+
+    #[test]
+    fn chat_clear_notifies_sessions_with_only_persisted_window_history() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let memory_chat = SessionId::new();
+        let disk_only_chat = SessionId::new();
+        manager.register(ConnectionId::new(), registration(memory_chat));
+        manager.register(ConnectionId::new(), registration(disk_only_chat));
+        assert!(manager.push_chat(memory_chat, true, "private chat".to_owned()));
+
+        let (affected, removed) = manager.clear_chat_history();
+
+        assert_eq!(affected.len(), 2);
+        assert!(affected.contains(&memory_chat));
+        assert!(affected.contains(&disk_only_chat));
+        assert_eq!(removed.sessions_affected, 1);
+        assert_eq!(removed.chat_messages, 1);
     }
 }

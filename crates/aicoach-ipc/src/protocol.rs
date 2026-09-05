@@ -239,6 +239,26 @@ pub struct CheckpointParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum DataOperation {
+    Inventory,
+    ClearSession,
+    ClearChatHistory,
+    ClearFailureMemory,
+    ClearAllTransient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataParams {
+    #[serde(flatten)]
+    pub operation: DataOperation,
+    /// A control command issued from the observed shell should disappear
+    /// together with the data it clears when its FINISH frame arrives.
+    #[serde(default)]
+    pub exclude_active_command: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InsertMode {
     Replace,
@@ -301,6 +321,7 @@ pub enum RequestBody {
     Chat(ChatParams),
     Context(ContextParams),
     Checkpoint(CheckpointParams),
+    Data(DataParams),
     InsertBuffer(InsertBufferParams),
     Disconnect,
     Ping,
@@ -409,6 +430,71 @@ pub struct SessionContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDataSummary {
+    pub session_id: SessionId,
+    pub connected: bool,
+    pub command_records: usize,
+    pub chat_messages: usize,
+    pub environment_values: usize,
+    pub checkpoint_present: bool,
+    pub environment_baseline_present: bool,
+    pub in_flight_commands: usize,
+    pub discarded_finish_markers: usize,
+    pub active_ai_requests: usize,
+    pub pending_failure: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDataLimits {
+    pub max_commands_per_session: usize,
+    pub max_output_chars_per_command: usize,
+    pub max_total_context_chars_per_session: usize,
+    pub chat_history_enabled: bool,
+    pub max_chat_messages_per_session: usize,
+    pub max_sessions: usize,
+    pub disconnected_session_ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataClearScope {
+    Session,
+    ChatHistory,
+    FailureMemory,
+    AllTransient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DataRemovalSummary {
+    pub sessions_affected: usize,
+    pub command_records: usize,
+    pub chat_messages: usize,
+    pub persisted_chat_messages: usize,
+    pub failure_fingerprints: usize,
+    pub environment_values: usize,
+    pub checkpoints: usize,
+    pub environment_baselines: usize,
+    pub in_flight_commands: usize,
+    pub active_ai_requests: usize,
+    pub pending_failures: usize,
+    pub source_card_cache_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum DaemonDataResult {
+    Inventory {
+        sessions: Vec<SessionDataSummary>,
+        source_card_cache_entries: usize,
+        limits: SessionDataLimits,
+    },
+    Cleared {
+        scope: DataClearScope,
+        removed: DataRemovalSummary,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum ResponseResult {
     Hello {
@@ -429,6 +515,7 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         checkpoint: Option<Box<SessionCheckpoint>>,
     },
+    Data(Box<DaemonDataResult>),
     Pong {
         unix_ms: u64,
     },
@@ -504,6 +591,7 @@ pub enum EventBody {
     ChatFailed { message: String, retryable: bool },
     InsertBuffer(InsertBufferParams),
     RequestCancelled,
+    DataCleared { scope: DataClearScope },
     SessionClosed,
 }
 
@@ -668,6 +756,60 @@ mod tests {
             panic!("expected checkpoint request")
         };
         assert!(!params.exclude_active_command);
+    }
+
+    #[test]
+    fn data_request_and_content_free_inventory_round_trip() {
+        let session_id = SessionId::new();
+        let request = Request::new(
+            Some(session_id),
+            RequestBody::Data(DataParams {
+                operation: DataOperation::ClearSession,
+                exclude_active_command: true,
+            }),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""method":"data""#));
+        assert!(json.contains(r#""action":"clear_session""#));
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+        let legacy = json.replace(r#","exclude_active_command":true"#, "");
+        let legacy = serde_json::from_str::<Request>(&legacy).unwrap();
+        let RequestBody::Data(params) = legacy.body else {
+            panic!("expected data request")
+        };
+        assert!(!params.exclude_active_command);
+
+        let result = DaemonDataResult::Inventory {
+            sessions: vec![SessionDataSummary {
+                session_id,
+                connected: true,
+                command_records: 2,
+                chat_messages: 3,
+                environment_values: 1,
+                checkpoint_present: true,
+                environment_baseline_present: false,
+                in_flight_commands: 0,
+                discarded_finish_markers: 0,
+                active_ai_requests: 0,
+                pending_failure: false,
+            }],
+            source_card_cache_entries: 1,
+            limits: SessionDataLimits {
+                max_commands_per_session: 30,
+                max_output_chars_per_command: 20_000,
+                max_total_context_chars_per_session: 100_000,
+                chat_history_enabled: true,
+                max_chat_messages_per_session: 50,
+                max_sessions: 64,
+                disconnected_session_ttl_seconds: 3_600,
+            },
+        };
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(encoded.contains(r#""command_records":2"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonDataResult>(&encoded).unwrap(),
+            result
+        );
     }
 
     #[test]

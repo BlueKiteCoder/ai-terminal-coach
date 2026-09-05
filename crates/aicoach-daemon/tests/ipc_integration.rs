@@ -21,9 +21,10 @@ use aicoach_daemon::{Daemon, DaemonOptions};
 use aicoach_ipc::{
     CancelParams, ChatParams, CheckpointOperation, CheckpointParams, ClientCapabilities,
     ClientKind, CommandFinishedParams, CommandId, CommandStartedParams, CompletionParams,
-    ContextParams, Event, EventBody, HelloParams, InsertBufferParams, InsertMode, IpcClient,
-    PROTOCOL_VERSION, RegisterSessionParams, Request, RequestBody, Response, ResponseOutcome,
-    ResponseResult, RiskLensParams, SafetyClassification, SessionCheckpoint, SessionId,
+    ContextParams, DaemonDataResult, DataClearScope, DataOperation, DataParams, DataRemovalSummary,
+    Event, EventBody, HelloParams, InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION,
+    RegisterSessionParams, Request, RequestBody, Response, ResponseOutcome, ResponseResult,
+    RiskLensParams, SafetyClassification, SessionCheckpoint, SessionDataSummary, SessionId,
 };
 use async_trait::async_trait;
 use futures_util::stream;
@@ -368,6 +369,88 @@ async fn update_checkpoint(
         panic!("expected checkpoint response")
     };
     checkpoint.map(|checkpoint| *checkpoint)
+}
+
+async fn data_operation(
+    client: &IpcClient,
+    session: Option<SessionId>,
+    operation: DataOperation,
+    exclude_active_command: bool,
+) -> DaemonDataResult {
+    let response = client
+        .send_request(
+            session,
+            RequestBody::Data(DataParams {
+                operation,
+                exclude_active_command,
+            }),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Ok {
+        result: ResponseResult::Data(result),
+    } = response.outcome
+    else {
+        panic!("expected daemon data response")
+    };
+    *result
+}
+
+async fn session_data(client: &IpcClient, session: SessionId) -> SessionDataSummary {
+    let DaemonDataResult::Inventory { sessions, .. } =
+        data_operation(client, None, DataOperation::Inventory, false).await
+    else {
+        panic!("expected inventory")
+    };
+    sessions
+        .into_iter()
+        .find(|item| item.session_id == session)
+        .unwrap()
+}
+
+async fn clear_session_from_shell(shell: &IpcClient, session: SessionId) -> DataRemovalSummary {
+    let command_id = CommandId::new();
+    shell
+        .send_request(
+            Some(session),
+            RequestBody::CommandStarted(CommandStartedParams {
+                command_id,
+                command: "aicoach data clear session".to_owned(),
+                cwd: PathBuf::from("/tmp/private-project"),
+                started_at_unix_ms: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let DaemonDataResult::Cleared { scope, removed } =
+        data_operation(shell, Some(session), DataOperation::ClearSession, true).await
+    else {
+        panic!("expected clear result")
+    };
+    assert_eq!(scope, DataClearScope::Session);
+    let finish = shell
+        .send_request(
+            Some(session),
+            RequestBody::CommandFinished(CommandFinishedParams {
+                command_id,
+                command: None,
+                cwd: None,
+                exit_code: 0,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(1),
+                environment: BTreeMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        finish.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Accepted
+        }
+    ));
+    removed
 }
 
 async fn wait_for_chat_done(events: &mut tokio::sync::broadcast::Receiver<Event>) {
@@ -970,6 +1053,118 @@ async fn checkpoint_lifecycle_is_session_local_and_excluded_from_provider_chat()
         update_checkpoint(&shell, session, CheckpointOperation::Clear).await,
         None
     );
+
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn data_inventory_and_session_clear_remove_content_without_dropping_the_shell() {
+    let running = RunningDaemon::start_with_failure_memory(Arc::new(TestProvider::default())).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys020").await;
+    let mut events = shell.subscribe();
+
+    complete_command_at(
+        &shell,
+        session,
+        "cargo test",
+        1,
+        Some("private diagnostic"),
+        Path::new("/tmp/private-project"),
+        BTreeMap::from([("LANG".to_owned(), "en_US.UTF-8".to_owned())]),
+    )
+    .await;
+    update_checkpoint(
+        &shell,
+        session,
+        CheckpointOperation::Start {
+            name: "private checkpoint".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let before = session_data(&shell, session).await;
+    assert!(before.connected);
+    assert_eq!(before.command_records, 1);
+    assert_eq!(before.environment_values, 1);
+    assert!(before.checkpoint_present);
+    assert!(before.pending_failure);
+
+    let removed = clear_session_from_shell(&shell, session).await;
+    assert_eq!(removed.sessions_affected, 1);
+    assert_eq!(removed.command_records, 1);
+    assert_eq!(removed.environment_values, 1);
+    assert_eq!(removed.checkpoints, 1);
+    assert_eq!(removed.in_flight_commands, 1);
+    assert_eq!(removed.pending_failures, 1);
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(
+            event.body,
+            EventBody::DataCleared {
+                scope: DataClearScope::Session
+            }
+        ) {
+            break;
+        }
+    }
+
+    let context = shell
+        .send_request(
+            Some(session),
+            RequestBody::Context(ContextParams::default()),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Ok {
+        result: ResponseResult::Context(context),
+    } = context.outcome
+    else {
+        panic!("expected context")
+    };
+    assert!(context.commands.is_empty());
+    assert!(context.environment.is_empty());
+    assert!(context.checkpoint.is_none());
+
+    let after = session_data(&shell, session).await;
+    assert!(after.connected);
+    assert_eq!(after.command_records, 0);
+    assert_eq!(after.in_flight_commands, 0);
+    assert!(!after.pending_failure);
+
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn failure_memory_clear_preserves_live_session_context() {
+    let running = RunningDaemon::start_with_failure_memory(Arc::new(TestProvider::default())).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys021").await;
+    complete_command(&shell, session, "cargo test", 1, Some("failed")).await;
+    complete_command(&shell, session, "cargo clean", 0, None).await;
+
+    let DaemonDataResult::Cleared { scope, removed } =
+        data_operation(&shell, None, DataOperation::ClearFailureMemory, true).await
+    else {
+        panic!("expected clear result")
+    };
+    assert_eq!(scope, DataClearScope::FailureMemory);
+    assert_eq!(removed.failure_fingerprints, 1);
+    assert_eq!(removed.pending_failures, 0);
+    assert_eq!(session_data(&shell, session).await.command_records, 2);
+
+    let snapshot = aicoach_core::FailureMemorySnapshot::load(
+        running.directory.path().join("failure-memory.json"),
+    )
+    .unwrap();
+    assert!(snapshot.entries.is_empty());
 
     shell.close().await.unwrap();
     running.stop().await;

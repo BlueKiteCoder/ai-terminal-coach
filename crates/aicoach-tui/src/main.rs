@@ -96,6 +96,8 @@ struct HistoryStore {
     sessions: BTreeMap<String, Vec<UiMessage>>,
     #[serde(default)]
     updated_at_micros: BTreeMap<String, i64>,
+    #[serde(flatten)]
+    additional_fields: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -700,6 +702,24 @@ fn handle_ipc_event(event: EventBody, app: &mut App) {
                 .language
                 .text("Request cancelled", "请求已取消")
                 .to_owned();
+        }
+        EventBody::DataCleared { scope } => {
+            app.messages.clear();
+            app.streaming = false;
+            app.recommendations.clear();
+            app.recommendation_state.select(None);
+            app.scroll = 0;
+            app.follow_tail = true;
+            if !matches!(scope, aicoach_ipc::DataClearScope::ChatHistory) {
+                app.context = None;
+                app.input.clear();
+                app.input_cursor = 0;
+            }
+            app.status = app
+                .language
+                .text("Local session data was cleared", "本地会话数据已清除")
+                .to_owned();
+            app.persist_history();
         }
         EventBody::SessionClosed => {
             app.status = app
@@ -1396,16 +1416,34 @@ fn save_history(
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
     let session_key = session_id.to_string();
-    let start = messages.len().saturating_sub(limit);
-    store
-        .sessions
-        .insert(session_key.clone(), messages[start..].to_vec());
-    store
-        .updated_at_micros
-        .insert(session_key, chrono::Utc::now().timestamp_micros());
+    if messages.is_empty() {
+        store.sessions.remove(&session_key);
+        store.updated_at_micros.remove(&session_key);
+        if store.sessions.is_empty()
+            && store.updated_at_micros.is_empty()
+            && store.additional_fields.is_empty()
+        {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("remove {}", path.display()));
+                }
+            }
+            return Ok(());
+        }
+    } else {
+        let start = messages.len().saturating_sub(limit);
+        store
+            .sessions
+            .insert(session_key.clone(), messages[start..].to_vec());
+        store
+            .updated_at_micros
+            .insert(session_key, chrono::Utc::now().timestamp_micros());
+    }
     // Bound inactive sessions too; terminal context isolation does not require
     // retaining chat forever.
-    while store.sessions.len() > 20 {
+    while store.sessions.len() > aicoach_core::MAX_PERSISTED_HISTORY_SESSIONS {
         let Some(key) = store
             .sessions
             .keys()
@@ -1532,12 +1570,27 @@ mod tests {
         for index in 0..20 {
             let session = if index == 0 { oldest } else { SessionId::new() };
             let key = session.to_string();
-            store.sessions.insert(key.clone(), Vec::new());
+            store.sessions.insert(
+                key.clone(),
+                vec![UiMessage {
+                    speaker: Speaker::User,
+                    content: index.to_string(),
+                }],
+            );
             store.updated_at_micros.insert(key, i64::from(index));
         }
         fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
         let newest = SessionId::new();
-        save_history(&path, newest, &[], 3).unwrap();
+        save_history(
+            &path,
+            newest,
+            &[UiMessage {
+                speaker: Speaker::User,
+                content: "newest".to_owned(),
+            }],
+            3,
+        )
+        .unwrap();
         let saved: HistoryStore = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(saved.sessions.len(), 20);
         assert!(!saved.sessions.contains_key(&oldest.to_string()));
@@ -1617,5 +1670,35 @@ mod tests {
         assert_eq!(wrap_display_line("你好ab", 4), vec!["你好", "ab"]);
         assert_eq!(wrap_display_line("abcdef", 4), vec!["abcd", "ef"]);
         assert_eq!(wrap_display_line("", 4), vec![""]);
+    }
+
+    #[test]
+    fn data_clear_event_drops_open_window_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ProductPaths::from_home(directory.path());
+        fs::create_dir_all(paths.history_file.parent().unwrap()).unwrap();
+        let config = Config::default();
+        let mut app = App::new(SessionId::new(), &config, &paths, false);
+        app.messages.push(UiMessage {
+            speaker: Speaker::User,
+            content: "private chat".to_owned(),
+        });
+        app.persist_history();
+        assert!(paths.history_file.exists());
+        app.add_recommendation("echo private");
+        app.streaming = true;
+
+        handle_ipc_event(
+            EventBody::DataCleared {
+                scope: aicoach_ipc::DataClearScope::Session,
+            },
+            &mut app,
+        );
+
+        assert!(app.messages.is_empty());
+        assert!(app.recommendations.is_empty());
+        assert!(!app.streaming);
+        assert!(app.status.contains("cleared"));
+        assert!(!paths.history_file.exists());
     }
 }

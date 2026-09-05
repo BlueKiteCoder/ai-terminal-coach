@@ -57,7 +57,7 @@ could happen before they choose to run it.
   and current failure to expose changed branches, virtual environments, directories, or tools.
 - [x] **Session Checkpoints:** let users name a bounded troubleshooting session and append the
   final resolution to its Capsule.
-- [ ] Local retention controls, per-session deletion, and a complete data inventory command.
+- [x] Local retention controls, per-session deletion, and a complete data inventory command.
 
 Exit gate: the Coach gets more useful on a developer's own Mac while its retained data remains
 inspectable, bounded, and removable.
