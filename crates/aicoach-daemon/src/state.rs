@@ -5,14 +5,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aicoach_core::{EnvironmentSnapshot, GitContext};
+use aicoach_core::{EnvironmentSnapshot, GitContext, strip_terminal_sequences};
 use aicoach_ipc::{
     CommandFinishedParams, CommandId, CommandStartedParams, ContextCommand, RegisterSessionParams,
-    RequestId, SessionContext, SessionId, sanitize_shell_environment,
+    RequestId, SessionCheckpoint, SessionContext, SessionId, sanitize_shell_environment,
 };
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+const MAX_CHECKPOINT_NAME_CHARS: usize = 120;
+const MAX_CHECKPOINT_RESOLUTION_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub Uuid);
@@ -85,6 +88,14 @@ pub struct SuccessfulCommandBaseline {
     pub snapshot: EnvironmentSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointError {
+    SessionNotFound,
+    EmptyName,
+    EmptyResolution,
+    NoActiveCheckpoint,
+}
+
 #[derive(Debug)]
 struct StartedCommand {
     command: String,
@@ -111,6 +122,7 @@ struct Session {
     commands: VecDeque<ContextCommand>,
     chat: VecDeque<(bool, String)>,
     active: HashMap<RequestId, ActiveRequest>,
+    checkpoint: Option<SessionCheckpoint>,
     last_success: Option<SuccessfulCommandBaseline>,
     last_accessed: Instant,
 }
@@ -160,6 +172,7 @@ impl SessionManager {
             commands: VecDeque::new(),
             chat: VecDeque::new(),
             active: HashMap::new(),
+            checkpoint: None,
             last_success: None,
             last_accessed: now,
         });
@@ -202,6 +215,7 @@ impl SessionManager {
             commands: VecDeque::new(),
             chat: VecDeque::new(),
             active: HashMap::new(),
+            checkpoint: None,
             last_success: None,
             last_accessed: now,
         });
@@ -358,6 +372,94 @@ impl SessionManager {
         true
     }
 
+    pub fn start_checkpoint(
+        &self,
+        session_id: SessionId,
+        name: &str,
+        started_at_unix_ms: u64,
+        exclude_active_command: bool,
+    ) -> Result<SessionCheckpoint, CheckpointError> {
+        let name = bounded_checkpoint_text(name, false, MAX_CHECKPOINT_NAME_CHARS)
+            .ok_or(CheckpointError::EmptyName)?;
+        let mut state = self.state.lock();
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(CheckpointError::SessionNotFound)?;
+        let checkpoint = SessionCheckpoint {
+            name,
+            started_at_unix_ms,
+            started_after_command_id: session.commands.back().map(|command| command.command_id),
+            start_command_id: exclude_active_command
+                .then(|| sole_started_command_id(session))
+                .flatten(),
+            resolution: None,
+            resolved_at_unix_ms: None,
+            resolved_after_command_id: None,
+            resolution_command_id: None,
+        };
+        session.checkpoint = Some(checkpoint.clone());
+        session.last_accessed = Instant::now();
+        Ok(checkpoint)
+    }
+
+    pub fn resolve_checkpoint(
+        &self,
+        session_id: SessionId,
+        resolution: &str,
+        resolved_at_unix_ms: u64,
+        exclude_active_command: bool,
+    ) -> Result<SessionCheckpoint, CheckpointError> {
+        let resolution = bounded_checkpoint_text(resolution, true, MAX_CHECKPOINT_RESOLUTION_CHARS)
+            .ok_or(CheckpointError::EmptyResolution)?;
+        let mut state = self.state.lock();
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(CheckpointError::SessionNotFound)?;
+        let resolved_after_command_id = session.commands.back().map(|command| command.command_id);
+        let resolution_command_id = exclude_active_command
+            .then(|| sole_started_command_id(session))
+            .flatten();
+        let checkpoint = session
+            .checkpoint
+            .as_mut()
+            .ok_or(CheckpointError::NoActiveCheckpoint)?;
+        checkpoint.resolution = Some(resolution);
+        checkpoint.resolved_at_unix_ms = Some(resolved_at_unix_ms);
+        checkpoint.resolved_after_command_id = resolved_after_command_id;
+        checkpoint.resolution_command_id = resolution_command_id;
+        session.last_accessed = Instant::now();
+        Ok(checkpoint.clone())
+    }
+
+    pub fn checkpoint(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionCheckpoint>, CheckpointError> {
+        let mut state = self.state.lock();
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(CheckpointError::SessionNotFound)?;
+        session.last_accessed = Instant::now();
+        Ok(session.checkpoint.clone())
+    }
+
+    pub fn clear_checkpoint(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionCheckpoint>, CheckpointError> {
+        let mut state = self.state.lock();
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(CheckpointError::SessionNotFound)?;
+        session.last_accessed = Instant::now();
+        session.checkpoint = None;
+        Ok(None)
+    }
+
     /// Attach a best-effort screen tail to the matching context record after
     /// asynchronous Terminal.app/iTerm2 capture completes.
     pub fn record_screen_tail(
@@ -410,6 +512,7 @@ impl SessionManager {
             cwd: session.cwd.clone(),
             shell: session.shell.clone(),
             environment: session.environment.clone(),
+            checkpoint: session.checkpoint.clone().map(Box::new),
             commands: session.commands.iter().skip(skip).cloned().collect(),
         })
     }
@@ -589,6 +692,21 @@ fn environment_changes(
         }
     }
     changes
+}
+
+fn bounded_checkpoint_text(value: &str, multiline: bool, max_chars: usize) -> Option<String> {
+    let safe = strip_terminal_sequences(value, multiline);
+    let safe = safe.trim();
+    if safe.is_empty() {
+        return None;
+    }
+    Some(safe.chars().take(max_chars).collect())
+}
+
+fn sole_started_command_id(session: &Session) -> Option<CommandId> {
+    (session.started.len() == 1)
+        .then(|| session.started.keys().next().copied())
+        .flatten()
 }
 
 fn trim_context(session: &mut Session, limits: &SessionLimits) {
@@ -1075,5 +1193,130 @@ mod tests {
         assert_eq!(baseline.command_id, second);
         assert!(baseline.snapshot.git_observed);
         assert_eq!(baseline.snapshot.git, Some(current_git));
+    }
+
+    #[test]
+    fn checkpoint_tracks_a_bounded_terminal_safe_resolution_after_its_marker() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let session = SessionId::new();
+        manager.register(ConnectionId::new(), registration(session));
+        assert_eq!(
+            manager.resolve_checkpoint(session, "fixed", 20, false),
+            Err(CheckpointError::NoActiveCheckpoint)
+        );
+
+        let command_id = CommandId::new();
+        assert!(manager.start_command(
+            session,
+            CommandStartedParams {
+                command_id,
+                command: "cargo test".to_owned(),
+                cwd: PathBuf::from("/tmp/a"),
+                started_at_unix_ms: None,
+            },
+        ));
+        manager
+            .finish_command(
+                session,
+                RequestId::new(),
+                CommandFinishedParams {
+                    command_id,
+                    command: None,
+                    cwd: None,
+                    exit_code: 1,
+                    stdout: None,
+                    stderr: Some("failed".to_owned()),
+                    duration_ms: Some(1),
+                    environment: BTreeMap::new(),
+                },
+                None,
+            )
+            .unwrap();
+
+        let checkpoint = manager
+            .start_checkpoint(session, "  Build \u{1b}[31mregression\n  ", 10, false)
+            .unwrap();
+        assert_eq!(checkpoint.name, "Build regression");
+        assert_eq!(checkpoint.started_after_command_id, Some(command_id));
+        let resolution = format!(
+            "first\nsecond\u{1b}]52;c;payload\u{7}\n{}",
+            "x".repeat(2_100)
+        );
+        let resolved = manager
+            .resolve_checkpoint(session, &resolution, 20, false)
+            .unwrap();
+        let resolution = resolved.resolution.as_deref().unwrap();
+        assert!(resolution.starts_with("first\nsecond\n"));
+        assert!(!resolution.contains('\u{1b}'));
+        assert!(!resolution.contains("payload"));
+        assert_eq!(resolution.chars().count(), MAX_CHECKPOINT_RESOLUTION_CHARS);
+        assert_eq!(resolved.resolved_at_unix_ms, Some(20));
+        assert_eq!(resolved.resolved_after_command_id, Some(command_id));
+        assert_eq!(
+            manager
+                .context(session, None)
+                .unwrap()
+                .checkpoint
+                .map(|checkpoint| *checkpoint),
+            Some(resolved)
+        );
+        assert_eq!(manager.clear_checkpoint(session).unwrap(), None);
+        assert_eq!(manager.checkpoint(session).unwrap(), None);
+    }
+
+    #[test]
+    fn checkpoint_marks_its_own_inflight_cli_commands_for_capsule_exclusion() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let session = SessionId::new();
+        manager.register(ConnectionId::new(), registration(session));
+
+        let start_cli = CommandId::new();
+        assert!(manager.start_command(
+            session,
+            CommandStartedParams {
+                command_id: start_cli,
+                command: "aicoach checkpoint start issue".to_owned(),
+                cwd: PathBuf::from("/tmp/a"),
+                started_at_unix_ms: None,
+            },
+        ));
+        let checkpoint = manager
+            .start_checkpoint(session, "issue", 10, true)
+            .unwrap();
+        assert_eq!(checkpoint.start_command_id, Some(start_cli));
+        assert!(checkpoint.started_after_command_id.is_none());
+        manager
+            .finish_command(
+                session,
+                RequestId::new(),
+                CommandFinishedParams {
+                    command_id: start_cli,
+                    command: None,
+                    cwd: None,
+                    exit_code: 0,
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: Some(1),
+                    environment: BTreeMap::new(),
+                },
+                None,
+            )
+            .unwrap();
+
+        let resolve_cli = CommandId::new();
+        assert!(manager.start_command(
+            session,
+            CommandStartedParams {
+                command_id: resolve_cli,
+                command: "aicoach checkpoint resolve".to_owned(),
+                cwd: PathBuf::from("/tmp/a"),
+                started_at_unix_ms: None,
+            },
+        ));
+        let checkpoint = manager
+            .resolve_checkpoint(session, "fixed", 20, true)
+            .unwrap();
+        assert_eq!(checkpoint.resolved_after_command_id, Some(start_cli));
+        assert_eq!(checkpoint.resolution_command_id, Some(resolve_cli));
     }
 }

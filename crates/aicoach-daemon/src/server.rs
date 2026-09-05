@@ -19,10 +19,10 @@ use aicoach_core::{
     source_card_from_output, source_queries, strip_terminal_sequences, try_collect_git_context,
 };
 use aicoach_ipc::{
-    ClientCapabilities, ClientKind, CompletionOperation, CompletionResult, Event, EventBody, Hint,
-    Message, PROTOCOL_VERSION, Request, RequestBody, Response, ResponseResult, RiskLensResult,
-    SafetyClassification, SessionContext, SessionId, Severity, WireProtocol, decode_incoming,
-    encode_outgoing,
+    CheckpointOperation, ClientCapabilities, ClientKind, CompletionOperation, CompletionResult,
+    Event, EventBody, Hint, Message, PROTOCOL_VERSION, Request, RequestBody, Response,
+    ResponseResult, RiskLensResult, SafetyClassification, SessionContext, SessionId, Severity,
+    WireProtocol, decode_incoming, encode_outgoing,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -42,7 +42,10 @@ use tracing::{debug, info, warn};
 
 use crate::{
     capture::capture_screen_tail,
-    state::{ActiveRequestKind, AnalysisJob, ConnectionId, SessionLimits, SessionManager},
+    state::{
+        ActiveRequestKind, AnalysisJob, CheckpointError, ConnectionId, SessionLimits,
+        SessionManager,
+    },
 };
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
@@ -823,6 +826,55 @@ impl Daemon {
                     send_unknown_session(&sender, &request).await;
                 }
             }
+            RequestBody::Checkpoint(params) => {
+                let Some(session_id) = request.session_id else {
+                    send_missing_session(&sender, &request).await;
+                    return;
+                };
+                let result = match params.operation {
+                    CheckpointOperation::Start { name } => self
+                        .sessions
+                        .start_checkpoint(
+                            session_id,
+                            &name,
+                            unix_ms(),
+                            params.exclude_active_command,
+                        )
+                        .map(Some),
+                    CheckpointOperation::Resolve { resolution } => self
+                        .sessions
+                        .resolve_checkpoint(
+                            session_id,
+                            &resolution,
+                            unix_ms(),
+                            params.exclude_active_command,
+                        )
+                        .map(Some),
+                    CheckpointOperation::Status => self.sessions.checkpoint(session_id),
+                    CheckpointOperation::Clear => self.sessions.clear_checkpoint(session_id),
+                };
+                match result {
+                    Ok(checkpoint) => {
+                        send_response(
+                            &sender,
+                            Response::ok(
+                                &request,
+                                ResponseResult::Checkpoint {
+                                    checkpoint: checkpoint.map(Box::new),
+                                },
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(CheckpointError::SessionNotFound) => {
+                        send_unknown_session(&sender, &request).await;
+                    }
+                    Err(error) => {
+                        let (code, message) = checkpoint_error(error);
+                        send_error(&sender, &request, code, message, false).await;
+                    }
+                }
+            }
             RequestBody::InsertBuffer(mut params) => {
                 if contains_terminal_control(&params.command) {
                     send_error(
@@ -1348,7 +1400,12 @@ impl Daemon {
         buffer: Option<String>,
         requested_cwd: Option<PathBuf>,
     ) -> ChatPrompt {
-        let terminal = self.sessions.context(session_id, Some(20));
+        let mut terminal = self.sessions.context(session_id, Some(20));
+        // Checkpoint names and human-written resolutions are local Capsule
+        // metadata. Keep them out of provider chat context by construction.
+        if let Some(context) = terminal.as_mut() {
+            context.checkpoint = None;
+        }
         let cwd = requested_cwd
             .or_else(|| terminal.as_ref().map(|context| context.cwd.clone()))
             .unwrap_or_default();
@@ -2618,10 +2675,29 @@ fn request_method(body: &RequestBody) -> &'static str {
         RequestBody::Cancel(_) => "cancel",
         RequestBody::Chat(_) => "chat",
         RequestBody::Context(_) => "context",
+        RequestBody::Checkpoint(_) => "checkpoint",
         RequestBody::InsertBuffer(_) => "insert_buffer",
         RequestBody::Disconnect => "disconnect",
         RequestBody::Ping => "ping",
         RequestBody::Shutdown(_) => "shutdown",
+    }
+}
+
+fn checkpoint_error(error: CheckpointError) -> (&'static str, &'static str) {
+    match error {
+        CheckpointError::SessionNotFound => ("session_not_found", "session is not registered"),
+        CheckpointError::EmptyName => (
+            "invalid_checkpoint_name",
+            "checkpoint name must contain visible text",
+        ),
+        CheckpointError::EmptyResolution => (
+            "invalid_checkpoint_resolution",
+            "checkpoint resolution must contain visible text",
+        ),
+        CheckpointError::NoActiveCheckpoint => (
+            "checkpoint_not_found",
+            "start a checkpoint before recording its resolution",
+        ),
     }
 }
 

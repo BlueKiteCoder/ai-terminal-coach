@@ -5,7 +5,7 @@ use aicoach_ipc::{
     Request, RequestBody, ResponseOutcome, ResponseResult, SessionContext, SessionId,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::{
     env, fs,
     io::Write,
@@ -60,7 +60,7 @@ pub(super) fn export(paths: &Paths, args: &CapsuleArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_capsule_session(paths: &Paths, requested: &str) -> Result<SessionId> {
+pub(super) fn resolve_capsule_session(paths: &Paths, requested: &str) -> Result<SessionId> {
     let value = if requested.trim().is_empty() {
         fs::read_to_string(paths.run_dir.join("active-session")).with_context(
             || "no active terminal session; open a new Zsh prompt or pass --session <UUID>",
@@ -172,9 +172,48 @@ fn render_session_capsule(
 ) -> String {
     use std::fmt::Write as _;
 
+    let position = |boundary| {
+        context
+            .commands
+            .iter()
+            .position(|command| command.command_id == boundary)
+    };
+    let checkpoint_start = context.checkpoint.as_ref().map_or(0, |checkpoint| {
+        checkpoint
+            .start_command_id
+            .and_then(position)
+            .map(|position| position + 1)
+            .or_else(|| {
+                checkpoint
+                    .started_after_command_id
+                    .and_then(position)
+                    .map(|position| position + 1)
+            })
+            .unwrap_or(0)
+    });
+    let checkpoint_end = context
+        .checkpoint
+        .as_ref()
+        .map_or(context.commands.len(), |checkpoint| {
+            if checkpoint.resolved_at_unix_ms.is_none() {
+                return context.commands.len();
+            }
+            checkpoint
+                .resolution_command_id
+                .and_then(position)
+                .or_else(|| {
+                    checkpoint
+                        .resolved_after_command_id
+                        .and_then(position)
+                        .map(|position| position + 1)
+                })
+                .unwrap_or(0)
+        });
     let commands = context
         .commands
         .iter()
+        .skip(checkpoint_start)
+        .take(checkpoint_end.saturating_sub(checkpoint_start))
         .filter(|command| !failed_only || command.exit_code != 0)
         .collect::<Vec<_>>();
     let failures = commands
@@ -200,6 +239,21 @@ fn render_session_capsule(
         let _ = writeln!(report, "- 生成时间：{}", markdown_inline(generated_at));
         let _ = writeln!(report, "- Shell：{}", markdown_inline(&shell));
         let _ = writeln!(report, "- 当前目录：{}", markdown_inline(&cwd));
+        if let Some(checkpoint) = context.checkpoint.as_ref() {
+            let name = capsule_text(&checkpoint.name, home, redactor);
+            let status = if checkpoint.resolution.is_some() {
+                "已解决"
+            } else {
+                "进行中"
+            };
+            let _ = writeln!(
+                report,
+                "- 检查点：{}（{}，始于 {}）",
+                markdown_inline(&name),
+                status,
+                markdown_inline(&format_timestamp(checkpoint.started_at_unix_ms))
+            );
+        }
         let _ = writeln!(
             report,
             "- 命令：{} 条，其中失败 {} 条",
@@ -223,6 +277,21 @@ fn render_session_capsule(
         let _ = writeln!(report, "- Generated: {}", markdown_inline(generated_at));
         let _ = writeln!(report, "- Shell: {}", markdown_inline(&shell));
         let _ = writeln!(report, "- Current directory: {}", markdown_inline(&cwd));
+        if let Some(checkpoint) = context.checkpoint.as_ref() {
+            let name = capsule_text(&checkpoint.name, home, redactor);
+            let status = if checkpoint.resolution.is_some() {
+                "resolved"
+            } else {
+                "active"
+            };
+            let _ = writeln!(
+                report,
+                "- Checkpoint: {} ({}, started {})",
+                markdown_inline(&name),
+                status,
+                markdown_inline(&format_timestamp(checkpoint.started_at_unix_ms))
+            );
+        }
         let _ = writeln!(
             report,
             "- Commands: {}, including {} failed",
@@ -253,6 +322,24 @@ fn render_session_capsule(
                 markdown_inline(&value)
             );
         }
+    }
+
+    if let Some(resolution) = context
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.resolution.as_deref())
+    {
+        let resolution = capsule_text(resolution, home, redactor);
+        let _ = writeln!(
+            report,
+            "\n## {}\n\n{}",
+            if chinese {
+                "最终解决方案"
+            } else {
+                "Resolution"
+            },
+            markdown_fence("text", &resolution)
+        );
     }
 
     let _ = writeln!(
@@ -386,6 +473,13 @@ fn format_duration(milliseconds: u64) -> String {
     }
 }
 
+fn format_timestamp(timestamp_ms: u64) -> String {
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map_or_else(|| timestamp_ms.to_string(), |time| time.to_rfc3339())
+}
+
 fn format_hundredths(value: u64, unit: &str) -> String {
     format!("{}.{:02} {unit}", value / 100, value % 100)
 }
@@ -430,6 +524,7 @@ mod tests {
                 "VIRTUAL_ENV".to_owned(),
                 "/Users/alice/work/demo/.venv".to_owned(),
             )]),
+            checkpoint: None,
             commands: vec![aicoach_ipc::ContextCommand {
                 command_id: aicoach_ipc::CommandId::new(),
                 command: format!("curl 'https://example.test?api_key={secret}'"),
@@ -469,6 +564,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             shell: "zsh".to_owned(),
             environment: std::collections::BTreeMap::new(),
+            checkpoint: None,
             commands: vec![
                 aicoach_ipc::ContextCommand {
                     command_id: aicoach_ipc::CommandId::new(),
@@ -507,6 +603,119 @@ mod tests {
     }
 
     #[test]
+    fn capsule_focuses_on_checkpoint_and_force_redacts_resolution() {
+        let before = aicoach_ipc::CommandId::new();
+        let start_command = aicoach_ipc::CommandId::new();
+        let after = aicoach_ipc::CommandId::new();
+        let resolution_command = aicoach_ipc::CommandId::new();
+        let after_resolution = aicoach_ipc::CommandId::new();
+        let mut context = SessionContext {
+            session_id: SessionId::new(),
+            tty: "/dev/ttys001".to_owned(),
+            cwd: PathBuf::from("/Users/alice/work/demo"),
+            shell: "zsh".to_owned(),
+            environment: std::collections::BTreeMap::new(),
+            checkpoint: Some(Box::new(aicoach_ipc::SessionCheckpoint {
+                name: "Intel build regression".to_owned(),
+                started_at_unix_ms: 1_788_537_600_000,
+                started_after_command_id: Some(before),
+                start_command_id: Some(start_command),
+                resolution: Some(
+                    "Pinned SDKROOT with password=checkpoint-private-value\n```safe fence```"
+                        .to_owned(),
+                ),
+                resolved_at_unix_ms: Some(1_788_537_660_000),
+                resolved_after_command_id: Some(after),
+                resolution_command_id: Some(resolution_command),
+            })),
+            commands: vec![
+                aicoach_ipc::ContextCommand {
+                    command_id: before,
+                    command: "echo before-checkpoint".to_owned(),
+                    cwd: PathBuf::from("/Users/alice/work/demo"),
+                    exit_code: 0,
+                    duration_ms: Some(1),
+                    stdout_summary: None,
+                    stderr_summary: None,
+                },
+                aicoach_ipc::ContextCommand {
+                    command_id: start_command,
+                    command: "aicoach checkpoint start bookkeeping".to_owned(),
+                    cwd: PathBuf::from("/Users/alice/work/demo"),
+                    exit_code: 0,
+                    duration_ms: Some(1),
+                    stdout_summary: None,
+                    stderr_summary: None,
+                },
+                aicoach_ipc::ContextCommand {
+                    command_id: after,
+                    command: "cargo test".to_owned(),
+                    cwd: PathBuf::from("/Users/alice/work/demo"),
+                    exit_code: 0,
+                    duration_ms: Some(2),
+                    stdout_summary: Some("passed".to_owned()),
+                    stderr_summary: None,
+                },
+                aicoach_ipc::ContextCommand {
+                    command_id: resolution_command,
+                    command: "aicoach checkpoint resolve".to_owned(),
+                    cwd: PathBuf::from("/Users/alice/work/demo"),
+                    exit_code: 0,
+                    duration_ms: Some(1),
+                    stdout_summary: None,
+                    stderr_summary: None,
+                },
+                aicoach_ipc::ContextCommand {
+                    command_id: after_resolution,
+                    command: "echo after-resolution".to_owned(),
+                    cwd: PathBuf::from("/Users/alice/work/demo"),
+                    exit_code: 0,
+                    duration_ms: Some(3),
+                    stdout_summary: None,
+                    stderr_summary: None,
+                },
+            ],
+        };
+
+        let report = render_session_capsule(
+            &context,
+            Path::new("/Users/alice"),
+            &PrivacyRedactor::default(),
+            false,
+            false,
+            "2026-09-05T00:00:00Z",
+        );
+
+        assert!(report.contains("Checkpoint:"));
+        assert!(report.contains("Intel build regression"));
+        assert!(report.contains("Resolution"));
+        assert!(report.contains("[REDACTED]"));
+        assert!(report.contains("cargo test"));
+        assert!(!report.contains("before-checkpoint"));
+        assert!(!report.contains("checkpoint start bookkeeping"));
+        assert!(!report.contains("checkpoint resolve"));
+        assert!(!report.contains("after-resolution"));
+        assert!(!report.contains("checkpoint-private-value"));
+        assert!(report.contains("Commands: 1, including 0 failed"));
+        assert!(report.contains("````text"));
+
+        // When a small `--last` slice no longer contains the resolution
+        // boundary, every returned command is newer and must stay excluded.
+        let post_resolution = context.commands.last().unwrap().clone();
+        context.commands = vec![post_resolution];
+        let bounded = render_session_capsule(
+            &context,
+            Path::new("/Users/alice"),
+            &PrivacyRedactor::default(),
+            false,
+            false,
+            "2026-09-05T00:00:00Z",
+        );
+        assert!(bounded.contains("No matching recorded commands."));
+        assert!(!bounded.contains("after-resolution"));
+    }
+
+    #[test]
     fn capsule_fetches_context_through_the_daemon_protocol() {
         use std::os::unix::net::UnixListener;
 
@@ -520,6 +729,7 @@ mod tests {
             cwd: PathBuf::from("/tmp/demo"),
             shell: "zsh".to_owned(),
             environment: std::collections::BTreeMap::new(),
+            checkpoint: None,
             commands: Vec::new(),
         };
         let server_context = expected.clone();
