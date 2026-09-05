@@ -269,6 +269,7 @@ fn decode_fields(verb: &str, fields: &[String]) -> Result<Request, ZshProtocolEr
                     command: fields[2].clone(),
                     cursor: None,
                     mode: InsertMode::Replace,
+                    safety: None,
                 }),
             ))
         }
@@ -471,11 +472,34 @@ pub fn encode_message(message: &Message) -> Result<String, ZshProtocolError> {
                 message.clone(),
                 retryable.to_string(),
             ],
-            EventBody::InsertBuffer(insert) => vec![
-                "INSERT".to_owned(),
-                event.session_id.to_string(),
-                insert.command.clone(),
-            ],
+            EventBody::InsertBuffer(insert) => {
+                let (level, coverage, rules_enabled) = insert.safety.map_or_else(
+                    || ("unrated".to_owned(), "unknown".to_owned(), String::new()),
+                    |safety| {
+                        (
+                            safety.level.map_or_else(
+                                || "unrated".to_owned(),
+                                |level| level.to_string().to_ascii_lowercase(),
+                            ),
+                            match safety.coverage {
+                                aicoach_core::AnalysisCoverage::Recognized => "recognized",
+                                aicoach_core::AnalysisCoverage::Partial => "partial",
+                                aicoach_core::AnalysisCoverage::Unknown => "unknown",
+                            }
+                            .to_owned(),
+                            safety.safety_rules_enabled.to_string(),
+                        )
+                    },
+                );
+                vec![
+                    "INSERT".to_owned(),
+                    event.session_id.to_string(),
+                    insert.command.clone(),
+                    level,
+                    coverage,
+                    rules_enabled,
+                ]
+            }
             EventBody::RequestCancelled => vec![
                 "CANCELLED".to_owned(),
                 event.session_id.to_string(),
@@ -530,7 +554,9 @@ mod tests {
         RiskLensReport, RiskLevel,
     };
 
-    use crate::protocol::{CompletionResult, Event, RiskLensResult, Severity};
+    use crate::protocol::{
+        CompletionResult, Event, InsertBufferParams, RiskLensResult, SafetyClassification, Severity,
+    };
 
     #[test]
     fn percent_encoding_round_trip_covers_frame_delimiters_and_unicode() {
@@ -636,6 +662,30 @@ mod tests {
         let encoded = encode_message(&Message::from(response)).unwrap();
         assert!(encoded.starts_with(&format!("LENS\t{session}\t{request_id}\thigh\t")));
         assert!(encoded.contains("%0AImpact"));
+    }
+
+    #[test]
+    fn inserted_buffer_carries_daemon_safety_classification() {
+        let session = SessionId::new();
+        let event = Event::new(
+            session,
+            None,
+            EventBody::InsertBuffer(InsertBufferParams {
+                command: "rm -rf /".to_owned(),
+                cursor: None,
+                mode: InsertMode::Replace,
+                safety: Some(SafetyClassification {
+                    level: Some(RiskLevel::Critical),
+                    coverage: AnalysisCoverage::Recognized,
+                    safety_rules_enabled: true,
+                }),
+            }),
+        );
+        let encoded = encode_message(&Message::from(event)).unwrap();
+        assert_eq!(
+            encoded,
+            format!("INSERT\t{session}\trm -rf /\tcritical\trecognized\ttrue")
+        );
     }
 
     #[test]

@@ -44,17 +44,41 @@ export AICOACH_ONBOARDING_CLI=$cli
 /usr/bin/expect <<'EXPECT'
 set timeout 15
 log_user 0
+set stage "language choice"
 spawn $env(AICOACH_ONBOARDING_CLI) onboard
+expect_after -i $spawn_id {
+  timeout {
+    send_error "onboarding PTY timed out during $stage\n"
+    catch {close -force}
+    exit 124
+  }
+  eof {
+    send_error "onboarding PTY exited during $stage\n"
+    exit 125
+  }
+}
 expect "Choose \[1\]:"
 send -- "\r"
+set stage "completion shortcut"
 expect "Press it now"
 send -- "\033g"
+set stage "chat shortcut"
 expect "Press it now"
 send -- "\033c"
+set stage "Risk Lens shortcut"
 expect "Press it now"
 send -- "\033l"
+set stage "completion summary"
 expect "Setup complete"
-expect eof
+set stage "process exit"
+expect {
+  eof {}
+  timeout {
+    send_error "onboarding printed completion but did not release its PTY\n"
+    catch {close -force}
+    exit 124
+  }
+}
 set result [wait]
 exit [lindex $result 3]
 EXPECT

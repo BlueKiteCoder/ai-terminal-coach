@@ -43,7 +43,8 @@ workflow, and uninstall on a clean supported Mac without reading source code.
   calling an AI provider; unfamiliar commands are honestly marked unrated.
 - [x] **Source Cards:** attach bounded local `man`/allowlisted `--help` excerpts to Risk Lens
   explanations and explicitly distinguish documented behavior from rule/profile inference.
-- [ ] One-keystroke “insert only” and “copy only” actions with a visible safety classification.
+- [x] One-keystroke “insert only” and “copy only” actions with a visible safety classification,
+  daemon-authoritative terminal handoff label, and an explicit “not executed” receipt.
 
 Exit gate: users can understand why a suggestion changed, where its claims came from, and what
 could happen before they choose to run it.

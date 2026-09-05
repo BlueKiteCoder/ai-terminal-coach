@@ -20,7 +20,8 @@ use aicoach_core::{
 use aicoach_ipc::{
     ClientCapabilities, ClientKind, CompletionOperation, CompletionResult, Event, EventBody, Hint,
     Message, PROTOCOL_VERSION, Request, RequestBody, Response, ResponseResult, RiskLensResult,
-    SessionContext, SessionId, Severity, WireProtocol, decode_incoming, encode_outgoing,
+    SafetyClassification, SessionContext, SessionId, Severity, WireProtocol, decode_incoming,
+    encode_outgoing,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -786,7 +787,7 @@ impl Daemon {
                     send_unknown_session(&sender, &request).await;
                 }
             }
-            RequestBody::InsertBuffer(params) => {
+            RequestBody::InsertBuffer(mut params) => {
                 if contains_terminal_control(&params.command) {
                     send_error(
                         &sender,
@@ -821,6 +822,10 @@ impl Daemon {
                     .await;
                     return;
                 }
+                // Never trust a client-supplied label. The daemon re-runs the
+                // local Risk Lens over the exact command delivered to ZLE.
+                let report = self.safety.risk_lens(&params.command);
+                params.safety = Some(SafetyClassification::from(&report));
                 self.send_shell_event(Event::new(
                     session_id,
                     Some(request.request_id),

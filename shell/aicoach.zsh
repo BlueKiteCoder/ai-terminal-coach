@@ -64,6 +64,9 @@ typeset -g AICOACH_LAST_START=0
 typeset -gi AICOACH_REQUEST_SEQ=0
 typeset -ga AICOACH_PENDING_INSERTS
 typeset -gi AICOACH_DEFER_INSERT=0
+typeset -g AICOACH_PENDING_INSERT_RISK=""
+typeset -g AICOACH_PENDING_INSERT_COVERAGE=""
+typeset -g AICOACH_PENDING_INSERT_RULES=""
 typeset -g AICOACH_PENDING_COMPLETION_OPERATION=""
 typeset -g AICOACH_PENDING_COMPLETION_COMMAND=""
 typeset -g AICOACH_PENDING_COMPLETION_CURSOR=""
@@ -345,6 +348,42 @@ _aicoach_color_for() {
   esac
 }
 
+_aicoach_insert_status() {
+  local risk=${1:l} coverage=${2:l} rules=${3:l} rating qualifier=""
+  case $risk in
+    low|medium|high|critical|unrated) ;;
+    *) risk=unrated ;;
+  esac
+  case $coverage in
+    recognized|partial|unknown) ;;
+    *) coverage=unknown ;;
+  esac
+
+  if [[ $AICOACH_LANGUAGE == zh-CN ]]; then
+    case $risk in
+      low) rating='低风险' ;;
+      medium) rating='中风险' ;;
+      high) rating='高风险' ;;
+      critical) rating='严重风险' ;;
+      *) rating='未评级' ;;
+    esac
+    case $coverage in
+      partial) qualifier=' · 部分识别' ;;
+      unknown) qualifier=' · 未识别命令' ;;
+    esac
+    [[ $rules == false ]] && qualifier+=' · 破坏性规则已关闭'
+    zle -M "[AI Coach] 仅插入 · ${rating}${qualifier} · 尚未执行；检查后请自行按 Enter"
+  else
+    rating=${risk:u}
+    case $coverage in
+      partial) qualifier=' · partial coverage' ;;
+      unknown) qualifier=' · unknown command' ;;
+    esac
+    [[ $rules == false ]] && qualifier+=' · destructive rules off'
+    zle -M "[AI Coach] Insert only · ${rating}${qualifier} · not executed; review, then press Enter"
+  fi
+}
+
 _aicoach_notice() {
   local severity=$1 message=$2 suggested=${3:-}
   _aicoach_safe_multiline_display "$message"; message=$REPLY
@@ -511,7 +550,8 @@ _aicoach_handle_line() {
       fi
       ;;
     INSERT)
-      local command
+      local command risk=${fields[4]:-unrated} encoded_coverage=${fields[5]:-} rules=${fields[6]:-}
+      local coverage=${encoded_coverage:-unknown}
       _aicoach_decode "${fields[3]:-}"; command=$REPLY
       if ! _aicoach_safe_buffer "$command"; then
         _aicoach_text rejected_command
@@ -519,9 +559,19 @@ _aicoach_handle_line() {
         return 0
       fi
       if _aicoach_local_danger "$command"; then
-        _aicoach_notice critical "$REPLY" "$command"
+        case $risk:$REPLY in
+          critical:*) ;;
+          *:CRITICAL:*|*:CRITICAL：*) risk=critical ;;
+          *) risk=high ;;
+        esac
+        # Preserve a daemon-reported partial classification for compound
+        # commands. Only old three-field INSERT frames need fallback coverage.
+        [[ -z $encoded_coverage ]] && coverage=recognized
       fi
       AICOACH_PENDING_INSERTS+=("$command")
+      typeset -g AICOACH_PENDING_INSERT_RISK=$risk
+      typeset -g AICOACH_PENDING_INSERT_COVERAGE=$coverage
+      typeset -g AICOACH_PENDING_INSERT_RULES=$rules
       (( AICOACH_DEFER_INSERT )) || zle aicoach-apply-pending
       ;;
     ERROR)
@@ -595,10 +645,15 @@ _aicoach_precmd() {
 
 _aicoach_apply_pending_inserts() {
   if (( ${#AICOACH_PENDING_INSERTS} )); then
+    local risk=$AICOACH_PENDING_INSERT_RISK coverage=$AICOACH_PENDING_INSERT_COVERAGE rules=$AICOACH_PENDING_INSERT_RULES
     BUFFER=${AICOACH_PENDING_INSERTS[-1]}
     CURSOR=${#BUFFER}
     AICOACH_PENDING_INSERTS=()
+    typeset -g AICOACH_PENDING_INSERT_RISK=""
+    typeset -g AICOACH_PENDING_INSERT_COVERAGE=""
+    typeset -g AICOACH_PENDING_INSERT_RULES=""
     zle redisplay
+    _aicoach_insert_status "$risk" "$coverage" "$rules"
   fi
 }
 

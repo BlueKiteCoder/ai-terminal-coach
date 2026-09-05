@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use aicoach_core::{RiskLensReport, SourceCard};
+use aicoach_core::{AnalysisCoverage, RiskLensReport, RiskLevel, SourceCard};
 
 pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 4 * 1024 * 1024;
@@ -227,6 +227,26 @@ pub enum InsertMode {
     Suggest,
 }
 
+/// A compact, local-only safety verdict attached by the daemon before a
+/// command is delivered to a shell buffer. Clients may omit it in requests;
+/// the daemon is the authority for the event sent to ZLE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyClassification {
+    pub level: Option<RiskLevel>,
+    pub coverage: AnalysisCoverage,
+    pub safety_rules_enabled: bool,
+}
+
+impl From<&RiskLensReport> for SafetyClassification {
+    fn from(report: &RiskLensReport) -> Self {
+        Self {
+            level: report.level,
+            coverage: report.coverage,
+            safety_rules_enabled: report.safety_rules_enabled,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InsertBufferParams {
     pub command: String,
@@ -234,6 +254,8 @@ pub struct InsertBufferParams {
     pub cursor: Option<usize>,
     #[serde(default = "replace_mode")]
     pub mode: InsertMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety: Option<SafetyClassification>,
 }
 
 const fn replace_mode() -> InsertMode {
@@ -577,5 +599,19 @@ mod tests {
             panic!("expected command_finished")
         };
         assert!(params.environment.is_empty());
+    }
+
+    #[test]
+    fn old_insert_requests_without_a_safety_label_remain_compatible() {
+        let request_id = RequestId::new();
+        let json = format!(
+            r#"{{"request_id":"{request_id}","method":"insert_buffer","params":{{"command":"echo ok","mode":"replace"}}}}"#
+        );
+        let request: Request = serde_json::from_str(&json).unwrap();
+        let RequestBody::InsertBuffer(params) = request.body else {
+            panic!("expected insert-buffer request")
+        };
+        assert_eq!(params.command, "echo ok");
+        assert!(params.safety.is_none());
     }
 }

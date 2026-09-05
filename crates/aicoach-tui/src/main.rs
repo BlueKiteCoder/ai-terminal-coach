@@ -17,11 +17,13 @@ use std::{
     time::Duration,
 };
 
-use aicoach_core::{Config, ProductPaths, strip_terminal_sequences};
+use aicoach_core::{
+    AnalysisCoverage, Config, ProductPaths, RiskLevel, SafetyEngine, strip_terminal_sequences,
+};
 use aicoach_ipc::{
     ChatParams, ClientCapabilities, ClientKind, ContextParams, EventBody, HelloParams, Hint,
     InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION, RegisterSessionParams, Request,
-    RequestBody, ResponseOutcome, ResponseResult, SessionContext, SessionId,
+    RequestBody, ResponseOutcome, ResponseResult, SafetyClassification, SessionContext, SessionId,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -82,6 +84,12 @@ struct UiMessage {
     content: String,
 }
 
+#[derive(Debug, Clone)]
+struct CommandSuggestion {
+    command: String,
+    safety: SafetyClassification,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HistoryStore {
     #[serde(default)]
@@ -119,8 +127,9 @@ struct App {
     messages: Vec<UiMessage>,
     input: String,
     input_cursor: usize,
-    recommendations: Vec<String>,
+    recommendations: Vec<CommandSuggestion>,
     recommendation_state: ListState,
+    safety: SafetyEngine,
     scroll: u16,
     follow_tail: bool,
     streaming: bool,
@@ -142,6 +151,7 @@ impl App {
         managed_window: bool,
     ) -> Self {
         let language = UiLanguage::from_config(config);
+        let safety = SafetyEngine::with_config(config.safety.clone());
         let mut recommendation_state = ListState::default();
         recommendation_state.select(None);
         let (mut messages, status) = if config.history.enabled {
@@ -182,6 +192,7 @@ impl App {
             input_cursor: 0,
             recommendations: Vec::new(),
             recommendation_state,
+            safety,
             scroll: 0,
             follow_tail: true,
             streaming: false,
@@ -196,11 +207,10 @@ impl App {
         }
     }
 
-    fn selected_command(&self) -> Option<&str> {
+    fn selected_suggestion(&self) -> Option<&CommandSuggestion> {
         self.recommendation_state
             .selected()
             .and_then(|index| self.recommendations.get(index))
-            .map(String::as_str)
     }
 
     fn add_recommendation(&mut self, command: impl Into<String>) {
@@ -208,11 +218,18 @@ impl App {
         if command.is_empty()
             || command.contains('\n')
             || command.chars().any(char::is_control)
-            || self.recommendations.iter().any(|item| item == &command)
+            || self
+                .recommendations
+                .iter()
+                .any(|item| item.command == command)
         {
             return;
         }
-        self.recommendations.push(command);
+        let report = self.safety.risk_lens(&command);
+        self.recommendations.push(CommandSuggestion {
+            command,
+            safety: SafetyClassification::from(&report),
+        });
         if self.recommendations.len() > 12 {
             self.recommendations.remove(0);
         }
@@ -523,7 +540,7 @@ async fn handle_key(key: KeyEvent, client: &IpcClient, app: &mut App) -> Result<
         KeyCode::Esc if app.show_help => app.show_help = false,
         KeyCode::Esc => {
             app.persist_history();
-            return_to_terminal(app);
+            return_to_terminal(app, None);
         }
         KeyCode::F(1) | KeyCode::Char('?') if app.input.is_empty() => {
             app.show_help = !app.show_help
@@ -708,7 +725,10 @@ fn handle_hint(hint: Hint, app: &mut App) {
 }
 
 async fn insert_selected(client: &IpcClient, app: &mut App) -> Result<()> {
-    let Some(command) = app.selected_command().map(str::to_owned) else {
+    let Some((command, safety)) = app
+        .selected_suggestion()
+        .map(|suggestion| (suggestion.command.clone(), suggestion.safety))
+    else {
         app.status = app
             .language
             .text("No command is available to insert", "当前没有可插入的命令")
@@ -723,6 +743,7 @@ async fn insert_selected(client: &IpcClient, app: &mut App) -> Result<()> {
                     command,
                     cursor: None,
                     mode: InsertMode::Replace,
+                    safety: None,
                 }),
             ),
             IPC_REQUEST_TIMEOUT,
@@ -730,14 +751,8 @@ async fn insert_selected(client: &IpcClient, app: &mut App) -> Result<()> {
         .await?;
     match response.outcome {
         ResponseOutcome::Ok { .. } => {
-            app.status = app
-                .language
-                .text(
-                    "Suggested command sent; review or edit it in the terminal",
-                    "推荐命令已发送，返回终端后可检查、编辑或执行",
-                )
-                .to_owned();
-            return_to_terminal(app);
+            let status = action_status(SuggestionAction::Insert, safety, app.language);
+            return_to_terminal(app, Some(status));
         }
         ResponseOutcome::Error { error } => {
             app.status = format!(
@@ -750,7 +765,7 @@ async fn insert_selected(client: &IpcClient, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn return_to_terminal(app: &mut App) {
+fn return_to_terminal(app: &mut App, success_status: Option<String>) {
     if app.managed_window {
         match Command::new("aicoach")
             .args(["toggle", "--session", &app.session_id.to_string()])
@@ -759,13 +774,14 @@ fn return_to_terminal(app: &mut App) {
             .spawn()
         {
             Ok(_) => {
-                app.status = app
-                    .language
-                    .text(
-                        "Returned to terminal; Coach keeps the context",
-                        "已返回原终端；Coach 会继续保留上下文",
-                    )
-                    .to_owned()
+                app.status = success_status.unwrap_or_else(|| {
+                    app.language
+                        .text(
+                            "Returned to terminal; Coach keeps the context",
+                            "已返回原终端；Coach 会继续保留上下文",
+                        )
+                        .to_owned()
+                })
             }
             Err(error) => {
                 app.status = format!(
@@ -782,7 +798,10 @@ fn return_to_terminal(app: &mut App) {
 }
 
 fn copy_selected(app: &mut App) -> Result<()> {
-    let Some(command) = app.selected_command().map(str::to_owned) else {
+    let Some((command, safety)) = app
+        .selected_suggestion()
+        .map(|suggestion| (suggestion.command.clone(), suggestion.safety))
+    else {
         app.status = app
             .language
             .text("No command is available to copy", "当前没有可复制的命令")
@@ -800,12 +819,100 @@ fn copy_selected(app: &mut App) -> Result<()> {
         .write_all(command.as_bytes())?;
     let status = child.wait()?;
     if status.success() {
+        app.status = action_status(SuggestionAction::Copy, safety, app.language);
+    } else {
         app.status = app
             .language
-            .text("Command copied to clipboard", "命令已复制到剪贴板")
+            .text("Clipboard helper failed", "剪贴板工具执行失败")
             .to_owned();
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum SuggestionAction {
+    Insert,
+    Copy,
+}
+
+fn risk_rating(level: Option<RiskLevel>, language: UiLanguage) -> &'static str {
+    match (level, language) {
+        (Some(RiskLevel::Low), UiLanguage::English) => "LOW",
+        (Some(RiskLevel::Medium), UiLanguage::English) => "MEDIUM",
+        (Some(RiskLevel::High), UiLanguage::English) => "HIGH",
+        (Some(RiskLevel::Critical), UiLanguage::English) => "CRITICAL",
+        (None, UiLanguage::English) => "UNRATED",
+        (Some(RiskLevel::Low), UiLanguage::Chinese) => "低风险",
+        (Some(RiskLevel::Medium), UiLanguage::Chinese) => "中风险",
+        (Some(RiskLevel::High), UiLanguage::Chinese) => "高风险",
+        (Some(RiskLevel::Critical), UiLanguage::Chinese) => "严重风险",
+        (None, UiLanguage::Chinese) => "未评级",
+    }
+}
+
+fn safety_badge(safety: SafetyClassification, language: UiLanguage) -> String {
+    let mut badge = risk_rating(safety.level, language).to_owned();
+    if safety.coverage == AnalysisCoverage::Partial {
+        badge.push_str(language.text("/PARTIAL", "/部分"));
+    }
+    if !safety.safety_rules_enabled {
+        badge.push_str(language.text("/RULES OFF", "/规则关"));
+    }
+    format!("[{badge}]")
+}
+
+fn safety_summary(safety: SafetyClassification, language: UiLanguage) -> String {
+    let mut parts = vec![risk_rating(safety.level, language)];
+    match safety.coverage {
+        AnalysisCoverage::Recognized => {}
+        AnalysisCoverage::Partial => {
+            parts.push(language.text("partial coverage", "部分识别"));
+        }
+        AnalysisCoverage::Unknown => {
+            parts.push(language.text("unknown command", "未识别命令"));
+        }
+    }
+    if !safety.safety_rules_enabled {
+        parts.push(language.text("destructive rules off", "破坏性规则已关闭"));
+    }
+    parts.join(" · ")
+}
+
+fn safety_style(safety: SafetyClassification) -> Style {
+    let color = match safety.level {
+        Some(RiskLevel::Low) => Color::Green,
+        Some(RiskLevel::Medium) | None => Color::Yellow,
+        Some(RiskLevel::High) => Color::LightRed,
+        Some(RiskLevel::Critical) => Color::Red,
+    };
+    let style = Style::default().fg(color);
+    if safety.level.is_none_or(|level| level >= RiskLevel::High) {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+fn action_status(
+    action: SuggestionAction,
+    safety: SafetyClassification,
+    language: UiLanguage,
+) -> String {
+    let classification = safety_summary(safety, language);
+    match (action, language) {
+        (SuggestionAction::Insert, UiLanguage::English) => format!(
+            "Insert only · {classification} · sent to the original terminal; review it and press Enter yourself"
+        ),
+        (SuggestionAction::Insert, UiLanguage::Chinese) => {
+            format!("仅插入 · {classification} · 已发送到原终端；请检查后自行按 Enter")
+        }
+        (SuggestionAction::Copy, UiLanguage::English) => {
+            format!("Copy only · {classification} · clipboard updated; nothing executed")
+        }
+        (SuggestionAction::Copy, UiLanguage::Chinese) => {
+            format!("仅复制 · {classification} · 已写入剪贴板；未执行任何命令")
+        }
+    }
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
@@ -875,9 +982,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
         Span::raw(app.language.text(" Return  ", " 返回终端  ")),
         Span::styled("⌥I/Tab", Style::default().fg(Color::Yellow)),
-        Span::raw(app.language.text(" Insert & return  ", " 插入并返回  ")),
+        Span::raw(
+            app.language
+                .text(" Insert only & return  ", " 仅插入并返回  "),
+        ),
         Span::styled("⌥Y/⌃Y", Style::default().fg(Color::Yellow)),
-        Span::raw(app.language.text(" Copy  ", " 复制  ")),
+        Span::raw(app.language.text(" Copy only  ", " 仅复制  ")),
         Span::styled("↑↓", Style::default().fg(Color::Yellow)),
         Span::raw(app.language.text(" Select  ", " 选择  ")),
         Span::styled("?", Style::default().fg(Color::Yellow)),
@@ -933,7 +1043,15 @@ fn draw_context(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let recommendations: Vec<ListItem<'_>> = app
         .recommendations
         .iter()
-        .map(|command| ListItem::new(command.as_str()))
+        .map(|suggestion| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{} ", safety_badge(suggestion.safety, app.language)),
+                    safety_style(suggestion.safety),
+                ),
+                Span::raw(suggestion.command.as_str()),
+            ]))
+        })
         .collect();
     let list = List::new(recommendations)
         .block(
@@ -1036,12 +1154,12 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, language: UiLanguage) {
         )),
         Line::from(language.text("↑ / ↓      Select suggestion", "↑ / ↓      选择推荐命令")),
         Line::from(language.text(
-            "Option+I / Tab / F2  Insert suggestion and return",
-            "Option+I / Tab / F2  插入推荐命令并返回原终端",
+            "Option+I / Tab / F2  Insert only, return, then review and press Enter",
+            "Option+I / Tab / F2  仅插入并返回；检查后仍需自行按 Enter",
         )),
         Line::from(language.text(
-            "Option+Y / Ctrl+Y / F3 Copy suggestion",
-            "Option+Y / Ctrl+Y / F3 复制推荐命令",
+            "Option+Y / Ctrl+Y / F3 Copy only; never run the command",
+            "Option+Y / Ctrl+Y / F3 仅复制；不会执行命令",
         )),
         Line::from(language.text(
             "PgUp/PgDn or mouse wheel  Scroll conversation",
@@ -1051,8 +1169,8 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, language: UiLanguage) {
         Line::default(),
         Line::from(Span::styled(
             language.text(
-                "Suggestions are never executed automatically.",
-                "所有建议都不会自动执行。",
+                "Every suggestion is locally rated before insert/copy; UNRATED is not safe.",
+                "每条建议在插入/复制前都会本地评级；“未评级”不等于安全。",
             ),
             Style::default().fg(Color::Yellow),
         )),
@@ -1430,6 +1548,32 @@ mod tests {
     fn multiline_code_blocks_are_not_split_into_partial_commands() {
         let answer = "```zsh\nfor file in *; do\n  echo $file\ndone\n```";
         assert!(extract_commands(answer).is_empty());
+    }
+
+    #[test]
+    fn suggestion_actions_show_honest_local_safety_classification() {
+        let engine = SafetyEngine::new();
+        let low = SafetyClassification::from(&engine.risk_lens("git status"));
+        let critical = SafetyClassification::from(&engine.risk_lens("rm -rf /"));
+        let unknown = SafetyClassification::from(&engine.risk_lens("company-tool deploy"));
+        let partial =
+            SafetyClassification::from(&engine.risk_lens("git status && company-tool deploy"));
+
+        assert_eq!(safety_badge(low, UiLanguage::English), "[LOW]");
+        assert_eq!(safety_badge(critical, UiLanguage::Chinese), "[严重风险]");
+        assert_eq!(safety_badge(unknown, UiLanguage::English), "[UNRATED]");
+        assert_eq!(
+            safety_badge(partial, UiLanguage::English),
+            "[UNRATED/PARTIAL]"
+        );
+        assert!(
+            action_status(SuggestionAction::Copy, unknown, UiLanguage::English)
+                .contains("unknown command · clipboard updated; nothing executed")
+        );
+        assert!(
+            action_status(SuggestionAction::Insert, critical, UiLanguage::Chinese)
+                .contains("已发送到原终端；请检查后自行按 Enter")
+        );
     }
 
     #[test]
