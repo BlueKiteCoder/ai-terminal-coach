@@ -71,7 +71,8 @@ inspectable, bounded, and removable.
   recipes and explicit provider, retention, routing, and compatibility contracts.
 - [x] Reproducible dual-architecture release automation, archive verification, checksums,
   changelog, upgrade notes, and fail-closed signing/notarization gates.
-- [ ] Small benchmark dashboard for shell hook latency, startup time, and binary size.
+- [x] A native benchmark dashboard with enforced budgets for shell hook latency, executable
+  startup, and stripped binary size on `main` and dual-architecture release checks.
 
 Exit gate: contributors can reproduce failures, add an analyzer rule or terminal adapter, and
 verify their change without access to a private AI provider.

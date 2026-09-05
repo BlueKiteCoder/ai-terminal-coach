@@ -26,3 +26,24 @@ jobs:
       - run: cargo run --locked -p aicoach-core --example render_demo -- --check docs/assets/workflow.svg
       - run: zsh scripts/test-zsh-integration.zsh
       - run: zsh scripts/test-onboarding-e2e.zsh
+
+  performance:
+    name: Performance budgets
+    if: github.event_name == 'push'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: performance-arm64
+      - run: cargo build --release --workspace --locked
+      - name: Measure and publish performance dashboard
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          report=$(scripts/benchmark-product.zsh --markdown)
+          print -r -- "$report"
+          print -r -- "$report" >> "$GITHUB_STEP_SUMMARY"
