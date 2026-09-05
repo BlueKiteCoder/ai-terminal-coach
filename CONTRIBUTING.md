@@ -20,6 +20,8 @@ cargo test --workspace --locked
 zsh scripts/test-zsh-integration.zsh
 zsh scripts/test-onboarding-e2e.zsh
 zsh scripts/benchmark-zsh-hooks.zsh
+cargo build --release --workspace --locked
+zsh scripts/benchmark-product.zsh
 ```
 
 AI provider tests must use local mocks. Never commit API keys, credentials,
@@ -29,6 +31,10 @@ generated release archives.
 Run `zsh scripts/check-no-secrets.sh` and `zsh scripts/check-actions-pinned.sh`
 before pushing. The same credential and immutable-action regression checks run
 in CI.
+
+Performance budgets and measurement details are documented in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md). Include before/after numbers when changing synchronous
+Zsh hooks or adding a release dependency.
 
 ## Pull requests
 

@@ -554,6 +554,13 @@ Meta 字节，验证校准、落盘与 Zsh widget 绑定。性能脚本实测 so
 `cargo run --locked -p aicoach-core --example render_demo -- docs/assets/workflow.svg`
 重新生成，CI 会拒绝过期的演示内容。
 
+## 性能预算
+
+`scripts/benchmark-product.zsh` 实测 Zsh integration 加载、同步 `preexec`/`precmd`、
+三个 release 可执行文件的启动中位数与合计体积。任一指标超过公开预算都会让 CI 失败；
+`--markdown` 生成 GitHub Job Summary，`--json` 可供外部工具读取。当前主分支和双架构
+测量入口、方法与噪声边界见 [Performance Budgets](docs/PERFORMANCE.md)。
+
 ## 目录与架构
 
 ```text
@@ -615,7 +622,8 @@ AI 不代替终端，也不代替用户执行命令。即使建议来自结构�
 
 本项目使用 [MIT License](LICENSE) 开源。贡献指南见
 [CONTRIBUTING.md](CONTRIBUTING.md)，工程入口见
-[Architecture](docs/ARCHITECTURE.md) 与 [IPC Protocol](docs/PROTOCOL.md)。
+[Architecture](docs/ARCHITECTURE.md)、[IPC Protocol](docs/PROTOCOL.md) 与
+[Performance Budgets](docs/PERFORMANCE.md)。
 
 ## English overview
 

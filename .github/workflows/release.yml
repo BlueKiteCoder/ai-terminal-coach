@@ -66,6 +66,7 @@ jobs:
 
       - run: zsh scripts/check-no-secrets.sh
       - run: zsh scripts/check-actions-pinned.sh
+      - run: zsh scripts/check-workflow-shell-safety.zsh
 
       - name: Validate version, tag, and release ancestry
         id: metadata
@@ -198,6 +199,16 @@ jobs:
           scripts/package-release.sh "${{ needs.validate.outputs.version }}"
           cmp "$RUNNER_TEMP/first.sha256" "$checksum"
 
+      - name: Record native performance dashboard
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          benchmark_exit=0
+          report=$(scripts/benchmark-product.zsh --markdown) || benchmark_exit=$?
+          print -r -- "$report"
+          print -r -- "$report" >> "$GITHUB_STEP_SUMMARY"
+          exit "$benchmark_exit"
+
       - name: Upload verified archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -265,9 +276,9 @@ jobs:
               --issuer "$APPLE_NOTARY_ISSUER_ID" \
               --wait --timeout 30m --output-format json)
             print -r -- "$result"
-            status=$(print -r -- "$result" | plutil -extract status raw -o - -)
-            [[ "$status" == Accepted ]] || {
-              print -u2 -- "Apple notarization rejected ${archive:t}: $status"
+            notary_status=$(print -r -- "$result" | plutil -extract status raw -o - -)
+            [[ "$notary_status" == Accepted ]] || {
+              print -u2 -- "Apple notarization rejected ${archive:t}: $notary_status"
               exit 1
             }
           done

@@ -20,6 +20,8 @@ All notable user-visible changes are recorded here. This project follows
   without content, then clear one session, history, fingerprints, logs, or all transient data.
 - Contributor architecture and IPC v2 guides define module ownership, request/event routing,
   extension recipes, compatibility rules, and the non-negotiable provider and ZLE boundaries.
+- Native performance dashboards measure Zsh hook latency, warmed executable startup, and stripped
+  binary size on `main` and dual-architecture release checks, failing when public budgets regress.
 
 ### Security
 
