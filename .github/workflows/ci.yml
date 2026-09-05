@@ -44,6 +44,8 @@ jobs:
         shell: zsh {0}
         run: |
           set -euo pipefail
-          report=$(scripts/benchmark-product.zsh --markdown)
+          status=0
+          report=$(scripts/benchmark-product.zsh --markdown) || status=$?
           print -r -- "$report"
           print -r -- "$report" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

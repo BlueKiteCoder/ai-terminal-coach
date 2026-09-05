@@ -202,9 +202,11 @@ jobs:
         shell: zsh {0}
         run: |
           set -euo pipefail
-          report=$(scripts/benchmark-product.zsh --markdown)
+          status=0
+          report=$(scripts/benchmark-product.zsh --markdown) || status=$?
           print -r -- "$report"
           print -r -- "$report" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       - name: Upload verified archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

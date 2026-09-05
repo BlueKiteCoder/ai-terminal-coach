@@ -12,7 +12,7 @@ workflow](https://github.com/BlueKiteCoder/ai-terminal-coach/actions/workflows/r
 
 | Metric | Budget | Measurement |
 |---|---:|---|
-| Zsh integration source | 50 ms | One clean source with widget/hook registration stubbed |
+| Zsh integration source | 50 ms p50 | Median of 9 loads with widget/hook registration stubbed |
 | Synchronous `preexec` work | 10 ms average | 2,000 in-process calls; socket delivery stubbed |
 | Synchronous `precmd` work | 10 ms average | 2,000 in-process calls; socket delivery stubbed |
 | `aicoach --version` startup | 100 ms p50 | Median of 40 warmed process launches |

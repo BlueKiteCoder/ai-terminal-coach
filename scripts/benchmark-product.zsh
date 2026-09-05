@@ -131,7 +131,7 @@ case $format in
     status_for $total_binary_bytes $binary_budget_bytes
     printf '| Combined release executables | %.3f MiB | ≤ 32 MiB | %s |\n' "$total_binary_mib" "$REPLY"
     print
-    print 'Startup is the median of 40 warmed process launches. Hooks use 2,000 in-process iterations.'
+    print 'Source is the median of 9 loads; startup is the median of 40 warmed process launches. Hooks use 2,000 in-process iterations.'
     ;;
   human)
     printf 'AI Terminal Coach performance (%s)\n' "$(uname -m)"

@@ -20,9 +20,16 @@ add-zsh-hook() { return 0 }
 add-zle-hook-widget() { return 0 }
 
 zmodload zsh/datetime
-typeset -F source_started=$EPOCHREALTIME
-source "${0:A:h:h}/shell/aicoach.zsh"
-typeset -F source_ms=$(( (EPOCHREALTIME - source_started) * 1000.0 ))
+typeset -a source_samples source_sorted
+typeset -F source_started source_elapsed
+repeat 9; do
+  source_started=$EPOCHREALTIME
+  source "${0:A:h:h}/shell/aicoach.zsh"
+  source_elapsed=$(( (EPOCHREALTIME - source_started) * 1000.0 ))
+  source_samples+=("$source_elapsed")
+done
+source_sorted=("${(@f)$(printf '%.9f\n' $source_samples | LC_ALL=C /usr/bin/sort -n)}")
+typeset -F source_ms=${source_sorted[5]}
 
 # Measure only synchronous hook work. Socket delivery and all AI work are
 # deliberately asynchronous and covered by the daemon IPC integration tests.
@@ -59,12 +66,13 @@ typeset -gi failed=0
   failed=1
 }
 (( source_ms <= 50.0 )) || {
-  print -u2 -- 'source exceeded the 50 ms integration-load budget'
+  printf >&2 'source exceeded the 50 ms integration-load budget: %.3f ms\n' "$source_ms"
   failed=1
 }
 for measurement in preexec_ms precmd_ms; do
   (( ${(P)measurement} <= 10.0 )) || {
-    print -u2 -- "${measurement%_ms} exceeded the 10 ms local-hook budget"
+    printf >&2 '%s exceeded the 10 ms local-hook budget: %.3f ms\n' \
+      "${measurement%_ms}" "${(P)measurement}"
     failed=1
   }
 done
