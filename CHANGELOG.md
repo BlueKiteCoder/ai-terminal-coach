@@ -18,6 +18,8 @@ All notable user-visible changes are recorded here. This project follows
   a final resolution entered interactively outside normal Shell history.
 - Local Data Controls inventory every persistent, Keychain, runtime, and daemon-memory category
   without content, then clear one session, history, fingerprints, logs, or all transient data.
+- Contributor architecture and IPC v2 guides define module ownership, request/event routing,
+  extension recipes, compatibility rules, and the non-negotiable provider and ZLE boundaries.
 
 ### Security
 
