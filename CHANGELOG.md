@@ -16,6 +16,8 @@ All notable user-visible changes are recorded here. This project follows
   surfaces only changed cwd, Python/Conda activation, and bounded Git metadata without AI access.
 - Session Checkpoints name a bounded troubleshooting interval, focus its Capsule timeline, and add
   a final resolution entered interactively outside normal Shell history.
+- Local Data Controls inventory every persistent, Keychain, runtime, and daemon-memory category
+  without content, then clear one session, history, fingerprints, logs, or all transient data.
 
 ### Security
 
@@ -27,6 +29,8 @@ All notable user-visible changes are recorded here. This project follows
   incomplete Git probes, and never add their comparison report to provider prompts.
 - Checkpoint names and resolutions are terminal-safe, length-bounded, daemon-memory-only, removed
   from all provider prompts, and force-redacted when a Capsule is exported.
+- Data inventory never prints stored content or reads the Keychain secret; session clearing
+  cancels active AI work, removes pending failure links, and cannot delete config or credentials.
 
 ### Fixed
 

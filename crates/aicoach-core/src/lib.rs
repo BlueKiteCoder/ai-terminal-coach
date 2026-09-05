@@ -4,6 +4,9 @@
 //! operations are suitable for latency-sensitive shell hooks and can be reused
 //! by the daemon, CLI, IPC protocol, and TUI.
 
+pub const MAX_DAEMON_LOG_FILES: usize = 48;
+pub const MAX_PERSISTED_HISTORY_SESSIONS: usize = 20;
+
 pub mod analyzer;
 pub mod command_patch;
 pub mod config;

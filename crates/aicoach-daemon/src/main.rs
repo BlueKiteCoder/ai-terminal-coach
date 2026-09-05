@@ -164,7 +164,6 @@ fn init_logging(logs_dir: &Path) -> tracing_appender::non_blocking::WorkerGuard 
 }
 
 fn prune_logs(logs_dir: &Path) -> std::io::Result<()> {
-    const MAX_LOG_FILES: usize = 48;
     let mut logs = fs::read_dir(logs_dir)?
         .filter_map(Result::ok)
         .filter(|entry| {
@@ -177,7 +176,9 @@ fn prune_logs(logs_dir: &Path) -> std::io::Result<()> {
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
     logs.sort_unstable();
-    let remove_count = logs.len().saturating_sub(MAX_LOG_FILES - 1);
+    let remove_count = logs
+        .len()
+        .saturating_sub(aicoach_core::MAX_DAEMON_LOG_FILES - 1);
     for path in logs.into_iter().take(remove_count) {
         fs::remove_file(path)?;
     }

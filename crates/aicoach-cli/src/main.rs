@@ -2,10 +2,11 @@
 
 mod capsule;
 mod checkpoint;
+mod data;
 mod onboarding;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::{
     env, fs,
@@ -68,6 +69,8 @@ enum Commands {
     Memory(MemoryArgs),
     /// Name, resolve, or clear the active terminal troubleshooting checkpoint.
     Checkpoint(CheckpointArgs),
+    /// Inventory and precisely clear local data without exposing its contents.
+    Data(DataArgs),
     /// Toggle the native Terminal.app/iTerm2 Coach window.
     Toggle(ToggleArgs),
 }
@@ -197,6 +200,40 @@ enum CheckpointAction {
     Clear,
 }
 
+#[derive(Args, Debug)]
+struct DataArgs {
+    #[command(subcommand)]
+    action: Option<DataAction>,
+}
+
+#[derive(Subcommand, Debug)]
+enum DataAction {
+    /// Show every product-managed persistent and in-memory data category.
+    Status(OutputArgs),
+    /// List per-session daemon memory counts without command or chat content.
+    Sessions(OutputArgs),
+    /// Delete one explicit local-data scope.
+    Clear(DataClearArgs),
+}
+
+#[derive(Args, Debug)]
+struct DataClearArgs {
+    #[arg(value_enum)]
+    scope: DataScope,
+    /// Shell session UUID for the session scope. Defaults to the active terminal.
+    #[arg(long, default_value = "")]
+    session: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DataScope {
+    Session,
+    History,
+    Fingerprints,
+    Logs,
+    All,
+}
+
 #[derive(Clone, Debug)]
 struct Paths {
     home: PathBuf,
@@ -207,6 +244,8 @@ struct Paths {
     run_dir: PathBuf,
     logs_dir: PathBuf,
     failure_memory: PathBuf,
+    history: PathBuf,
+    window_state: PathBuf,
     socket: PathBuf,
     pid: PathBuf,
     launch_agents: PathBuf,
@@ -233,6 +272,8 @@ impl Paths {
             config: config_dir.join("config.toml"),
             data_dir,
             failure_memory: state_dir.join("failure-memory.json"),
+            history: state_dir.join("history.json"),
+            window_state: state_dir.join("window-state.json"),
             socket: run_dir.join("aicoach.sock"),
             pid: run_dir.join("aicoachd.pid"),
             daemon_plist: launch_agents.join(format!("{DAEMON_LABEL}.plist")),
@@ -317,6 +358,7 @@ fn run() -> Result<()> {
         Commands::Capsule(args) => capsule::export(&paths, &args),
         Commands::Memory(args) => memory_command(&paths, args.action),
         Commands::Checkpoint(args) => checkpoint::run(&paths, &args),
+        Commands::Data(args) => data::run(&paths, &args),
         Commands::Toggle(args) => toggle(&paths, &args),
     }
 }
@@ -1730,6 +1772,36 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn data_commands_require_an_explicit_clear_scope() {
+        let status = Cli::try_parse_from(["aicoach", "data", "status", "--json"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Data(DataArgs {
+                action: Some(DataAction::Status(OutputArgs { json: true }))
+            })
+        ));
+        let clear = Cli::try_parse_from([
+            "aicoach",
+            "data",
+            "clear",
+            "session",
+            "--session",
+            "00000000-0000-4000-8000-000000000001",
+        ])
+        .unwrap();
+        assert!(matches!(
+            clear.command,
+            Commands::Data(DataArgs {
+                action: Some(DataAction::Clear(DataClearArgs {
+                    scope: DataScope::Session,
+                    ..
+                }))
+            })
+        ));
+        assert!(Cli::try_parse_from(["aicoach", "data", "clear"]).is_err());
     }
 
     #[test]

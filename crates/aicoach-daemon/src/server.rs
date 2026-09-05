@@ -20,9 +20,10 @@ use aicoach_core::{
 };
 use aicoach_ipc::{
     CheckpointOperation, ClientCapabilities, ClientKind, CompletionOperation, CompletionResult,
-    Event, EventBody, Hint, Message, PROTOCOL_VERSION, Request, RequestBody, Response,
-    ResponseResult, RiskLensResult, SafetyClassification, SessionContext, SessionId, Severity,
-    WireProtocol, decode_incoming, encode_outgoing,
+    DaemonDataResult, DataClearScope, DataOperation, Event, EventBody, Hint, Message,
+    PROTOCOL_VERSION, Request, RequestBody, Response, ResponseResult, RiskLensResult,
+    SafetyClassification, SessionContext, SessionId, Severity, WireProtocol, decode_incoming,
+    encode_outgoing,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -43,8 +44,8 @@ use tracing::{debug, info, warn};
 use crate::{
     capture::capture_screen_tail,
     state::{
-        ActiveRequestKind, AnalysisJob, CheckpointError, ConnectionId, SessionLimits,
-        SessionManager,
+        ActiveRequestKind, AnalysisJob, CheckpointError, ConnectionId, FinishCommand,
+        SessionLimits, SessionManager,
     },
 };
 
@@ -555,7 +556,7 @@ impl Daemon {
                     send_missing_session(&sender, &request).await;
                     return;
                 };
-                let Some(job) =
+                let Some(finished) =
                     self.sessions
                         .finish_command(session_id, request.request_id, params, None)
                 else {
@@ -570,6 +571,10 @@ impl Daemon {
                     return;
                 };
                 send_accepted(&sender, &request).await;
+                let FinishCommand::Recorded(job) = finished else {
+                    return;
+                };
+                let job = *job;
                 if let Some(recall) = self.observe_failure_memory(&job) {
                     self.send_session_event(Event::new(
                         job.session_id,
@@ -874,6 +879,138 @@ impl Daemon {
                         send_error(&sender, &request, code, message, false).await;
                     }
                 }
+            }
+            RequestBody::Data(params) => {
+                let (result, affected) = match params.operation {
+                    DataOperation::Inventory => {
+                        let mut sessions = self.sessions.data_inventory();
+                        if let Some(memory) = self.failure_memory.lock().as_ref() {
+                            for session in &mut sessions {
+                                session.pending_failure = memory.has_pending(session.session_id.0);
+                            }
+                        }
+                        (
+                            DaemonDataResult::Inventory {
+                                sessions,
+                                source_card_cache_entries: self.source_card_cache.read().len(),
+                                limits: self.sessions.data_limits(),
+                            },
+                            Vec::new(),
+                        )
+                    }
+                    DataOperation::ClearSession => {
+                        let Some(session_id) = request.session_id else {
+                            send_missing_session(&sender, &request).await;
+                            return;
+                        };
+                        let Some(mut removed) = self
+                            .sessions
+                            .clear_session_data(session_id, params.exclude_active_command)
+                        else {
+                            send_unknown_session(&sender, &request).await;
+                            return;
+                        };
+                        removed.pending_failures =
+                            self.failure_memory.lock().as_mut().map_or(0, |memory| {
+                                usize::from(memory.clear_pending(session_id.0))
+                            });
+                        (
+                            DaemonDataResult::Cleared {
+                                scope: DataClearScope::Session,
+                                removed,
+                            },
+                            vec![session_id],
+                        )
+                    }
+                    DataOperation::ClearChatHistory => {
+                        let (affected, removed) = self.sessions.clear_chat_history();
+                        (
+                            DaemonDataResult::Cleared {
+                                scope: DataClearScope::ChatHistory,
+                                removed,
+                            },
+                            affected,
+                        )
+                    }
+                    DataOperation::ClearFailureMemory => {
+                        let mut removed = aicoach_ipc::DataRemovalSummary::default();
+                        let clear_result = {
+                            let mut memory = self.failure_memory.lock();
+                            memory
+                                .as_mut()
+                                .map(aicoach_core::FailureMemory::clear)
+                                .transpose()
+                        };
+                        let cleared = match clear_result {
+                            Ok(cleared) => cleared,
+                            Err(error) => {
+                                warn!(error = %error, "could not clear local failure memory");
+                                send_error(
+                                    &sender,
+                                    &request,
+                                    "data_clear_failed",
+                                    "failure memory could not be cleared; original data was preserved",
+                                    false,
+                                )
+                                .await;
+                                return;
+                            }
+                        };
+                        if let Some((fingerprints, pending)) = cleared {
+                            removed.failure_fingerprints = fingerprints;
+                            removed.pending_failures = pending;
+                        }
+                        (
+                            DaemonDataResult::Cleared {
+                                scope: DataClearScope::FailureMemory,
+                                removed,
+                            },
+                            Vec::new(),
+                        )
+                    }
+                    DataOperation::ClearAllTransient => {
+                        let (affected, mut removed) = self
+                            .sessions
+                            .clear_all_transient(params.exclude_active_command);
+                        removed.pending_failures = self
+                            .failure_memory
+                            .lock()
+                            .as_mut()
+                            .map_or(0, aicoach_core::FailureMemory::clear_all_pending);
+                        removed.source_card_cache_entries = {
+                            let mut cache = self.source_card_cache.write();
+                            let count = cache.len();
+                            cache.clear();
+                            count
+                        };
+                        (
+                            DaemonDataResult::Cleared {
+                                scope: DataClearScope::AllTransient,
+                                removed,
+                            },
+                            affected,
+                        )
+                    }
+                };
+                let scope = match &result {
+                    DaemonDataResult::Cleared { scope, .. } => Some(*scope),
+                    DaemonDataResult::Inventory { .. } => None,
+                };
+                if let Some(scope) = scope {
+                    for session_id in affected {
+                        self.send_session_event(Event::new(
+                            session_id,
+                            Some(request.request_id),
+                            EventBody::DataCleared { scope },
+                        ))
+                        .await;
+                    }
+                }
+                send_response(
+                    &sender,
+                    Response::ok(&request, ResponseResult::Data(Box::new(result))),
+                )
+                .await;
             }
             RequestBody::InsertBuffer(mut params) => {
                 if contains_terminal_control(&params.command) {
@@ -2676,6 +2813,7 @@ fn request_method(body: &RequestBody) -> &'static str {
         RequestBody::Chat(_) => "chat",
         RequestBody::Context(_) => "context",
         RequestBody::Checkpoint(_) => "checkpoint",
+        RequestBody::Data(_) => "data",
         RequestBody::InsertBuffer(_) => "insert_buffer",
         RequestBody::Disconnect => "disconnect",
         RequestBody::Ping => "ping",

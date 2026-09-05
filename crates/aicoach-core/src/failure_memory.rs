@@ -179,6 +179,42 @@ impl FailureMemory {
         &self.snapshot.entries
     }
 
+    pub fn has_pending(&self, session_id: Uuid) -> bool {
+        self.pending.contains_key(&session_id)
+    }
+
+    pub fn clear_pending(&mut self, session_id: Uuid) -> bool {
+        self.pending.remove(&session_id).is_some()
+    }
+
+    pub fn clear_all_pending(&mut self) -> usize {
+        let removed = self.pending.len();
+        self.pending.clear();
+        removed
+    }
+
+    /// Remove both persisted fingerprints and unresolved per-session links.
+    /// The in-memory state is restored if the owner-only atomic write fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O or serialization error when the empty snapshot cannot
+    /// be persisted atomically.
+    pub fn clear(&mut self) -> Result<(usize, usize), FailureMemoryError> {
+        let previous_snapshot = self.snapshot.clone();
+        let previous_pending = self.pending.clone();
+        let fingerprints = self.snapshot.entries.len();
+        let pending = self.pending.len();
+        self.snapshot.entries.clear();
+        self.pending.clear();
+        if let Err(error) = self.persist() {
+            self.snapshot = previous_snapshot;
+            self.pending = previous_pending;
+            return Err(error);
+        }
+        Ok((fingerprints, pending))
+    }
+
     /// Observe a completed command and update only local state.
     /// Call [`Self::persist`] when the returned observation is changed.
     #[allow(clippy::too_many_arguments)]
@@ -943,5 +979,44 @@ mod tests {
             .unwrap();
         assert_eq!(recall.successful_follow_up, "zztool repair [PRIVATE]");
         assert!(!recall.reusable);
+    }
+
+    #[test]
+    fn pending_failures_can_be_removed_without_touching_persisted_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = memory(directory.path());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        memory.observe(first, "cargo test", 1, None, Some("failed"), 1_000);
+        memory.observe(second, "cargo build", 1, None, Some("failed"), 1_000);
+        assert!(memory.has_pending(first));
+        assert!(memory.has_pending(second));
+
+        assert!(memory.clear_pending(first));
+        assert!(!memory.has_pending(first));
+        assert!(memory.has_pending(second));
+        assert_eq!(memory.clear_all_pending(), 1);
+        assert!(!memory.has_pending(second));
+        assert!(memory.entries().is_empty());
+    }
+
+    #[test]
+    fn clear_atomically_removes_fingerprints_and_pending_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = memory(directory.path());
+        let resolved = Uuid::new_v4();
+        let pending = Uuid::new_v4();
+        memory.observe(resolved, "cargo test", 1, None, Some("failed"), 1_000);
+        memory.observe(resolved, "cargo clean", 0, None, None, 2_000);
+        memory.observe(pending, "cargo build", 1, None, Some("failed"), 3_000);
+        assert_eq!(memory.entries().len(), 1);
+        assert!(memory.has_pending(pending));
+
+        assert_eq!(memory.clear().unwrap(), (1, 1));
+        assert!(memory.entries().is_empty());
+        assert!(!memory.has_pending(pending));
+        let saved =
+            FailureMemorySnapshot::load(directory.path().join("failure-memory.json")).unwrap();
+        assert!(saved.entries.is_empty());
     }
 }

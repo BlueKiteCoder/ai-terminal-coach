@@ -76,6 +76,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   Markdown。它完全在本机生成、强制脱敏并清除终端控制序列，可一键复制到剪贴板。
 - **Session Checkpoints** 可以给当前排障过程命名、记录最终解决方案，并让 Capsule 自动
   聚焦检查点之后的命令；检查点只存在于当前 daemon 内存，且不会加入 AI 请求。
+- aicoach data 给出不含正文的完整本地数据清单，并能精确清除单个 session、聊天历史、
+  Failure Fingerprints、日志或全部瞬时数据；配置、安装文件和 Keychain 始终单独保留。
 - Provider 不可用时 daemon 自动进入 local-only 模式，Zsh 完全正常工作。
 - 界面状态、本地分析和 AI 回复支持英文与中文；全新安装默认英文。
 - `aicoach onboard` 提供两分钟引导：读取终端实际发送的 Option 按键、拒绝会覆盖
@@ -355,6 +357,36 @@ aicoach checkpoint clear
 不会写入 Failure Fingerprints，也不会进入 completion、analysis 或 chat provider prompt。
 Capsule 导出时仍会强制执行密钥、主目录和自定义隐私规则脱敏。
 
+## 本地数据控制中心
+
+aicoach data 只读取路径、字节数、条目数、保留上限和布尔状态，不打印命令、输出、
+目录、环境变量值、检查点文字或聊天正文，也不会读取 Keychain 中的密钥值。
+
+~~~zsh
+aicoach data
+aicoach data status --json
+aicoach data sessions
+aicoach data sessions --json
+
+aicoach data clear session                 # 当前终端 session
+aicoach data clear session --session UUID  # 指定 session
+aicoach data clear history
+aicoach data clear fingerprints
+aicoach data clear logs
+aicoach data clear all
+~~~
+
+clear session 会清除该 session 的命令/输出摘要、daemon 与 TUI 聊天、允许列表环境快照、
+Session Checkpoint、Environment Drift 基线、待关联失败和活跃 AI 请求，但保留正在使用的
+Shell 连接；清理命令自身也不会重新写回上下文。clear history 只清聊天，clear all
+还会清除所有 daemon 瞬时数据、Failure Fingerprints、日志、窗口状态和运行标记。
+单独清理 fingerprints 或 logs 不会重启 daemon，也不会顺带丢失 session 上下文。
+
+所有 clear 操作都保留 config.toml、安装支持文件、~/.zshrc.aicoach.backup 和 macOS
+Keychain 凭据；Keychain 仍需显式运行 aicoach config delete-key 删除。按 session 清理时，
+已损坏或异常过大的 history.json 不会被覆盖或部分改写。正在打开的 Coach 窗口会收到
+清理事件，丢弃其内存中的旧聊天，避免退出时把已经删除的内容重新保存。
+
 ## Failure Fingerprints：越用越懂当前这台 Mac
 
 当一条命令失败后，daemon 会在当前 session 内等待下一条非观察型成功命令；同一失败
@@ -435,6 +467,7 @@ aicoach config show|path|validate|set|edit|set-key|delete-key
 aicoach logs [-n 100] [--follow]
 aicoach capsule [--last 20] [--failed-only] [--copy] [--output FILE]
 aicoach checkpoint [--session UUID] [start NAME | resolve [RESOLUTION] | status [--json] | clear]
+aicoach data [status [--json] | sessions [--json] | clear session|history|fingerprints|logs|all]
 aicoach memory [status [--json] | list [--json] | clear]
 aicoach toggle [--session UUID] [--tty /dev/ttys001]
 ```
@@ -619,6 +652,13 @@ resolution to its Capsule. Checkpoint metadata is terminal-safe, per-session and
 daemon-memory-only; it is removed before completion, analysis, or chat provider
 requests. Capsule export focuses on commands after the marker and force-redacts
 the resolution before it can leave the machine.
+
+The local data control center inventories every product-managed persistent,
+Keychain, runtime, and daemon-memory category using metadata and counts only.
+Typed clear scopes can erase one session, chat history, failure fingerprints,
+logs, or all transient data. Session clearing cancels active AI work and removes
+its own bookkeeping command without disconnecting the live shell; configuration,
+support files, the shell backup, and Keychain credentials remain separate.
 
 Build and install:
 
