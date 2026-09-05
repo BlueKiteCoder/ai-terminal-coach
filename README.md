@@ -74,6 +74,8 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   private key/SSH key/敏感环境变量脱敏；可以关闭。
 - `aicoach capsule` 把当前终端最近的命令、状态、耗时和已保留的可用输出整理成可分享的
   Markdown。它完全在本机生成、强制脱敏并清除终端控制序列，可一键复制到剪贴板。
+- **Session Checkpoints** 可以给当前排障过程命名、记录最终解决方案，并让 Capsule 自动
+  聚焦检查点之后的命令；检查点只存在于当前 daemon 内存，且不会加入 AI 请求。
 - Provider 不可用时 daemon 自动进入 local-only 模式，Zsh 完全正常工作。
 - 界面状态、本地分析和 AI 回复支持英文与中文；全新安装默认英文。
 - `aicoach onboard` 提供两分钟引导：读取终端实际发送的 Option 按键、拒绝会覆盖
@@ -331,6 +333,28 @@ Capsule 直接读取 daemon 已经保留的有界 session context，不会发起
 控制序列，并用动态 Markdown fence 包住不可信输出。脱敏属于防御性 best effort，
 公开分享前仍应人工检查。
 
+## Session Checkpoints：把排障过程变成可复用答案
+
+开始处理一个具体问题时创建检查点；解决后不带参数运行 `resolve`，会在 Shell history
+之外读取最终说明。之后生成的 Capsule 会自动省略检查点之前的命令，并加入强制脱敏的
+最终解决方案。
+
+```zsh
+aicoach checkpoint start "Intel build regression"
+# ...继续正常排查...
+aicoach checkpoint resolve       # 交互输入，不进入 Shell history
+aicoach checkpoint status
+aicoach checkpoint status --json
+aicoach capsule --output incident.md
+aicoach checkpoint clear
+```
+
+也可以用 `aicoach checkpoint resolve "Pinned the SDK and reran tests"` 直接记录，但参数会
+进入常规 Shell history。名称与解决方案分别限制为 120/2000 字符并移除终端控制序列。
+检查点按终端 session 隔离，只保存在 daemon 内存；重启 daemon 或 session 淘汰后消失，
+不会写入 Failure Fingerprints，也不会进入 completion、analysis 或 chat provider prompt。
+Capsule 导出时仍会强制执行密钥、主目录和自定义隐私规则脱敏。
+
 ## Failure Fingerprints：越用越懂当前这台 Mac
 
 当一条命令失败后，daemon 会在当前 session 内等待下一条非观察型成功命令；同一失败
@@ -394,9 +418,10 @@ retention_days = 30
 resolution_window_minutes = 10
 ```
 
-Daemon 不把完整 Terminal history 持久化；Failure Fingerprints 的例外边界如上所述，
-可完整查看和删除。日志只记录请求类型、session/request ID、状态和错误种类，不记录
-命令输出、提示词、API key 或响应正文。
+Daemon 不把完整 Terminal history 持久化；Session Checkpoints 和 Environment Drift 基线
+只存在于 daemon 内存，Failure Fingerprints 的例外边界如上所述且可完整查看和删除。
+日志只记录请求类型、session/request ID、状态和错误种类，不记录命令输出、提示词、
+API key 或响应正文。
 
 ## CLI
 
@@ -409,6 +434,7 @@ aicoach doctor [--json]
 aicoach config show|path|validate|set|edit|set-key|delete-key
 aicoach logs [-n 100] [--follow]
 aicoach capsule [--last 20] [--failed-only] [--copy] [--output FILE]
+aicoach checkpoint [--session UUID] [start NAME | resolve [RESOLUTION] | status [--json] | clear]
 aicoach memory [status [--json] | list [--json] | clear]
 aicoach toggle [--session UUID] [--tty /dev/ttys001]
 ```
@@ -559,8 +585,9 @@ AI Terminal Coach is a macOS/Zsh companion that provides local diagnostics,
 safety warnings, a provider-free preflight Risk Lens, explainable token-level
 Command Patches, local-manual Source Cards, AI-assisted completion, quick
 terminal chat, share-ready privacy-scrubbed Session Capsules, local-only Failure
-Fingerprints, a provider-free Environment Drift Lens, and a standalone Ratatui
-Coach window. It never presses Enter or executes an AI suggestion.
+Fingerprints, memory-only Session Checkpoints, a provider-free Environment Drift
+Lens, and a standalone Ratatui Coach window. It never presses Enter or executes
+an AI suggestion.
 
 The workflow image above is generated from the real local analyzer, Risk Lens,
 Source Card, Command Patch, and privacy-redaction output. CI verifies the
@@ -586,6 +613,12 @@ in the same daemon session. It reports changed cwd, Python/Conda activation and
 bounded Git metadata. The baseline is memory-only, file contents are not read,
 incomplete Git probes are omitted, and the comparison is never added to an AI
 provider request.
+
+Session Checkpoints name one bounded troubleshooting interval and attach a final
+resolution to its Capsule. Checkpoint metadata is terminal-safe, per-session and
+daemon-memory-only; it is removed before completion, analysis, or chat provider
+requests. Capsule export focuses on commands after the marker and force-redacts
+the resolution before it can leave the machine.
 
 Build and install:
 

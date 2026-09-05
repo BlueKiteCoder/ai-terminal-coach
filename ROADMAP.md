@@ -55,7 +55,7 @@ could happen before they choose to run it.
   follow-up seen last time—without claiming causality or uploading long-lived command history.
 - [x] **Environment Drift Lens:** compare safe environment/Git metadata between the last success
   and current failure to expose changed branches, virtual environments, directories, or tools.
-- [ ] **Session Checkpoints:** let users name a bounded troubleshooting session and append the
+- [x] **Session Checkpoints:** let users name a bounded troubleshooting session and append the
   final resolution to its Capsule.
 - [ ] Local retention controls, per-session deletion, and a complete data inventory command.
 

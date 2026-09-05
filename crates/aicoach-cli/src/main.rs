@@ -1,6 +1,7 @@
 #![allow(clippy::items_after_statements, clippy::too_many_lines)]
 
 mod capsule;
+mod checkpoint;
 mod onboarding;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -65,6 +66,8 @@ enum Commands {
     Capsule(CapsuleArgs),
     /// Inspect or clear bounded, local-only failure fingerprints.
     Memory(MemoryArgs),
+    /// Name, resolve, or clear the active terminal troubleshooting checkpoint.
+    Checkpoint(CheckpointArgs),
     /// Toggle the native Terminal.app/iTerm2 Coach window.
     Toggle(ToggleArgs),
 }
@@ -167,6 +170,30 @@ enum MemoryAction {
     /// List retained, already-redacted successful follow-up commands.
     List(OutputArgs),
     /// Delete every retained failure fingerprint and restart the daemon if needed.
+    Clear,
+}
+
+#[derive(Args, Debug)]
+struct CheckpointArgs {
+    /// Shell session UUID. Defaults to the most recently focused terminal.
+    #[arg(long, default_value = "")]
+    session: String,
+    #[command(subcommand)]
+    action: Option<CheckpointAction>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CheckpointAction {
+    /// Start or replace a named, memory-only troubleshooting checkpoint.
+    Start { name: String },
+    /// Record the final resolution for the active checkpoint.
+    Resolve {
+        /// Resolution text. Omit it to enter the text outside Shell history.
+        resolution: Option<String>,
+    },
+    /// Show the active checkpoint and its privacy boundary.
+    Status(OutputArgs),
+    /// Clear the active checkpoint without deleting terminal command context.
     Clear,
 }
 
@@ -289,6 +316,7 @@ fn run() -> Result<()> {
         Commands::Logs(args) => logs(&paths, &args),
         Commands::Capsule(args) => capsule::export(&paths, &args),
         Commands::Memory(args) => memory_command(&paths, args.action),
+        Commands::Checkpoint(args) => checkpoint::run(&paths, &args),
         Commands::Toggle(args) => toggle(&paths, &args),
     }
 }
@@ -1656,6 +1684,50 @@ mod tests {
             clear.command,
             Commands::Memory(MemoryArgs {
                 action: Some(MemoryAction::Clear)
+            })
+        ));
+    }
+
+    #[test]
+    fn checkpoint_commands_parse_names_resolutions_and_status_output() {
+        let start = Cli::try_parse_from([
+            "aicoach",
+            "checkpoint",
+            "--session",
+            "00000000-0000-4000-8000-000000000001",
+            "start",
+            "Intel build regression",
+        ])
+        .unwrap();
+        assert!(matches!(
+            start.command,
+            Commands::Checkpoint(CheckpointArgs {
+                action: Some(CheckpointAction::Start { ref name }),
+                ..
+            }) if name == "Intel build regression"
+        ));
+        let resolve = Cli::try_parse_from([
+            "aicoach",
+            "checkpoint",
+            "resolve",
+            "Pinned the SDK and reran tests",
+        ])
+        .unwrap();
+        assert!(matches!(
+            resolve.command,
+            Commands::Checkpoint(CheckpointArgs {
+                action: Some(CheckpointAction::Resolve {
+                    resolution: Some(ref resolution)
+                }),
+                ..
+            }) if resolution == "Pinned the SDK and reran tests"
+        ));
+        let status = Cli::try_parse_from(["aicoach", "checkpoint", "status", "--json"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Checkpoint(CheckpointArgs {
+                action: Some(CheckpointAction::Status(OutputArgs { json: true })),
+                ..
             })
         ));
     }

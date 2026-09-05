@@ -427,6 +427,15 @@ pub fn encode_message(message: &Message) -> Result<String, ZshProtocolError> {
                     serde_json::to_string(context)
                         .map_err(|_| ZshProtocolError::UnsupportedMessage)?,
                 ],
+                ResponseResult::Checkpoint { checkpoint } => vec![
+                    "CHECKPOINT".to_owned(),
+                    response
+                        .session_id
+                        .map_or_else(String::new, |value| value.to_string()),
+                    response.request_id.to_string(),
+                    serde_json::to_string(checkpoint)
+                        .map_err(|_| ZshProtocolError::UnsupportedMessage)?,
+                ],
                 ResponseResult::Pong { .. } => vec!["PONG".to_owned()],
                 ResponseResult::ShutdownAccepted => {
                     vec!["SHUTDOWN".to_owned(), response.request_id.to_string()]

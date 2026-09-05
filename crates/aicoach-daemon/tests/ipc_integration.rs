@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -19,11 +19,11 @@ use aicoach_core::{
 };
 use aicoach_daemon::{Daemon, DaemonOptions};
 use aicoach_ipc::{
-    CancelParams, ChatParams, ClientCapabilities, ClientKind, CommandFinishedParams, CommandId,
-    CommandStartedParams, CompletionParams, ContextParams, EventBody, HelloParams,
-    InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION, RegisterSessionParams, Request,
-    RequestBody, Response, ResponseOutcome, ResponseResult, RiskLensParams, SafetyClassification,
-    SessionId,
+    CancelParams, ChatParams, CheckpointOperation, CheckpointParams, ClientCapabilities,
+    ClientKind, CommandFinishedParams, CommandId, CommandStartedParams, CompletionParams,
+    ContextParams, Event, EventBody, HelloParams, InsertBufferParams, InsertMode, IpcClient,
+    PROTOCOL_VERSION, RegisterSessionParams, Request, RequestBody, Response, ResponseOutcome,
+    ResponseResult, RiskLensParams, SafetyClassification, SessionCheckpoint, SessionId,
 };
 use async_trait::async_trait;
 use futures_util::stream;
@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 struct TestProvider {
     analysis_calls: AtomicUsize,
     completion_calls: AtomicUsize,
+    chat_requests: Mutex<Vec<ChatRequest>>,
     interrupt_stream: bool,
 }
 
@@ -57,9 +58,10 @@ impl AiProvider for TestProvider {
 
     async fn stream_chat(
         &self,
-        _request: ChatRequest,
+        request: ChatRequest,
         _cancellation: CancellationToken,
     ) -> AiResult<ChatStream> {
+        self.chat_requests.lock().unwrap().push(request);
         if self.interrupt_stream {
             Ok(Box::pin(stream::iter([
                 Ok("partial".to_owned()),
@@ -342,6 +344,42 @@ async fn complete_command_at(
         )
         .await
         .unwrap();
+}
+
+async fn update_checkpoint(
+    client: &IpcClient,
+    session: SessionId,
+    operation: CheckpointOperation,
+) -> Option<SessionCheckpoint> {
+    let response = client
+        .send_request(
+            Some(session),
+            RequestBody::Checkpoint(CheckpointParams {
+                operation,
+                exclude_active_command: false,
+            }),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Ok {
+        result: ResponseResult::Checkpoint { checkpoint },
+    } = response.outcome
+    else {
+        panic!("expected checkpoint response")
+    };
+    checkpoint.map(|checkpoint| *checkpoint)
+}
+
+async fn wait_for_chat_done(events: &mut tokio::sync::broadcast::Receiver<Event>) {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(event.body, EventBody::ChatDone) {
+            return;
+        }
+    }
 }
 
 #[tokio::test]
@@ -846,6 +884,92 @@ async fn environment_drift_reports_a_real_git_branch_change() {
     };
     assert!(hint.message.contains("Git branch: main → feature"));
     assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
+
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checkpoint_lifecycle_is_session_local_and_excluded_from_provider_chat() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start(Arc::clone(&provider)).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys019").await;
+
+    let started = update_checkpoint(
+        &shell,
+        session,
+        CheckpointOperation::Start {
+            name: "Intel \u{1b}[31mbuild regression".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.name, "Intel build regression");
+    assert!(started.resolution.is_none());
+
+    let private_resolution = "Set password=checkpoint-provider-private and reran tests";
+    let resolved = update_checkpoint(
+        &shell,
+        session,
+        CheckpointOperation::Resolve {
+            resolution: private_resolution.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved.resolution.as_deref(), Some(private_resolution));
+    assert!(resolved.resolved_at_unix_ms.is_some());
+
+    let mut events = shell.subscribe();
+    let chat = shell
+        .send_request(
+            Some(session),
+            RequestBody::Chat(ChatParams {
+                message: "What should I inspect next?".to_owned(),
+                stream: true,
+                cwd: None,
+                buffer: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        chat.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Accepted
+        }
+    ));
+    wait_for_chat_done(&mut events).await;
+    {
+        let requests = provider.chat_requests.lock().unwrap();
+        let provider_json = serde_json::to_string(requests.last().unwrap()).unwrap();
+        assert!(!provider_json.contains("Intel build regression"));
+        assert!(!provider_json.contains("checkpoint-provider-private"));
+    }
+
+    let context = shell
+        .send_request(
+            Some(session),
+            RequestBody::Context(ContextParams::default()),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Ok {
+        result: ResponseResult::Context(context),
+    } = context.outcome
+    else {
+        panic!("expected session context")
+    };
+    assert_eq!(
+        context.checkpoint.map(|checkpoint| *checkpoint),
+        Some(resolved)
+    );
+
+    assert_eq!(
+        update_checkpoint(&shell, session, CheckpointOperation::Clear).await,
+        None
+    );
 
     shell.close().await.unwrap();
     running.stop().await;

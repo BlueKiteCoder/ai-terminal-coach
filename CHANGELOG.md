@@ -14,6 +14,8 @@ All notable user-visible changes are recorded here. This project follows
   next succeeded last time, with bounded retention plus `aicoach memory status|list|clear` controls.
 - Environment Drift Lens compares a failed command with the latest success in the same session and
   surfaces only changed cwd, Python/Conda activation, and bounded Git metadata without AI access.
+- Session Checkpoints name a bounded troubleshooting interval, focus its Capsule timeline, and add
+  a final resolution entered interactively outside normal Shell history.
 
 ### Security
 
@@ -23,6 +25,8 @@ All notable user-visible changes are recorded here. This project follows
   owner-only, force-redacted independently of provider settings, and never added to AI prompts.
 - Environment Drift baselines remain in daemon memory, read no repository file contents, omit
   incomplete Git probes, and never add their comparison report to provider prompts.
+- Checkpoint names and resolutions are terminal-safe, length-bounded, daemon-memory-only, removed
+  from all provider prompts, and force-redacted when a Capsule is exported.
 
 ### Fixed
 

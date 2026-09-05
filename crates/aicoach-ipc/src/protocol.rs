@@ -219,6 +219,25 @@ pub struct ContextParams {
     pub max_commands: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum CheckpointOperation {
+    Start { name: String },
+    Resolve { resolution: String },
+    Status,
+    Clear,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointParams {
+    #[serde(flatten)]
+    pub operation: CheckpointOperation,
+    /// CLI calls made from the observed shell can exclude their own in-flight
+    /// bookkeeping command from the resulting Capsule interval.
+    #[serde(default)]
+    pub exclude_active_command: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InsertMode {
@@ -281,6 +300,7 @@ pub enum RequestBody {
     Cancel(CancelParams),
     Chat(ChatParams),
     Context(ContextParams),
+    Checkpoint(CheckpointParams),
     InsertBuffer(InsertBufferParams),
     Disconnect,
     Ping,
@@ -358,6 +378,24 @@ pub struct ContextCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCheckpoint {
+    pub name: String,
+    pub started_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_after_command_id: Option<CommandId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_command_id: Option<CommandId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_after_command_id: Option<CommandId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_command_id: Option<CommandId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContext {
     pub session_id: SessionId,
     pub tty: String,
@@ -365,6 +403,8 @@ pub struct SessionContext {
     pub shell: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<Box<SessionCheckpoint>>,
     pub commands: Vec<ContextCommand>,
 }
 
@@ -385,6 +425,10 @@ pub enum ResponseResult {
         message: String,
     },
     Context(SessionContext),
+    Checkpoint {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<Box<SessionCheckpoint>>,
+    },
     Pong {
         unix_ms: u64,
     },
@@ -599,6 +643,41 @@ mod tests {
             panic!("expected command_finished")
         };
         assert!(params.environment.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_request_round_trips_with_a_flat_action() {
+        let request = Request::new(
+            Some(SessionId::new()),
+            RequestBody::Checkpoint(CheckpointParams {
+                operation: CheckpointOperation::Resolve {
+                    resolution: "Pinned the SDK".to_owned(),
+                },
+                exclude_active_command: true,
+            }),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""method":"checkpoint""#));
+        assert!(json.contains(r#""action":"resolve""#));
+        assert!(json.contains(r#""exclude_active_command":true"#));
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+
+        let legacy_json = json.replace(r#","exclude_active_command":true"#, "");
+        let legacy = serde_json::from_str::<Request>(&legacy_json).unwrap();
+        let RequestBody::Checkpoint(params) = legacy.body else {
+            panic!("expected checkpoint request")
+        };
+        assert!(!params.exclude_active_command);
+    }
+
+    #[test]
+    fn old_session_context_without_checkpoint_remains_compatible() {
+        let session_id = SessionId::new();
+        let json = format!(
+            r#"{{"session_id":"{session_id}","tty":"/dev/ttys001","cwd":"/tmp","shell":"zsh","commands":[]}}"#
+        );
+        let context: SessionContext = serde_json::from_str(&json).unwrap();
+        assert!(context.checkpoint.is_none());
     }
 
     #[test]
