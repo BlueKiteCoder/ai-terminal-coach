@@ -8,6 +8,7 @@ pub mod analyzer;
 pub mod command_patch;
 pub mod config;
 pub mod context;
+pub mod failure_memory;
 pub mod git;
 pub mod models;
 pub mod privacy;
@@ -20,10 +21,14 @@ pub use analyzer::{AnalysisCategory, LocalAnalysis, LocalAnalyzer};
 pub use command_patch::{CommandPatch, CommandPatchHunk};
 pub use config::{
     AiConfig, AiModels, AiModelsConfig, AiTimeouts, AiTimeoutsConfig, CoachConfig, Config,
-    ConfigError, ContextConfig, HistoryConfig, KeybindingsConfig, PrivacyConfig, ProductPaths,
-    SafetyConfig, SafetyMode, WindowConfig,
+    ConfigError, ContextConfig, HistoryConfig, KeybindingsConfig, MemoryConfig, PrivacyConfig,
+    ProductPaths, SafetyConfig, SafetyMode, WindowConfig,
 };
 pub use context::ContextManager;
+pub use failure_memory::{
+    FailureFingerprint, FailureMemory, FailureMemoryError, FailureMemoryObservation,
+    FailureMemoryOptions, FailureMemoryRecall, FailureMemorySnapshot,
+};
 pub use git::{GitContextError, collect_git_context, try_collect_git_context};
 pub use models::{
     AnalysisInput, AnalysisResult, ChatMessage, ChatRole, CommandRecord, CompletionInput,

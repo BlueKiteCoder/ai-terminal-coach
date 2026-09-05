@@ -22,6 +22,7 @@ pub struct ProductPaths {
     pub socket_file: PathBuf,
     pub logs_dir: PathBuf,
     pub history_file: PathBuf,
+    pub failure_memory_file: PathBuf,
     pub window_state_file: PathBuf,
 }
 
@@ -47,6 +48,7 @@ impl ProductPaths {
             config_file: config_dir.join("config.toml"),
             logs_dir: data_dir.join("logs"),
             history_file: data_dir.join("history.json"),
+            failure_memory_file: data_dir.join("failure-memory.json"),
             window_state_file: data_dir.join("window-state.json"),
             socket_file: run_dir.join("aicoach.sock"),
             home_dir,
@@ -98,6 +100,7 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub context: ContextConfig,
     pub history: HistoryConfig,
+    pub memory: MemoryConfig,
     pub window: WindowConfig,
 }
 
@@ -300,6 +303,7 @@ impl Config {
         if self.history.enabled && self.history.max_messages == 0 {
             errors.push("history.max_messages must be greater than zero when enabled".to_owned());
         }
+        self.memory.validate(&mut errors);
         if self.window.width < 40 || self.window.height < 10 {
             errors.push("window must be at least 40 columns by 10 rows".to_owned());
         }
@@ -643,6 +647,53 @@ impl Default for HistoryConfig {
     }
 }
 
+/// Bounded, local-only memory for recurring command failures.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    pub max_entries: usize,
+    pub retention_days: u64,
+    pub resolution_window_minutes: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: 128,
+            retention_days: 30,
+            resolution_window_minutes: 10,
+        }
+    }
+}
+
+impl MemoryConfig {
+    fn validate(self, errors: &mut Vec<String>) {
+        if self.enabled && self.max_entries == 0 {
+            errors.push("memory.max_entries must be greater than zero when enabled".to_owned());
+        }
+        if self.max_entries > 4_096 {
+            errors.push("memory.max_entries must not exceed 4096".to_owned());
+        }
+        if self.enabled && self.retention_days == 0 {
+            errors.push("memory.retention_days must be greater than zero when enabled".to_owned());
+        }
+        if self.retention_days > 3_650 {
+            errors.push("memory.retention_days must not exceed 3650".to_owned());
+        }
+        if self.enabled && self.resolution_window_minutes == 0 {
+            errors.push(
+                "memory.resolution_window_minutes must be greater than zero when enabled"
+                    .to_owned(),
+            );
+        }
+        if self.resolution_window_minutes > 24 * 60 {
+            errors.push("memory.resolution_window_minutes must not exceed 1440".to_owned());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowConfig {
@@ -703,6 +754,10 @@ mod tests {
             Path::new("/Users/tester/.aicoach/run/aicoach.sock")
         );
         assert_eq!(paths.logs_dir, Path::new("/Users/tester/.aicoach/logs"));
+        assert_eq!(
+            paths.failure_memory_file,
+            Path::new("/Users/tester/.aicoach/failure-memory.json")
+        );
     }
 
     #[test]
@@ -845,6 +900,26 @@ mod tests {
         assert_eq!(config.coach.language, "en-US");
         assert_eq!(config.ai.timeouts_ms.chat, 90_000);
         assert!(config.privacy.redaction);
+        assert!(config.memory.enabled);
+        assert_eq!(config.memory.max_entries, 128);
+    }
+
+    #[test]
+    fn failure_memory_configuration_is_bounded() {
+        let mut config = Config::default();
+        config.memory.max_entries = 4_097;
+        config.memory.retention_days = 3_651;
+        config.memory.resolution_window_minutes = 1_441;
+        let ConfigError::Validation(errors) = config.validate().unwrap_err() else {
+            panic!("expected failure-memory limits to fail validation")
+        };
+        assert!(errors.iter().any(|error| error.contains("max_entries")));
+        assert!(errors.iter().any(|error| error.contains("retention_days")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("resolution_window_minutes"))
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
 };
 
 use aicoach_ai::{AiModels, AiTimeouts, NoopAiProvider, OpenAiCompatibleProvider, OpenAiConfig};
-use aicoach_core::{Config, PrivacyRedactor, ProductPaths};
+use aicoach_core::{Config, FailureMemoryOptions, PrivacyRedactor, ProductPaths};
 use aicoach_daemon::{Daemon, DaemonOptions, RuntimeFiles, SessionLimits};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -92,6 +92,13 @@ async fn main() -> Result<()> {
         }
     };
 
+    let privacy_redactor = PrivacyRedactor::from_config(&config.privacy)
+        .context("could not initialize privacy redaction")?;
+    let mut memory_privacy = config.privacy.clone();
+    memory_privacy.redaction = true;
+    let memory_redactor = PrivacyRedactor::from_config(&memory_privacy)
+        .context("could not initialize failure-memory redaction")?;
+
     let options = DaemonOptions {
         session_limits: SessionLimits {
             max_commands: config.context.max_commands,
@@ -106,8 +113,19 @@ async fn main() -> Result<()> {
         auto_error_analysis: config.coach.auto_error_analysis,
         inline_hint: config.coach.inline_hint,
         safety_enabled: config.safety.enabled,
-        privacy_redactor: PrivacyRedactor::from_config(&config.privacy)
-            .context("could not initialize privacy redaction")?,
+        failure_memory: config.memory.enabled.then(|| FailureMemoryOptions {
+            path: paths.failure_memory_file.clone(),
+            home_dir: paths.home_dir.clone(),
+            max_entries: config.memory.max_entries,
+            retention: Duration::from_secs(
+                config.memory.retention_days.saturating_mul(24 * 60 * 60),
+            ),
+            resolution_window: Duration::from_secs(
+                config.memory.resolution_window_minutes.saturating_mul(60),
+            ),
+            redactor: memory_redactor,
+        }),
+        privacy_redactor,
         server_version: env!("CARGO_PKG_VERSION").to_owned(),
         active_state_dir: Some(runtime_dir),
     };

@@ -45,7 +45,7 @@ enum Commands {
     Onboard(onboarding::OnboardArgs),
     /// Install the Zsh integration and macOS background services.
     Install(InstallArgs),
-    /// Remove shell/background integration while preserving config and logs.
+    /// Remove integration while preserving config, local memory, and logs.
     Uninstall(UninstallArgs),
     /// Start (or wake) the daemon.
     Start,
@@ -63,6 +63,8 @@ enum Commands {
     Logs(LogsArgs),
     /// Export a private-by-default Markdown capsule of the active terminal session.
     Capsule(CapsuleArgs),
+    /// Inspect or clear bounded, local-only failure fingerprints.
+    Memory(MemoryArgs),
     /// Toggle the native Terminal.app/iTerm2 Coach window.
     Toggle(ToggleArgs),
 }
@@ -152,6 +154,22 @@ struct CapsuleArgs {
     output: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+struct MemoryArgs {
+    #[command(subcommand)]
+    action: Option<MemoryAction>,
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryAction {
+    /// Show retention settings and the exact local data path.
+    Status(OutputArgs),
+    /// List retained, already-redacted successful follow-up commands.
+    List(OutputArgs),
+    /// Delete every retained failure fingerprint and restart the daemon if needed.
+    Clear,
+}
+
 #[derive(Clone, Debug)]
 struct Paths {
     home: PathBuf,
@@ -161,6 +179,7 @@ struct Paths {
     state_dir: PathBuf,
     run_dir: PathBuf,
     logs_dir: PathBuf,
+    failure_memory: PathBuf,
     socket: PathBuf,
     pid: PathBuf,
     launch_agents: PathBuf,
@@ -171,16 +190,22 @@ struct Paths {
 impl Paths {
     fn discover() -> Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+        Ok(Self::from_home(home))
+    }
+
+    fn from_home(home: impl Into<PathBuf>) -> Self {
+        let home = home.into();
         let config_dir = home.join(".config/aicoach");
         let state_dir = home.join(".aicoach");
         let data_dir = config_dir.join("assets");
         let run_dir = state_dir.join("run");
         let logs_dir = state_dir.join("logs");
         let launch_agents = home.join("Library/LaunchAgents");
-        Ok(Self {
+        Self {
             home,
             config: config_dir.join("config.toml"),
             data_dir,
+            failure_memory: state_dir.join("failure-memory.json"),
             socket: run_dir.join("aicoach.sock"),
             pid: run_dir.join("aicoachd.pid"),
             daemon_plist: launch_agents.join(format!("{DAEMON_LABEL}.plist")),
@@ -190,7 +215,7 @@ impl Paths {
             run_dir,
             logs_dir,
             launch_agents,
-        })
+        }
     }
 
     fn create_runtime(&self) -> Result<()> {
@@ -223,6 +248,20 @@ struct Check {
     required: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct MemoryStatusReport {
+    enabled: bool,
+    path: String,
+    exists: bool,
+    bytes: u64,
+    entries: usize,
+    max_entries: usize,
+    retention_days: u64,
+    resolution_window_minutes: u64,
+    persisted_fields: [&'static str; 6],
+    excluded_fields: [&'static str; 3],
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("\x1b[31merror:\x1b[0m {error:#}");
@@ -249,6 +288,7 @@ fn run() -> Result<()> {
         Commands::Config(args) => config_command(&paths, args.action),
         Commands::Logs(args) => logs(&paths, &args),
         Commands::Capsule(args) => capsule::export(&paths, &args),
+        Commands::Memory(args) => memory_command(&paths, args.action),
         Commands::Toggle(args) => toggle(&paths, &args),
     }
 }
@@ -355,7 +395,9 @@ fn uninstall(paths: &Paths, args: &UninstallArgs) -> Result<()> {
             "AI Terminal Coach and local data were removed; shell backup files were preserved."
         );
     } else {
-        println!("AI Terminal Coach integration removed. Config and logs were preserved.");
+        println!(
+            "AI Terminal Coach integration removed. Config, local memory, and logs were preserved."
+        );
     }
     Ok(())
 }
@@ -685,6 +727,100 @@ fn config_command(paths: &Paths, action: Option<ConfigAction>) -> Result<()> {
         }
         ConfigAction::SetKey => set_keychain_key(paths)?,
         ConfigAction::DeleteKey => delete_keychain_key(paths)?,
+    }
+    Ok(())
+}
+
+fn memory_command(paths: &Paths, action: Option<MemoryAction>) -> Result<()> {
+    match action.unwrap_or(MemoryAction::Status(OutputArgs { json: false })) {
+        MemoryAction::Status(output) => {
+            let config = if paths.config.exists() {
+                aicoach_core::Config::load_from(&paths.config)?
+            } else {
+                aicoach_core::Config::default()
+            };
+            let snapshot = aicoach_core::FailureMemorySnapshot::load(&paths.failure_memory)?;
+            let metadata = fs::metadata(&paths.failure_memory).ok();
+            let report = MemoryStatusReport {
+                enabled: config.memory.enabled,
+                path: paths.failure_memory.display().to_string(),
+                exists: metadata.is_some(),
+                bytes: metadata.as_ref().map_or(0, fs::Metadata::len),
+                entries: snapshot.entries.len(),
+                max_entries: config.memory.max_entries,
+                retention_days: config.memory.retention_days,
+                resolution_window_minutes: config.memory.resolution_window_minutes,
+                persisted_fields: [
+                    "hashed failure fingerprint",
+                    "executable family",
+                    "occurrence count",
+                    "last-seen time",
+                    "redacted successful follow-up",
+                    "reusable flag",
+                ],
+                excluded_fields: [
+                    "failed command",
+                    "stdout/stderr diagnostic",
+                    "terminal session identifier",
+                ],
+            };
+            if output.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Failure Fingerprints");
+                println!("  enabled:    {}", yes_no(report.enabled));
+                println!("  entries:    {} / {}", report.entries, report.max_entries);
+                println!("  retention:  {} days", report.retention_days);
+                println!(
+                    "  association: next successful command within {} minutes",
+                    report.resolution_window_minutes
+                );
+                println!("  file:       {}", report.path);
+                println!("  size:       {} bytes", report.bytes);
+                println!("  never saved: failed commands, diagnostics, or session IDs");
+            }
+        }
+        MemoryAction::List(output) => {
+            let snapshot = aicoach_core::FailureMemorySnapshot::load(&paths.failure_memory)?;
+            if output.json {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else if snapshot.entries.is_empty() {
+                println!("No failure fingerprints are retained.");
+            } else {
+                for entry in snapshot.entries {
+                    let family =
+                        aicoach_core::strip_terminal_sequences(&entry.command_family, false);
+                    let follow_up =
+                        aicoach_core::strip_terminal_sequences(&entry.successful_follow_up, false);
+                    let seen = chrono::DateTime::from_timestamp_millis(entry.last_seen_unix_ms)
+                        .map_or_else(
+                            || entry.last_seen_unix_ms.to_string(),
+                            |value| value.to_rfc3339(),
+                        );
+                    println!(
+                        "{} · {} occurrences · last seen {}",
+                        family, entry.occurrences, seen
+                    );
+                    println!("  next successful command: {follow_up}");
+                    if !entry.reusable {
+                        println!(
+                            "  contains redaction placeholders; review only, do not reuse as-is"
+                        );
+                    }
+                }
+            }
+        }
+        MemoryAction::Clear => {
+            let was_running = is_daemon_running(paths).0;
+            if was_running {
+                stop(paths)?;
+            }
+            remove_file_if_exists(&paths.failure_memory)?;
+            if was_running {
+                start(paths)?;
+            }
+            println!("All retained failure fingerprints were removed.");
+        }
     }
     Ok(())
 }
@@ -1507,6 +1643,37 @@ mod tests {
     }
 
     #[test]
+    fn memory_commands_have_explicit_read_and_delete_modes() {
+        let list = Cli::try_parse_from(["aicoach", "memory", "list", "--json"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Commands::Memory(MemoryArgs {
+                action: Some(MemoryAction::List(OutputArgs { json: true }))
+            })
+        ));
+        let clear = Cli::try_parse_from(["aicoach", "memory", "clear"]).unwrap();
+        assert!(matches!(
+            clear.command,
+            Commands::Memory(MemoryArgs {
+                action: Some(MemoryAction::Clear)
+            })
+        ));
+    }
+
+    #[test]
+    fn memory_clear_recovers_even_when_config_and_memory_are_malformed() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(directory.path());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        fs::write(&paths.config, "not valid toml").unwrap();
+        fs::write(&paths.failure_memory, "not valid json").unwrap();
+        memory_command(&paths, Some(MemoryAction::Clear)).unwrap();
+        assert!(!paths.failure_memory.exists());
+        assert!(paths.config.exists());
+    }
+
+    #[test]
     fn homebrew_launch_agents_use_the_upgrade_stable_prefix_link() {
         use std::os::unix::fs::symlink;
 
@@ -1547,20 +1714,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path();
         fs::write(home.join(".zshrc"), [0xff, b'\n']).unwrap();
-        let paths = Paths {
-            home: home.to_path_buf(),
-            config_dir: home.join(".config/aicoach"),
-            config: home.join(".config/aicoach/config.toml"),
-            data_dir: home.join(".config/aicoach/assets"),
-            state_dir: home.join(".aicoach"),
-            run_dir: home.join(".aicoach/run"),
-            logs_dir: home.join(".aicoach/logs"),
-            socket: home.join(".aicoach/run/aicoach.sock"),
-            pid: home.join(".aicoach/run/aicoachd.pid"),
-            launch_agents: home.join("Library/LaunchAgents"),
-            daemon_plist: home.join("Library/LaunchAgents/com.aicoach.daemon.plist"),
-            hotkey_plist: home.join("Library/LaunchAgents/com.aicoach.hotkey.plist"),
-        };
+        let paths = Paths::from_home(home);
         assert!(install_zshrc(&paths).is_err());
         assert_eq!(fs::read(home.join(".zshrc")).unwrap(), [0xff, b'\n']);
     }
@@ -1574,20 +1728,7 @@ mod tests {
         let target = home.join("actual-zshrc");
         fs::write(&target, "export TEST=1\n").unwrap();
         symlink(&target, home.join(".zshrc")).unwrap();
-        let paths = Paths {
-            home: home.to_path_buf(),
-            config_dir: home.join(".config/aicoach"),
-            config: home.join(".config/aicoach/config.toml"),
-            data_dir: home.join(".config/aicoach/assets"),
-            state_dir: home.join(".aicoach"),
-            run_dir: home.join(".aicoach/run"),
-            logs_dir: home.join(".aicoach/logs"),
-            socket: home.join(".aicoach/run/aicoach.sock"),
-            pid: home.join(".aicoach/run/aicoachd.pid"),
-            launch_agents: home.join("Library/LaunchAgents"),
-            daemon_plist: home.join("Library/LaunchAgents/com.aicoach.daemon.plist"),
-            hotkey_plist: home.join("Library/LaunchAgents/com.aicoach.hotkey.plist"),
-        };
+        let paths = Paths::from_home(home);
         assert!(install_zshrc(&paths).is_err());
         assert!(
             fs::symlink_metadata(home.join(".zshrc"))

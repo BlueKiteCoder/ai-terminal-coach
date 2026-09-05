@@ -51,8 +51,8 @@ could happen before they choose to run it.
 
 ## Milestone 3 — Local memory that earns daily use
 
-- [ ] **Failure Fingerprints:** detect recurring failures locally and surface the fix that worked
-  the last time, without uploading a long-lived personal command history.
+- [x] **Failure Fingerprints:** detect recurring failures locally and surface the next successful
+  follow-up seen last time—without claiming causality or uploading long-lived command history.
 - [ ] **Environment Drift Lens:** compare safe environment/Git metadata between the last success
   and current failure to expose changed branches, virtual environments, directories, or tools.
 - [ ] **Session Checkpoints:** let users name a bounded troubleshooting session and append the
