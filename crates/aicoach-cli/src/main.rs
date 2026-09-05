@@ -4,6 +4,7 @@ mod capsule;
 mod checkpoint;
 mod data;
 mod onboarding;
+mod support;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -59,6 +60,8 @@ enum Commands {
     Status(OutputArgs),
     /// Diagnose configuration, shell, socket, AI credential and terminal integration.
     Doctor(OutputArgs),
+    /// Export a path-free, content-free Markdown report for public support requests.
+    Support(support::SupportArgs),
     /// Inspect or modify configuration.
     Config(ConfigArgs),
     /// Read bounded daemon logs.
@@ -353,6 +356,7 @@ fn run() -> Result<()> {
         }
         Commands::Status(args) => status(&paths, args.json),
         Commands::Doctor(args) => doctor(&paths, args.json),
+        Commands::Support(args) => support::export(&paths, &args),
         Commands::Config(args) => config_command(&paths, args.action),
         Commands::Logs(args) => logs(&paths, &args),
         Commands::Capsule(args) => capsule::export(&paths, &args),
@@ -598,6 +602,29 @@ fn status(paths: &Paths, as_json: bool) -> Result<()> {
 }
 
 fn doctor(paths: &Paths, as_json: bool) -> Result<()> {
+    let checks = collect_doctor_checks(paths);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&checks)?);
+    } else {
+        for check in &checks {
+            let icon = match check.status {
+                "ok" => "\x1b[32m✓\x1b[0m",
+                "warn" => "\x1b[33m!\x1b[0m",
+                _ => "\x1b[31m✗\x1b[0m",
+            };
+            println!("{icon} {:<18} {}", check.name, check.detail);
+        }
+    }
+    if checks
+        .iter()
+        .any(|check| check.required && check.status == "fail")
+    {
+        bail!("doctor found required checks that need attention")
+    }
+    Ok(())
+}
+
+fn collect_doctor_checks(paths: &Paths) -> Vec<Check> {
     let config_text = fs::read_to_string(&paths.config).ok();
     let config_value = config_text
         .as_deref()
@@ -679,10 +706,7 @@ fn doctor(paths: &Paths, as_json: bool) -> Result<()> {
         },
         Check {
             name: "Terminal",
-            status: if matches!(
-                terminal.as_str(),
-                "Apple_Terminal" | "iTerm.app" | "WezTerm" | "kitty" | "WarpTerminal"
-            ) {
+            status: if public_terminal_name(&terminal).is_some() {
                 "ok"
             } else {
                 "warn"
@@ -737,25 +761,20 @@ fn doctor(paths: &Paths, as_json: bool) -> Result<()> {
         }
     }
 
-    if as_json {
-        println!("{}", serde_json::to_string_pretty(&checks)?);
-    } else {
-        for check in &checks {
-            let icon = match check.status {
-                "ok" => "\x1b[32m✓\x1b[0m",
-                "warn" => "\x1b[33m!\x1b[0m",
-                _ => "\x1b[31m✗\x1b[0m",
-            };
-            println!("{icon} {:<18} {}", check.name, check.detail);
-        }
+    checks
+}
+
+fn public_terminal_name(value: &str) -> Option<&'static str> {
+    match value {
+        "Apple_Terminal" => Some("Terminal.app"),
+        "iTerm.app" => Some("iTerm2"),
+        "WarpTerminal" => Some("Warp"),
+        "WezTerm" => Some("WezTerm"),
+        "kitty" => Some("kitty"),
+        "Alacritty" => Some("Alacritty"),
+        "vscode" => Some("Visual Studio Code"),
+        _ => None,
     }
-    if checks
-        .iter()
-        .any(|check| check.required && check.status == "fail")
-    {
-        bail!("doctor found required checks that need attention")
-    }
-    Ok(())
 }
 
 fn config_command(paths: &Paths, action: Option<ConfigAction>) -> Result<()> {
@@ -1802,6 +1821,20 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["aicoach", "data", "clear"]).is_err());
+    }
+
+    #[test]
+    fn support_reports_have_explicit_copy_and_output_destinations() {
+        let report =
+            Cli::try_parse_from(["aicoach", "support", "--copy", "--output", "diagnostics.md"])
+                .unwrap();
+        assert!(matches!(
+            report.command,
+            Commands::Support(support::SupportArgs {
+                copy: true,
+                output: Some(ref output),
+            }) if output == Path::new("diagnostics.md")
+        ));
     }
 
     #[test]

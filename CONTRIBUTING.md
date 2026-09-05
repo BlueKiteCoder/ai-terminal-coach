@@ -32,6 +32,11 @@ Run `zsh scripts/check-no-secrets.sh` and `zsh scripts/check-actions-pinned.sh`
 before pushing. The same credential and immutable-action regression checks run
 in CI.
 
+Terminal compatibility claims must come from a real supported-macOS test. Run
+`aicoach support --copy`, use the Terminal compatibility issue template, and tick only
+capabilities personally verified in that exact terminal. The report intentionally omits
+private paths and terminal content; review it before posting anyway.
+
 Performance budgets and measurement details are documented in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md). Include before/after numbers when changing synchronous
 Zsh hooks or adding a release dependency.

@@ -64,7 +64,7 @@ that combines local policy, session state, routing, and provider access.
 | `aicoach-ai` | Provider trait, OpenAI-compatible HTTP/JSON/SSE, cancellation, retry, timeouts, credential-safe errors | Session retention, ZLE mutation, local safety policy |
 | `aicoach-ipc` | Typed requests/responses/events, identifiers, frame limits, JSON and Zsh codecs | Authorization policy, request execution |
 | `aicoach-daemon` | Session lifecycle, request routing, cancellation, event delivery, local-first orchestration, provider boundary | Installation, terminal key capture |
-| `aicoach-cli` | Install/uninstall, LaunchAgents, Keychain setup, configuration, doctor, Capsule, checkpoints, data controls | Interactive chat rendering, provider calls |
+| `aicoach-cli` | Install/uninstall, LaunchAgents, Keychain setup, configuration, doctor, public-safe Support Report, Capsule, checkpoints, data controls | Interactive chat rendering, provider calls |
 | `aicoach-tui` | Ratatui state, input, streaming display, scrolling, safe copy/insert requests, bounded disk chat history | Shell ownership, direct ZLE mutation |
 | `shell/aicoach.zsh` | `preexec`/`precmd`, allowlisted environment snapshot, ZLE buffer ownership, physical shortcuts | AI HTTP, long-lived policy decisions |
 | `macos/` and `scripts/` | Global hotkey helper and Terminal.app/iTerm2 window coordination | Command collection or execution |

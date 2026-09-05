@@ -22,6 +22,8 @@ All notable user-visible changes are recorded here. This project follows
   extension recipes, compatibility rules, and the non-negotiable provider and ZLE boundaries.
 - Native performance dashboards measure Zsh hook latency, warmed executable startup, and stripped
   binary size on `main` and dual-architecture release checks, failing when public budgets regress.
+- `aicoach support` exports a provider-free Markdown diagnostics report with allowlisted runtime
+  facts and content-free capability results, paired with an evidence-based compatibility template.
 
 ### Security
 
@@ -35,6 +37,8 @@ All notable user-visible changes are recorded here. This project follows
   from all provider prompts, and force-redacted when a Capsule is exported.
 - Data inventory never prints stored content or reads the Keychain secret; session clearing
   cancels active AI work, removes pending failure links, and cannot delete config or credentials.
+- Support Reports omit usernames, hostnames, paths, sessions, terminal content, logs, provider
+  endpoints, model names, and credentials; unknown terminal/config values are never echoed.
 
 ### Fixed
 
