@@ -58,6 +58,8 @@ All notable user-visible changes are recorded here. This project follows
   reserved for Session Airlock.
 - `aicoach data clear all` clears open log files in place instead of restarting the daemon, so a
   memory-only Session Airlock cannot be silently reopened by a data-erasure command.
+- Automatic Coach window selection falls back to Terminal.app when iTerm2 is not installed and a
+  different application is currently frontmost.
 
 ## [0.1.0] - 2026-09-04
 

@@ -213,8 +213,8 @@ function run(argv) {
   if (front === "iTerm2") return toggleIterm(command, fallback);
   if (front === "Terminal") return toggleTerminal(command, fallback);
 
-  const iterm = Application("iTerm2");
   try {
+    const iterm = Application("iTerm2");
     if (iterm.running()) return toggleIterm(command, fallback);
   } catch (_) {}
   return toggleTerminal(command, fallback);
