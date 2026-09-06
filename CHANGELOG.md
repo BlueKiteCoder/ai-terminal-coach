@@ -18,12 +18,14 @@ All notable user-visible changes are recorded here. This project follows
   a final resolution entered interactively outside normal Shell history.
 - Local Data Controls inventory every persistent, Keychain, runtime, and daemon-memory category
   without content, then clear one session, history, fingerprints, logs, or all transient data.
-- Contributor architecture and IPC v2 guides define module ownership, request/event routing,
+- Contributor architecture and IPC v3 guides define module ownership, request/event routing,
   extension recipes, compatibility rules, and the non-negotiable provider and ZLE boundaries.
 - Native performance dashboards measure Zsh hook latency, warmed executable startup, and stripped
   binary size on `main` and dual-architecture release checks, failing when public budgets regress.
 - `aicoach support` exports a provider-free Markdown diagnostics report with allowlisted runtime
   facts and content-free capability results, paired with an evidence-based compatibility template.
+- Live Privacy Receipts expose the post-redaction provider payload size, item count, aggregate
+  hidden-span count, elapsed time, and outcome for completion, analysis, and chat in the Coach UI.
 
 ### Security
 
@@ -39,6 +41,9 @@ All notable user-visible changes are recorded here. This project follows
   cancels active AI work, removes pending failure links, and cannot delete config or credentials.
 - Support Reports omit usernames, hostnames, paths, sessions, terminal content, logs, provider
   endpoints, model names, and credentials; unknown terminal/config values are never echoed.
+- Privacy Receipts contain no prompt, response, matched value, rule, model, endpoint, path, or
+  history content; they are suppressed for shells, never persisted, and honestly mark disabled
+  redaction, cancellation, provider failure, and local analysis fallback.
 
 ### Fixed
 

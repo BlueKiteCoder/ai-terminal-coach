@@ -4,7 +4,7 @@ AI Terminal Coach uses a versioned local protocol between Zsh, the CLI, the TUI,
 This guide explains the contract contributors must preserve. The authoritative types are in
 `crates/aicoach-ipc/src/protocol.rs`; codecs and frame handling live beside them.
 
-Current protocol version: **2**
+Current protocol version: **3**
 
 ## Transport
 
@@ -86,7 +86,7 @@ read the public structs adjacent to `RequestBody` before implementing a client.
 
 Responses are point-to-point: they return on the connection that sent the request.
 
-Events have three routing classes:
+Events have four routing classes:
 
 1. **Request events** — streaming chat deltas/done/failure and request cancellation return only to
    the originating connection.
@@ -94,9 +94,12 @@ Events have three routing classes:
    subscribed to that session through context or chat.
 3. **Shell mutation events** — insert-buffer proposals go only to the current shell owner whose
    negotiated capabilities permit insertion. They never go to a TUI observer.
+4. **Observer metadata events** — live Privacy Receipts go only to non-shell clients subscribed to
+   the session. They are deliberately suppressed for shell clients so asynchronous metadata never
+   disturbs ZLE or terminal output.
 
 Current event bodies are `hint`, `completion`, `chat_delta`, `chat_done`, `chat_failed`,
-`insert_buffer`, `request_cancelled`, `data_cleared`, and `session_closed`.
+`insert_buffer`, `request_cancelled`, `data_cleared`, `privacy_receipt`, and `session_closed`.
 
 The bounded outbound queue applies backpressure. A disconnected or slow observer must not block the
 shell hook or cause work to be executed elsewhere.
@@ -130,11 +133,36 @@ level but ZLE still rejects it if the user's current buffer differs from the ori
 - A shell buffer proposal is never an execution instruction. Clients display or insert it and leave
   Enter untouched.
 
+### Live Privacy Receipt
+
+Every completion, analysis, or chat operation that reaches the provider abstraction emits one
+`privacy_receipt` after that attempt finishes. Local-only analysis and Risk Lens do not emit one
+because no provider-bound request exists. Its fields are content-free metadata:
+
+| Field | Meaning |
+|---|---|
+| `purpose` | `completion`, `analysis`, or `chat` |
+| `outcome` | `succeeded`, `failed`, `cancelled`, or `local_fallback` |
+| `payload_chars` | Unicode scalar count of the JSON-serialized application request after redaction, before model/provider configuration and HTTP framing |
+| `payload_items` | Completion context entries, analysis context records, or chat messages in that request |
+| `redactions` | Aggregate number of secret-shaped spans replaced; no rule or match is retained |
+| `redaction_enabled` | The actual provider-bound redaction setting for the request |
+| `elapsed_ms` | Time spent awaiting the provider attempt, including stream consumption |
+
+The event never carries the prompt, response, matched value, redaction rule, model, endpoint, path,
+or history content. It is not appended to chat history, logs, capsules, failure memory, or another
+persistent store. A Coach window must already be subscribed to observe it; the daemon does not
+replay old receipts. It proves what this application prepared at its provider boundary, not how an
+external provider stores or processes a request.
+
 ## Compatibility rules
 
 An additive field is compatible when old readers can ignore it and new readers provide a serde
 default when it is absent. Adding an enum variant can still break exhaustive clients, so document
 the minimum compatible release.
+
+Protocol v3 is the minimum version for `privacy_receipt`; the new event variant required the
+version bump so exhaustive v2 clients fail the handshake instead of misinterpreting the stream.
 
 Bump `PROTOCOL_VERSION` when changing an existing serialized field name or type, removing a field or
 variant, changing envelope/tag shape, changing identifier meaning, or making previously optional

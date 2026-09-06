@@ -19,12 +19,13 @@ use aicoach_core::{
 };
 use aicoach_daemon::{Daemon, DaemonOptions};
 use aicoach_ipc::{
-    CancelParams, ChatParams, CheckpointOperation, CheckpointParams, ClientCapabilities,
-    ClientKind, CommandFinishedParams, CommandId, CommandStartedParams, CompletionParams,
-    ContextParams, DaemonDataResult, DataClearScope, DataOperation, DataParams, DataRemovalSummary,
-    Event, EventBody, HelloParams, InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION,
-    RegisterSessionParams, Request, RequestBody, Response, ResponseOutcome, ResponseResult,
-    RiskLensParams, SafetyClassification, SessionCheckpoint, SessionDataSummary, SessionId,
+    AiRequestOutcome, AiRequestPurpose, CancelParams, ChatParams, CheckpointOperation,
+    CheckpointParams, ClientCapabilities, ClientKind, CommandFinishedParams, CommandId,
+    CommandStartedParams, CompletionParams, ContextParams, DaemonDataResult, DataClearScope,
+    DataOperation, DataParams, DataRemovalSummary, Event, EventBody, HelloParams,
+    InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION, RegisterSessionParams, Request,
+    RequestBody, Response, ResponseOutcome, ResponseResult, RiskLensParams, SafetyClassification,
+    SessionCheckpoint, SessionDataSummary, SessionId,
 };
 use async_trait::async_trait;
 use futures_util::stream;
@@ -40,7 +41,9 @@ use tokio_util::sync::CancellationToken;
 struct TestProvider {
     analysis_calls: AtomicUsize,
     completion_calls: AtomicUsize,
+    completion_requests: Mutex<Vec<CommandCompletionRequest>>,
     chat_requests: Mutex<Vec<ChatRequest>>,
+    fail_analysis: bool,
     interrupt_stream: bool,
 }
 
@@ -84,6 +87,11 @@ impl AiProvider for TestProvider {
         _cancellation: CancellationToken,
     ) -> AiResult<AnalysisResult> {
         self.analysis_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_analysis {
+            return Err(AiError::Transport {
+                operation: AiOperation::Analysis,
+            });
+        }
         Ok(AnalysisResult {
             need_response: true,
             severity: CoreSeverity::Error,
@@ -101,6 +109,10 @@ impl AiProvider for TestProvider {
         cancellation: CancellationToken,
     ) -> AiResult<CoreCompletionResult> {
         self.completion_calls.fetch_add(1, Ordering::SeqCst);
+        self.completion_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
         if request.buffer == "wait" {
             cancellation.cancelled().await;
             return Err(AiError::Cancelled {
@@ -465,6 +477,63 @@ async fn wait_for_chat_done(events: &mut tokio::sync::broadcast::Receiver<Event>
     }
 }
 
+async fn subscribe_tui(client: &IpcClient, session: SessionId, client_name: &str) {
+    let hello = client
+        .send_request(
+            None,
+            RequestBody::Hello(HelloParams {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: client_name.to_owned(),
+                client_version: "1".to_owned(),
+                client_kind: ClientKind::Tui,
+                capabilities: ClientCapabilities::default(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        hello.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Hello { .. }
+        }
+    ));
+    let context = client
+        .send_request(
+            Some(session),
+            RequestBody::Context(ContextParams::default()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        context.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Context(_)
+        }
+    ));
+}
+
+async fn wait_for_privacy_receipt(
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    request_id: Option<aicoach_ipc::RequestId>,
+) -> (Event, bool) {
+    let mut saw_chat_done = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(request_id) = request_id {
+            assert_eq!(event.request_id, Some(request_id));
+        }
+        match event.body {
+            EventBody::ChatDone => saw_chat_done = true,
+            EventBody::PrivacyReceipt(_) => return (event, saw_chat_done),
+            EventBody::ChatFailed { message, .. } => panic!("stream failed: {message}"),
+            _ => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn connects_disconnects_and_accepts_a_new_client() {
     let running = RunningDaemon::start(Arc::new(TestProvider::default())).await;
@@ -551,6 +620,9 @@ async fn cancel_interrupts_active_completion_and_daemon_remains_responsive() {
     let client = IpcClient::connect(&running.socket).await.unwrap();
     let session = register(&client, None, "/dev/ttys003").await;
     let mut events = client.subscribe();
+    let observer = IpcClient::connect(&running.socket).await.unwrap();
+    subscribe_tui(&observer, session, "cancel-receipt-test").await;
+    let mut observer_events = observer.subscribe();
     let completion = Request::new(
         Some(session),
         RequestBody::Completion(CompletionParams {
@@ -592,6 +664,13 @@ async fn cancel_interrupts_active_completion_and_daemon_remains_responsive() {
         .unwrap();
     assert_eq!(cancelled_event.request_id, Some(completion_id));
     assert!(matches!(cancelled_event.body, EventBody::RequestCancelled));
+    let (receipt_event, _) =
+        wait_for_privacy_receipt(&mut observer_events, Some(completion_id)).await;
+    let EventBody::PrivacyReceipt(receipt) = receipt_event.body else {
+        unreachable!()
+    };
+    assert_eq!(receipt.purpose, AiRequestPurpose::Completion);
+    assert_eq!(receipt.outcome, AiRequestOutcome::Cancelled);
     let pong = client
         .send_request(Some(session), RequestBody::Ping)
         .await
@@ -603,6 +682,7 @@ async fn cancel_interrupts_active_completion_and_daemon_remains_responsive() {
         }
     ));
     client.close().await.unwrap();
+    observer.close().await.unwrap();
     running.stop().await;
 }
 
@@ -794,6 +874,58 @@ async fn failed_command_uses_ai_after_local_trigger_and_pushes_hint() {
     assert_eq!(hint.message, "provider analyzed failure");
     assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 1);
     shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn privacy_receipt_reports_analysis_local_fallback_without_secret_details() {
+    let provider = Arc::new(TestProvider {
+        fail_analysis: true,
+        ..TestProvider::default()
+    });
+    let running = RunningDaemon::start(Arc::clone(&provider)).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys025").await;
+    let mut shell_events = shell.subscribe();
+
+    let observer = IpcClient::connect(&running.socket).await.unwrap();
+    subscribe_tui(&observer, session, "privacy-observer").await;
+    let mut observer_events = observer.subscribe();
+
+    let secret = ["fixture", "private", "value"].join("-");
+    complete_command(
+        &shell,
+        session,
+        "mystery-command --flag",
+        1,
+        Some(&format!("unclassified failure API_KEY={secret}")),
+    )
+    .await;
+
+    let (receipt_event, _) = wait_for_privacy_receipt(&mut observer_events, None).await;
+    let EventBody::PrivacyReceipt(receipt) = receipt_event.body else {
+        unreachable!()
+    };
+    assert_eq!(receipt.purpose, AiRequestPurpose::Analysis);
+    assert_eq!(receipt.outcome, AiRequestOutcome::LocalFallback);
+    assert!(receipt.payload_chars > 0);
+    assert!(receipt.redactions >= 1);
+    assert!(receipt.redaction_enabled);
+    assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 1);
+
+    let shell_event = tokio::time::timeout(Duration::from_secs(2), shell_events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(shell_event.body, EventBody::Hint(_)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), shell_events.recv())
+            .await
+            .is_err()
+    );
+
+    shell.close().await.unwrap();
+    observer.close().await.unwrap();
     running.stop().await;
 }
 
@@ -1221,6 +1353,114 @@ async fn streaming_chat_events_return_to_tui_origin_not_shell_owner() {
 }
 
 #[tokio::test]
+async fn privacy_receipts_are_content_free_live_only_and_hidden_from_shells() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start(Arc::clone(&provider)).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys024").await;
+    let mut shell_events = shell.subscribe();
+
+    let tui = IpcClient::connect(&running.socket).await.unwrap();
+    subscribe_tui(&tui, session, "privacy-receipt-test").await;
+    let mut tui_events = tui.subscribe();
+
+    let secret = ["sk", "abcdefghijklmnopqrstuvwxyz123456"].join("-");
+    let chat_request = Request::new(
+        Some(session),
+        RequestBody::Chat(ChatParams {
+            message: format!("explain {secret}"),
+            stream: true,
+            cwd: None,
+            buffer: None,
+        }),
+    );
+    let chat_request_id = chat_request.request_id;
+    let accepted = tui.send(chat_request).await.unwrap();
+    assert!(matches!(
+        accepted.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Accepted
+        }
+    ));
+
+    let (chat_receipt_event, saw_done) =
+        wait_for_privacy_receipt(&mut tui_events, Some(chat_request_id)).await;
+    assert!(saw_done);
+    let EventBody::PrivacyReceipt(chat_receipt) = &chat_receipt_event.body else {
+        unreachable!()
+    };
+    assert_eq!(chat_receipt.purpose, AiRequestPurpose::Chat);
+    assert_eq!(chat_receipt.outcome, AiRequestOutcome::Succeeded);
+    assert!(chat_receipt.payload_chars > 0);
+    assert!(chat_receipt.payload_items >= 2);
+    assert!(chat_receipt.redaction_enabled);
+    assert!(chat_receipt.redactions >= 1);
+
+    let receipt_json = serde_json::to_string(&chat_receipt_event).unwrap();
+    for forbidden in [
+        secret.as_str(),
+        "explain",
+        "hello world",
+        "prompt",
+        "response",
+        "model",
+        "endpoint",
+        "matched_value",
+    ] {
+        assert!(!receipt_json.contains(forbidden));
+    }
+    let sent_chat_json = {
+        let requests = provider.chat_requests.lock().unwrap();
+        serde_json::to_string(requests.last().unwrap()).unwrap()
+    };
+    assert!(!sent_chat_json.contains(&secret));
+    assert!(sent_chat_json.contains("[REDACTED]"));
+
+    let completion = shell
+        .send_request(
+            Some(session),
+            RequestBody::Completion(CompletionParams {
+                buffer: format!("echo {secret}"),
+                cursor: 40,
+                cwd: PathBuf::from("/tmp"),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        completion.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Completion(_)
+        }
+    ));
+
+    let (completion_receipt_event, _) = wait_for_privacy_receipt(&mut tui_events, None).await;
+    let EventBody::PrivacyReceipt(completion_receipt) = completion_receipt_event.body else {
+        unreachable!()
+    };
+    assert_eq!(completion_receipt.purpose, AiRequestPurpose::Completion);
+    assert_eq!(completion_receipt.outcome, AiRequestOutcome::Succeeded);
+    assert!(completion_receipt.redactions >= 1);
+    assert!(completion_receipt.payload_items >= 2);
+    let sent_completion_json = {
+        let requests = provider.completion_requests.lock().unwrap();
+        serde_json::to_string(requests.last().unwrap()).unwrap()
+    };
+    assert!(!sent_completion_json.contains(&secret));
+    assert!(sent_completion_json.contains("[REDACTED]"));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), shell_events.recv())
+            .await
+            .is_err()
+    );
+
+    shell.close().await.unwrap();
+    tui.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn tui_created_session_cannot_claim_shell_buffer_ownership() {
     let running = RunningDaemon::start(Arc::new(TestProvider::default())).await;
     let tui = IpcClient::connect(&running.socket).await.unwrap();
@@ -1290,18 +1530,7 @@ async fn interrupted_stream_reports_failure_instead_of_done() {
     let shell = IpcClient::connect(&running.socket).await.unwrap();
     let session = register(&shell, None, "/dev/ttys006").await;
     let tui = IpcClient::connect(&running.socket).await.unwrap();
-    tui.send_request(
-        None,
-        RequestBody::Hello(HelloParams {
-            protocol_version: PROTOCOL_VERSION,
-            client_name: "stream-test-tui".to_owned(),
-            client_version: "1".to_owned(),
-            client_kind: ClientKind::Tui,
-            capabilities: ClientCapabilities::default(),
-        }),
-    )
-    .await
-    .unwrap();
+    subscribe_tui(&tui, session, "stream-test-tui").await;
     let mut events = tui.subscribe();
     let response = tui
         .send_request(
@@ -1322,7 +1551,8 @@ async fn interrupted_stream_reports_failure_instead_of_done() {
         }
     ));
     let mut saw_partial = false;
-    loop {
+    let mut saw_failure = false;
+    let receipt = loop {
         let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
             .unwrap()
@@ -1331,13 +1561,17 @@ async fn interrupted_stream_reports_failure_instead_of_done() {
             EventBody::ChatDelta { delta } => saw_partial |= delta == "partial",
             EventBody::ChatFailed { retryable, .. } => {
                 assert!(retryable);
-                break;
+                saw_failure = true;
             }
+            EventBody::PrivacyReceipt(receipt) => break receipt,
             EventBody::ChatDone => panic!("interrupted stream was reported as complete"),
             _ => {}
         }
-    }
+    };
     assert!(saw_partial);
+    assert!(saw_failure);
+    assert_eq!(receipt.purpose, AiRequestPurpose::Chat);
+    assert_eq!(receipt.outcome, AiRequestOutcome::Failed);
     shell.close().await.unwrap();
     tui.close().await.unwrap();
     running.stop().await;

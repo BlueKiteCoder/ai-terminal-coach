@@ -21,9 +21,10 @@ use aicoach_core::{
     AnalysisCoverage, Config, ProductPaths, RiskLevel, SafetyEngine, strip_terminal_sequences,
 };
 use aicoach_ipc::{
-    ChatParams, ClientCapabilities, ClientKind, ContextParams, EventBody, HelloParams, Hint,
-    InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION, RegisterSessionParams, Request,
-    RequestBody, ResponseOutcome, ResponseResult, SafetyClassification, SessionContext, SessionId,
+    AiRequestOutcome, AiRequestPurpose, ChatParams, ClientCapabilities, ClientKind, ContextParams,
+    EventBody, HelloParams, Hint, InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION,
+    PrivacyReceipt, RegisterSessionParams, Request, RequestBody, ResponseOutcome, ResponseResult,
+    SafetyClassification, SessionContext, SessionId,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -138,6 +139,8 @@ struct App {
     status: String,
     should_quit: bool,
     show_help: bool,
+    show_privacy: bool,
+    privacy_receipt: Option<PrivacyReceipt>,
     history_enabled: bool,
     history_limit: usize,
     history_path: PathBuf,
@@ -201,6 +204,8 @@ impl App {
             status,
             should_quit: false,
             show_help: false,
+            show_privacy: false,
+            privacy_receipt: None,
             history_enabled: config.history.enabled,
             history_limit: config.history.max_messages,
             history_path: paths.history_file.clone(),
@@ -540,12 +545,25 @@ async fn handle_key(key: KeyEvent, client: &IpcClient, app: &mut App) -> Result<
     }
     match key.code {
         KeyCode::Esc if app.show_help => app.show_help = false,
+        KeyCode::Esc if app.show_privacy => app.show_privacy = false,
         KeyCode::Esc => {
             app.persist_history();
             return_to_terminal(app, None);
         }
         KeyCode::F(1) | KeyCode::Char('?') if app.input.is_empty() => {
-            app.show_help = !app.show_help
+            app.show_help = !app.show_help;
+            app.show_privacy = false;
+        }
+        KeyCode::Char('p' | 'P') if app.input.is_empty() => {
+            if app.privacy_receipt.is_some() {
+                app.show_privacy = !app.show_privacy;
+                app.show_help = false;
+            } else {
+                app.status = app
+                    .language
+                    .text("No live Privacy Receipt yet", "暂时还没有实时隐私回执")
+                    .to_owned();
+            }
         }
         KeyCode::Enter => submit_chat(client, app).await?,
         KeyCode::Backspace => remove_before_cursor(&mut app.input, &mut app.input_cursor),
@@ -710,6 +728,8 @@ fn handle_ipc_event(event: EventBody, app: &mut App) {
             app.recommendation_state.select(None);
             app.scroll = 0;
             app.follow_tail = true;
+            app.privacy_receipt = None;
+            app.show_privacy = false;
             if !matches!(scope, aicoach_ipc::DataClearScope::ChatHistory) {
                 app.context = None;
                 app.input.clear();
@@ -720,6 +740,10 @@ fn handle_ipc_event(event: EventBody, app: &mut App) {
                 .text("Local session data was cleared", "本地会话数据已清除")
                 .to_owned();
             app.persist_history();
+        }
+        EventBody::PrivacyReceipt(receipt) => {
+            app.status = privacy_receipt_summary(&receipt, app.language);
+            app.privacy_receipt = Some(receipt);
         }
         EventBody::SessionClosed => {
             app.status = app
@@ -955,7 +979,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         },
         |context| sanitize_terminal_text(&context.cwd.display().to_string(), false),
     );
-    let header = Paragraph::new(Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(
             " AI Terminal Coach ",
             Style::default()
@@ -963,8 +987,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("  {cwd}"), Style::default().fg(Color::DarkGray)),
-    ]))
-    .block(
+    ];
+    if let Some(receipt) = app.privacy_receipt.as_ref() {
+        header_spans.push(Span::styled(
+            format!("  {}", privacy_receipt_badge(receipt, app.language)),
+            Style::default().fg(privacy_receipt_color(receipt.outcome)),
+        ));
+    }
+    let header = Paragraph::new(Line::from(header_spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)),
@@ -1012,6 +1042,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         Span::raw(app.language.text(" Select  ", " 选择  ")),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(app.language.text(" Help  ", " 帮助  ")),
+        Span::styled("P", Style::default().fg(Color::Yellow)),
+        Span::raw(app.language.text(" Privacy  ", " 隐私回执  ")),
         Span::styled("Ctrl-Q", Style::default().fg(Color::Yellow)),
         Span::raw(app.language.text(" Quit  ", " 退出  ")),
         Span::styled(&app.status, Style::default().fg(Color::DarkGray)),
@@ -1021,6 +1053,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     if app.show_help {
         draw_help(frame, centered_rect(70, 70, area), app.language);
+    } else if app.show_privacy
+        && let Some(receipt) = app.privacy_receipt.as_ref()
+    {
+        draw_privacy_receipt(frame, centered_rect(70, 70, area), receipt, app.language);
     }
 }
 
@@ -1185,6 +1221,10 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, language: UiLanguage) {
             "PgUp/PgDn or mouse wheel  Scroll conversation",
             "PgUp/PgDn 或鼠标滚轮  滚动对话",
         )),
+        Line::from(language.text(
+            "P          Inspect the latest live Privacy Receipt",
+            "P          查看最近一次实时 Privacy Receipt",
+        )),
         Line::from(language.text("Ctrl+Q     Quit Coach", "Ctrl+Q     退出 Coach")),
         Line::default(),
         Line::from(Span::styled(
@@ -1205,6 +1245,159 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, language: UiLanguage) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn draw_privacy_receipt(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    receipt: &PrivacyReceipt,
+    language: UiLanguage,
+) {
+    frame.render_widget(Clear, area);
+    let result = privacy_outcome_label(receipt.outcome, language);
+    let redaction = if receipt.redaction_enabled {
+        language.text("enabled", "已启用")
+    } else {
+        language.text("disabled by config", "已由配置关闭")
+    };
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            language.text("Live Privacy Receipt", "实时隐私回执"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(format!(
+            "{}: {}",
+            language.text("Purpose", "用途"),
+            privacy_purpose_label(receipt.purpose, language)
+        )),
+        Line::from(Span::styled(
+            format!("{}: {result}", language.text("Outcome", "结果")),
+            Style::default().fg(privacy_receipt_color(receipt.outcome)),
+        )),
+        Line::from(format!(
+            "{}: {}",
+            language.text("Payload after redaction", "脱敏后 payload"),
+            format_char_count(receipt.payload_chars, language)
+        )),
+        Line::from(format!(
+            "{}: {}",
+            language.text("Payload items", "Payload 项数"),
+            receipt.payload_items
+        )),
+        Line::from(format!(
+            "{}: {}",
+            language.text("Secret-shaped spans hidden", "已隐藏的敏感形态片段"),
+            receipt.redactions
+        )),
+        Line::from(format!(
+            "{}: {redaction}",
+            language.text("Redaction", "脱敏")
+        )),
+        Line::from(format!(
+            "{}: {} ms",
+            language.text("Provider elapsed", "Provider 耗时"),
+            receipt.elapsed_ms
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            language.text(
+                "Live metadata only — prompts, responses, matches, models, and endpoints are not retained here.",
+                "这里只显示实时元数据——不会在此保留 prompt、response、命中内容、模型或 endpoint。",
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .title(language.text("Privacy (P/Esc to close)", "隐私回执（P/Esc 关闭）"))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn privacy_receipt_badge(receipt: &PrivacyReceipt, language: UiLanguage) -> String {
+    format!(
+        "Privacy {} · {} · {}",
+        privacy_outcome_symbol(receipt.outcome),
+        privacy_purpose_label(receipt.purpose, language),
+        format_char_count(receipt.payload_chars, language)
+    )
+}
+
+fn privacy_receipt_summary(receipt: &PrivacyReceipt, language: UiLanguage) -> String {
+    match language {
+        UiLanguage::English => format!(
+            "Privacy Receipt · {} · {} · {} hidden · {}",
+            privacy_purpose_label(receipt.purpose, language),
+            format_char_count(receipt.payload_chars, language),
+            receipt.redactions,
+            privacy_outcome_label(receipt.outcome, language)
+        ),
+        UiLanguage::Chinese => format!(
+            "Privacy Receipt · {} · {} · 隐藏 {} 处 · {}",
+            privacy_purpose_label(receipt.purpose, language),
+            format_char_count(receipt.payload_chars, language),
+            receipt.redactions,
+            privacy_outcome_label(receipt.outcome, language)
+        ),
+    }
+}
+
+const fn privacy_purpose_label(purpose: AiRequestPurpose, language: UiLanguage) -> &'static str {
+    match (purpose, language) {
+        (AiRequestPurpose::Completion, UiLanguage::English) => "completion",
+        (AiRequestPurpose::Analysis, UiLanguage::English) => "analysis",
+        (AiRequestPurpose::Chat, UiLanguage::English) => "chat",
+        (AiRequestPurpose::Completion, UiLanguage::Chinese) => "补全",
+        (AiRequestPurpose::Analysis, UiLanguage::Chinese) => "分析",
+        (AiRequestPurpose::Chat, UiLanguage::Chinese) => "对话",
+    }
+}
+
+const fn privacy_outcome_label(outcome: AiRequestOutcome, language: UiLanguage) -> &'static str {
+    match (outcome, language) {
+        (AiRequestOutcome::Succeeded, UiLanguage::English) => "provider succeeded",
+        (AiRequestOutcome::Failed, UiLanguage::English) => "provider failed",
+        (AiRequestOutcome::Cancelled, UiLanguage::English) => "cancelled",
+        (AiRequestOutcome::LocalFallback, UiLanguage::English) => "local fallback",
+        (AiRequestOutcome::Succeeded, UiLanguage::Chinese) => "Provider 成功",
+        (AiRequestOutcome::Failed, UiLanguage::Chinese) => "Provider 失败",
+        (AiRequestOutcome::Cancelled, UiLanguage::Chinese) => "已取消",
+        (AiRequestOutcome::LocalFallback, UiLanguage::Chinese) => "已回退本地分析",
+    }
+}
+
+const fn privacy_outcome_symbol(outcome: AiRequestOutcome) -> &'static str {
+    match outcome {
+        AiRequestOutcome::Succeeded => "✓",
+        AiRequestOutcome::LocalFallback => "↩",
+        AiRequestOutcome::Failed => "!",
+        AiRequestOutcome::Cancelled => "×",
+    }
+}
+
+const fn privacy_receipt_color(outcome: AiRequestOutcome) -> Color {
+    match outcome {
+        AiRequestOutcome::Succeeded => Color::Green,
+        AiRequestOutcome::LocalFallback => Color::Yellow,
+        AiRequestOutcome::Failed => Color::Red,
+        AiRequestOutcome::Cancelled => Color::DarkGray,
+    }
+}
+
+fn format_char_count(characters: u64, language: UiLanguage) -> String {
+    match language {
+        UiLanguage::English => format!("{characters} chars"),
+        UiLanguage::Chinese => format!("{characters} 字符"),
+    }
 }
 
 fn is_insert_shortcut(key: KeyEvent, input_is_empty: bool) -> bool {
@@ -1687,6 +1880,15 @@ mod tests {
         assert!(paths.history_file.exists());
         app.add_recommendation("echo private");
         app.streaming = true;
+        app.privacy_receipt = Some(PrivacyReceipt {
+            purpose: AiRequestPurpose::Chat,
+            outcome: AiRequestOutcome::Succeeded,
+            payload_chars: 50,
+            payload_items: 2,
+            redactions: 1,
+            redaction_enabled: true,
+            elapsed_ms: 20,
+        });
 
         handle_ipc_event(
             EventBody::DataCleared {
@@ -1698,7 +1900,65 @@ mod tests {
         assert!(app.messages.is_empty());
         assert!(app.recommendations.is_empty());
         assert!(!app.streaming);
+        assert!(app.privacy_receipt.is_none());
         assert!(app.status.contains("cleared"));
         assert!(!paths.history_file.exists());
+    }
+
+    #[test]
+    fn privacy_receipts_are_visible_but_never_added_to_chat_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ProductPaths::from_home(directory.path());
+        let config = Config::default();
+        let mut app = App::new(SessionId::new(), &config, &paths, false);
+        let receipt = PrivacyReceipt {
+            purpose: AiRequestPurpose::Completion,
+            outcome: AiRequestOutcome::Succeeded,
+            payload_chars: 1_234,
+            payload_items: 5,
+            redactions: 2,
+            redaction_enabled: true,
+            elapsed_ms: 48,
+        };
+
+        handle_ipc_event(EventBody::PrivacyReceipt(receipt.clone()), &mut app);
+
+        assert_eq!(app.privacy_receipt, Some(receipt));
+        assert!(app.status.contains("1234 chars"));
+        assert!(app.messages.is_empty());
+        assert!(!paths.history_file.exists());
+    }
+
+    #[test]
+    fn privacy_receipt_popup_renders_at_a_standard_terminal_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ProductPaths::from_home(directory.path());
+        let mut app = App::new(SessionId::new(), &Config::default(), &paths, false);
+        app.privacy_receipt = Some(PrivacyReceipt {
+            purpose: AiRequestPurpose::Chat,
+            outcome: AiRequestOutcome::Succeeded,
+            payload_chars: 1_234,
+            payload_items: 4,
+            redactions: 2,
+            redaction_enabled: true,
+            elapsed_ms: 48,
+        });
+        app.show_privacy = true;
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Live Privacy Receipt"));
+        assert!(rendered.contains("Payload after redaction: 1234 chars"));
+        assert!(rendered.contains("Provider elapsed: 48 ms"));
+        assert!(rendered.contains("provider succeeded"));
     }
 }

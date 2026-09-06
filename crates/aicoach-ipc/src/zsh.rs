@@ -536,6 +536,31 @@ pub fn encode_message(message: &Message) -> Result<String, ZshProtocolError> {
                 }
                 .to_owned(),
             ],
+            EventBody::PrivacyReceipt(receipt) => vec![
+                "PRIVACY_RECEIPT".to_owned(),
+                event.session_id.to_string(),
+                event
+                    .request_id
+                    .map_or_else(String::new, |value| value.to_string()),
+                match receipt.purpose {
+                    crate::protocol::AiRequestPurpose::Completion => "completion",
+                    crate::protocol::AiRequestPurpose::Analysis => "analysis",
+                    crate::protocol::AiRequestPurpose::Chat => "chat",
+                }
+                .to_owned(),
+                match receipt.outcome {
+                    crate::protocol::AiRequestOutcome::Succeeded => "succeeded",
+                    crate::protocol::AiRequestOutcome::Failed => "failed",
+                    crate::protocol::AiRequestOutcome::Cancelled => "cancelled",
+                    crate::protocol::AiRequestOutcome::LocalFallback => "local_fallback",
+                }
+                .to_owned(),
+                receipt.payload_chars.to_string(),
+                receipt.payload_items.to_string(),
+                receipt.redactions.to_string(),
+                receipt.redaction_enabled.to_string(),
+                receipt.elapsed_ms.to_string(),
+            ],
             EventBody::SessionClosed => vec!["CLOSED".to_owned(), event.session_id.to_string()],
         },
         Message::Request { .. } => return Err(ZshProtocolError::UnsupportedMessage),
@@ -750,6 +775,32 @@ mod tests {
         assert!(encoded.starts_with(&format!(
             "ERROR\t{session}\t{request}\tai_unavailable\tinterrupted\ttrue"
         )));
+    }
+
+    #[test]
+    fn privacy_receipt_shell_shape_contains_metadata_only() {
+        let session = SessionId::new();
+        let request = RequestId::new();
+        let encoded = encode_message(&Message::from(Event::new(
+            session,
+            Some(request),
+            EventBody::PrivacyReceipt(crate::protocol::PrivacyReceipt {
+                purpose: crate::protocol::AiRequestPurpose::Analysis,
+                outcome: crate::protocol::AiRequestOutcome::LocalFallback,
+                payload_chars: 900,
+                payload_items: 4,
+                redactions: 3,
+                redaction_enabled: true,
+                elapsed_ms: 75,
+            }),
+        )))
+        .unwrap();
+        assert_eq!(
+            encoded,
+            format!(
+                "PRIVACY_RECEIPT\t{session}\t{request}\tanalysis\tlocal_fallback\t900\t4\t3\ttrue\t75"
+            )
+        );
     }
 
     #[test]

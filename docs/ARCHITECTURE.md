@@ -1,7 +1,7 @@
 # Architecture
 
 This document is the map for changing AI Terminal Coach without weakening its product, privacy,
-or safety boundaries. It describes `main` and protocol version 2. The Rust types remain the source
+or safety boundaries. It describes `main` and protocol version 3. The Rust types remain the source
 of truth when this guide and code disagree.
 
 ## Non-negotiable invariants
@@ -17,6 +17,8 @@ Every change must preserve these properties:
 6. Provider-bound command, output, path, Git, and chat content passes through the configured privacy
    redactor. Long-lived local-memory metadata is not added to provider prompts.
 7. Logs record operation metadata and safe error kinds, never request or response bodies.
+8. Privacy Receipts contain provider-bound counts and outcomes only; they are live observer state,
+   never shell output, chat history, logs, or retained session content.
 
 ## Process topology
 
@@ -96,6 +98,15 @@ that combines local policy, session state, routing, and provider access.
 Chat deltas and completion/failure events return to the connection that created the request. This
 prevents a TUI stream from appearing as shell output. Session notifications use a separate route:
 the shell owner plus clients that subscribed by requesting context or chat for that session.
+
+### Provider boundary and Privacy Receipts
+
+Completion, analysis, and chat inputs are bounded first, then redacted immediately before the
+provider abstraction. At that boundary the daemon records only aggregate replacement count,
+serialized application-payload character count, payload-item count, and provider elapsed time.
+After the attempt finishes it publishes one typed Privacy Receipt to subscribed non-shell observers.
+The event contains no content and is not replayed or persisted. Local-only work emits no receipt;
+provider failure during analysis is reported as a local fallback rather than a false success.
 
 ### Local data clearing
 
