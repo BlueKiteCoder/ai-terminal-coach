@@ -525,6 +525,7 @@ mod tests {
                 "/Users/alice/work/demo/.venv".to_owned(),
             )]),
             checkpoint: None,
+            provider_access_enabled: true,
             commands: vec![aicoach_ipc::ContextCommand {
                 command_id: aicoach_ipc::CommandId::new(),
                 command: format!("curl 'https://example.test?api_key={secret}'"),
@@ -565,6 +566,7 @@ mod tests {
             shell: "zsh".to_owned(),
             environment: std::collections::BTreeMap::new(),
             checkpoint: None,
+            provider_access_enabled: true,
             commands: vec![
                 aicoach_ipc::ContextCommand {
                     command_id: aicoach_ipc::CommandId::new(),
@@ -628,6 +630,7 @@ mod tests {
                 resolved_after_command_id: Some(after),
                 resolution_command_id: Some(resolution_command),
             })),
+            provider_access_enabled: true,
             commands: vec![
                 aicoach_ipc::ContextCommand {
                     command_id: before,
@@ -730,6 +733,7 @@ mod tests {
             shell: "zsh".to_owned(),
             environment: std::collections::BTreeMap::new(),
             checkpoint: None,
+            provider_access_enabled: true,
             commands: Vec::new(),
         };
         let server_context = expected.clone();

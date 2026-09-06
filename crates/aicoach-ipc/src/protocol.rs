@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use aicoach_core::{AnalysisCoverage, RiskLensReport, RiskLevel, SourceCard};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 4 * 1024 * 1024;
 pub const SHELL_ENVIRONMENT_ALLOWLIST: [&str; 7] = [
     "LANG",
@@ -219,6 +219,20 @@ pub struct ContextParams {
     pub max_commands: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AirlockOperation {
+    Status,
+    Seal,
+    Open,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AirlockParams {
+    #[serde(flatten)]
+    pub operation: AirlockOperation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CheckpointOperation {
@@ -320,6 +334,7 @@ pub enum RequestBody {
     Cancel(CancelParams),
     Chat(ChatParams),
     Context(ContextParams),
+    Airlock(AirlockParams),
     Checkpoint(CheckpointParams),
     Data(DataParams),
     InsertBuffer(InsertBufferParams),
@@ -426,7 +441,13 @@ pub struct SessionContext {
     pub environment: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<Box<SessionCheckpoint>>,
+    #[serde(default = "provider_access_default")]
+    pub provider_access_enabled: bool,
     pub commands: Vec<ContextCommand>,
+}
+
+const fn provider_access_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +463,15 @@ pub struct SessionDataSummary {
     pub discarded_finish_markers: usize,
     pub active_ai_requests: usize,
     pub pending_failure: bool,
+    #[serde(default = "provider_access_default")]
+    pub provider_access_enabled: bool,
+}
+
+/// Content-free state returned after inspecting or changing a Session Airlock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AirlockStatus {
+    pub provider_access_enabled: bool,
+    pub cancelled_requests: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +541,7 @@ pub enum ResponseResult {
         message: String,
     },
     Context(SessionContext),
+    Airlock(AirlockStatus),
     Checkpoint {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         checkpoint: Option<Box<SessionCheckpoint>>,
@@ -592,6 +623,7 @@ pub enum EventBody {
     InsertBuffer(InsertBufferParams),
     RequestCancelled,
     DataCleared { scope: DataClearScope },
+    AirlockChanged(AirlockStatus),
     PrivacyReceipt(PrivacyReceipt),
     SessionClosed,
 }
@@ -768,6 +800,35 @@ mod tests {
     }
 
     #[test]
+    fn airlock_request_status_and_event_round_trip() {
+        let session_id = SessionId::new();
+        let request = Request::new(
+            Some(session_id),
+            RequestBody::Airlock(AirlockParams {
+                operation: AirlockOperation::Seal,
+            }),
+        );
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains(r#""method":"airlock""#));
+        assert!(encoded.contains(r#""action":"seal""#));
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
+
+        let event = Event::new(
+            session_id,
+            None,
+            EventBody::AirlockChanged(AirlockStatus {
+                provider_access_enabled: false,
+                cancelled_requests: 2,
+            }),
+        );
+        let message = Message::from(event.clone());
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains(r#""event":"airlock_changed""#));
+        assert!(!encoded.contains("prompt"));
+        assert_eq!(serde_json::from_str::<Message>(&encoded).unwrap(), message);
+    }
+
+    #[test]
     fn environment_filter_keeps_only_allowlisted_metadata() {
         let environment = BTreeMap::from([
             ("LANG".to_owned(), "zh_CN.UTF-8".to_owned()),
@@ -862,6 +923,7 @@ mod tests {
                 discarded_finish_markers: 0,
                 active_ai_requests: 0,
                 pending_failure: false,
+                provider_access_enabled: false,
             }],
             source_card_cache_entries: 1,
             limits: SessionDataLimits {
@@ -880,6 +942,12 @@ mod tests {
             serde_json::from_str::<DaemonDataResult>(&encoded).unwrap(),
             result
         );
+        let legacy = encoded.replace(r#","provider_access_enabled":false"#, "");
+        let legacy = serde_json::from_str::<DaemonDataResult>(&legacy).unwrap();
+        let DaemonDataResult::Inventory { sessions, .. } = legacy else {
+            unreachable!()
+        };
+        assert!(sessions[0].provider_access_enabled);
     }
 
     #[test]
@@ -890,6 +958,7 @@ mod tests {
         );
         let context: SessionContext = serde_json::from_str(&json).unwrap();
         assert!(context.checkpoint.is_none());
+        assert!(context.provider_access_enabled);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Architecture
 
 This document is the map for changing AI Terminal Coach without weakening its product, privacy,
-or safety boundaries. It describes `main` and protocol version 3. The Rust types remain the source
+or safety boundaries. It describes `main` and protocol version 4. The Rust types remain the source
 of truth when this guide and code disagree.
 
 ## Non-negotiable invariants
@@ -19,6 +19,8 @@ Every change must preserve these properties:
 7. Logs record operation metadata and safe error kinds, never request or response bodies.
 8. Privacy Receipts contain provider-bound counts and outcomes only; they are live observer state,
    never shell output, chat history, logs, or retained session content.
+9. A sealed Session Airlock atomically prevents new provider work and cancels active provider work
+   without disabling local analysis or changing another terminal session.
 
 ## Process topology
 
@@ -65,13 +67,13 @@ that combines local policy, session state, routing, and provider access.
 | `aicoach-core` | Config, privacy, local analysis, safety, Risk Lens, Command Patch, Source Cards, Git metadata, Failure Fingerprints | Sockets, UI state, provider HTTP |
 | `aicoach-ai` | Provider trait, OpenAI-compatible HTTP/JSON/SSE, cancellation, retry, timeouts, credential-safe errors | Session retention, ZLE mutation, local safety policy |
 | `aicoach-ipc` | Typed requests/responses/events, identifiers, frame limits, JSON and Zsh codecs | Authorization policy, request execution |
-| `aicoach-daemon` | Session lifecycle, request routing, cancellation, event delivery, local-first orchestration, provider boundary | Installation, terminal key capture |
-| `aicoach-cli` | Install/uninstall, LaunchAgents, Keychain setup, configuration, doctor, public-safe Support Report, Capsule, checkpoints, data controls | Interactive chat rendering, provider calls |
-| `aicoach-tui` | Ratatui state, input, streaming display, scrolling, safe copy/insert requests, bounded disk chat history | Shell ownership, direct ZLE mutation |
+| `aicoach-daemon` | Session lifecycle, request routing, cancellation, event delivery, local-first orchestration, atomic Session Airlock, provider boundary | Installation, terminal key capture |
+| `aicoach-cli` | Install/uninstall, LaunchAgents, Keychain setup, configuration, doctor, public-safe Support Report, Capsule, checkpoints, Airlock and data controls | Interactive chat rendering, provider calls |
+| `aicoach-tui` | Ratatui state, input, streaming display, Airlock control, scrolling, safe copy/insert requests, bounded disk chat history | Shell ownership, direct ZLE mutation |
 | `shell/aicoach.zsh` | `preexec`/`precmd`, allowlisted environment snapshot, ZLE buffer ownership, physical shortcuts | AI HTTP, long-lived policy decisions |
 | `macos/` and `scripts/` | Global hotkey helper and Terminal.app/iTerm2 window coordination | Command collection or execution |
 
-## Four important flows
+## Six important flows
 
 ### Command failure
 
@@ -108,12 +110,24 @@ After the attempt finishes it publishes one typed Privacy Receipt to subscribed 
 The event contains no content and is not replayed or persisted. Local-only work emits no receipt;
 provider failure during analysis is reported as a local fallback rather than a false success.
 
+### Session Airlock
+
+Each daemon session owns a default-open, memory-only provider-access flag. Provider request
+registration checks that flag while holding the same state lock that `seal` uses to turn it off and
+drain/cancel active work. This makes the boundary atomic: a completion, analysis, or chat request is
+either registered before the seal and cancelled, or rejected before provider payload preparation.
+The TUI and CLI can query and change the flag; only non-shell observers receive the asynchronous
+state event. Risk Lens, Source Cards, diagnostics, context, failure memory, and data controls remain
+local and available. Clearing data preserves the flag. A deliberate daemon restart discards all
+sessions, so a later session starts open by default.
+
 ### Local data clearing
 
-The daemon clears and cancels in-memory state first, then emits `data_cleared` to open Coach windows
-before acknowledging the CLI. The CLI handles disk files with typed scopes. A late shell FINISH
-frame for an erased in-flight command is consumed without recreating the deleted context. Config,
-support files, the shell backup, and Keychain credentials are outside every data-clear scope.
+The daemon clears and cancels in-memory content first, then emits `data_cleared` to open Coach
+windows before acknowledging the CLI. The CLI handles disk files with typed scopes without
+restarting a running daemon. A late shell FINISH frame for an erased in-flight command is consumed
+without recreating the deleted context. Config, support files, the shell backup, Keychain
+credentials, and the per-session Airlock flag are outside every data-clear scope.
 
 ## State and trust boundaries
 

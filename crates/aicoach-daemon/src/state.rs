@@ -40,6 +40,12 @@ pub enum ActiveRequestKind {
     Chat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginRequestError {
+    SessionNotFound,
+    AirlockSealed,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionLimits {
     pub max_commands: usize,
@@ -139,6 +145,7 @@ struct Session {
     commands: VecDeque<ContextCommand>,
     chat: VecDeque<(bool, String)>,
     active: HashMap<RequestId, ActiveRequest>,
+    provider_access_enabled: bool,
     checkpoint: Option<SessionCheckpoint>,
     last_success: Option<SuccessfulCommandBaseline>,
     last_accessed: Instant,
@@ -190,6 +197,7 @@ impl SessionManager {
             commands: VecDeque::new(),
             chat: VecDeque::new(),
             active: HashMap::new(),
+            provider_access_enabled: true,
             checkpoint: None,
             last_success: None,
             last_accessed: now,
@@ -234,6 +242,7 @@ impl SessionManager {
             commands: VecDeque::new(),
             chat: VecDeque::new(),
             active: HashMap::new(),
+            provider_access_enabled: true,
             checkpoint: None,
             last_success: None,
             last_accessed: now,
@@ -621,6 +630,7 @@ impl SessionManager {
             shell: session.shell.clone(),
             environment: session.environment.clone(),
             checkpoint: session.checkpoint.clone().map(Box::new),
+            provider_access_enabled: session.provider_access_enabled,
             commands: session.commands.iter().skip(skip).cloned().collect(),
         })
     }
@@ -658,36 +668,55 @@ impl SessionManager {
         true
     }
 
-    pub fn begin_request(
+    /// Atomically checks the per-session Airlock and registers provider work.
+    /// A request can therefore never slip in after the session is sealed.
+    pub fn begin_provider_request(
         &self,
         session_id: SessionId,
         request_id: RequestId,
         kind: ActiveRequestKind,
-    ) -> Option<(CancellationToken, Option<RequestId>)> {
+    ) -> Result<(CancellationToken, Option<RequestId>), BeginRequestError> {
+        let mut state = self.state.lock();
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(BeginRequestError::SessionNotFound)?;
+        session.last_accessed = Instant::now();
+        if !session.provider_access_enabled {
+            return Err(BeginRequestError::AirlockSealed);
+        }
+        Ok(begin_request_for_session(session, request_id, kind))
+    }
+
+    pub fn provider_access_enabled(&self, session_id: SessionId) -> Option<bool> {
         let mut state = self.state.lock();
         let session = state.sessions.get_mut(&session_id)?;
         session.last_accessed = Instant::now();
-        let mut superseded = None;
-        if kind == ActiveRequestKind::Completion
-            && let Some((old_id, old)) = session
-                .active
-                .iter()
-                .find(|(_, active)| active.kind == ActiveRequestKind::Completion)
-                .map(|(id, active)| (*id, active.cancellation.clone()))
-        {
-            old.cancel();
-            session.active.remove(&old_id);
-            superseded = Some(old_id);
+        Some(session.provider_access_enabled)
+    }
+
+    /// Changes one session's provider boundary. Sealing and cancellation occur
+    /// under the same lock, so no new provider request can race past the seal.
+    pub fn set_provider_access(
+        &self,
+        session_id: SessionId,
+        enabled: bool,
+    ) -> Option<(bool, Vec<RequestId>)> {
+        let mut state = self.state.lock();
+        let session = state.sessions.get_mut(&session_id)?;
+        let changed = session.provider_access_enabled != enabled;
+        session.provider_access_enabled = enabled;
+        session.last_accessed = Instant::now();
+        if enabled {
+            return Some((changed, Vec::new()));
         }
-        let cancellation = CancellationToken::new();
-        session.active.insert(
-            request_id,
-            ActiveRequest {
-                kind,
-                cancellation: cancellation.clone(),
-            },
-        );
-        Some((cancellation, superseded))
+        let mut cancelled = session.active.keys().copied().collect::<Vec<_>>();
+        cancelled.sort_unstable();
+        for request in session.active.values() {
+            request.cancellation.cancel();
+        }
+        session.active.clear();
+        Some((changed, cancelled))
     }
 
     pub fn end_request(&self, session_id: SessionId, request_id: RequestId) {
@@ -824,7 +853,36 @@ fn session_data_summary(session: &Session) -> SessionDataSummary {
         discarded_finish_markers: session.discarded_commands.len(),
         active_ai_requests: session.active.len(),
         pending_failure: false,
+        provider_access_enabled: session.provider_access_enabled,
     }
+}
+
+fn begin_request_for_session(
+    session: &mut Session,
+    request_id: RequestId,
+    kind: ActiveRequestKind,
+) -> (CancellationToken, Option<RequestId>) {
+    let mut superseded = None;
+    if kind == ActiveRequestKind::Completion
+        && let Some((old_id, old)) = session
+            .active
+            .iter()
+            .find(|(_, active)| active.kind == ActiveRequestKind::Completion)
+            .map(|(id, active)| (*id, active.cancellation.clone()))
+    {
+        old.cancel();
+        session.active.remove(&old_id);
+        superseded = Some(old_id);
+    }
+    let cancellation = CancellationToken::new();
+    session.active.insert(
+        request_id,
+        ActiveRequest {
+            kind,
+            cancellation: cancellation.clone(),
+        },
+    );
+    (cancellation, superseded)
 }
 
 fn clear_transient_session_data(
@@ -998,16 +1056,90 @@ mod tests {
         manager.register(ConnectionId::new(), registration(session));
         let first = RequestId::new();
         let first_token = manager
-            .begin_request(session, first, ActiveRequestKind::Completion)
+            .begin_provider_request(session, first, ActiveRequestKind::Completion)
             .unwrap()
             .0;
         let second = RequestId::new();
         let (_, superseded) = manager
-            .begin_request(session, second, ActiveRequestKind::Completion)
+            .begin_provider_request(session, second, ActiveRequestKind::Completion)
             .unwrap();
         assert_eq!(superseded, Some(first));
         assert!(first_token.is_cancelled());
         assert_eq!(manager.active_request_count(session), 1);
+    }
+
+    #[test]
+    fn airlock_is_session_scoped_atomic_and_reversible() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let sealed = SessionId::new();
+        let open = SessionId::new();
+        let connection = ConnectionId::new();
+        manager.register(connection, registration(sealed));
+        manager.register(ConnectionId::new(), registration(open));
+        assert_eq!(manager.provider_access_enabled(sealed), Some(true));
+        assert_eq!(manager.provider_access_enabled(open), Some(true));
+
+        let active_id = RequestId::new();
+        let (active, _) = manager
+            .begin_provider_request(sealed, active_id, ActiveRequestKind::Chat)
+            .unwrap();
+        let (changed, cancelled) = manager.set_provider_access(sealed, false).unwrap();
+        assert!(changed);
+        assert_eq!(cancelled, vec![active_id]);
+        assert_eq!(
+            manager.set_provider_access(sealed, false),
+            Some((false, Vec::new()))
+        );
+        assert!(active.is_cancelled());
+        assert_eq!(manager.active_request_count(sealed), 0);
+        assert_eq!(manager.provider_access_enabled(sealed), Some(false));
+        assert_eq!(manager.provider_access_enabled(open), Some(true));
+        assert!(matches!(
+            manager.begin_provider_request(sealed, RequestId::new(), ActiveRequestKind::Completion),
+            Err(BeginRequestError::AirlockSealed)
+        ));
+        assert!(
+            manager
+                .begin_provider_request(open, RequestId::new(), ActiveRequestKind::Completion)
+                .is_ok()
+        );
+
+        assert_eq!(
+            manager.set_provider_access(sealed, true),
+            Some((true, Vec::new()))
+        );
+        assert_eq!(
+            manager.set_provider_access(sealed, true),
+            Some((false, Vec::new()))
+        );
+        assert!(
+            manager
+                .begin_provider_request(sealed, RequestId::new(), ActiveRequestKind::Chat)
+                .is_ok()
+        );
+
+        // Reconnecting an existing session must not silently change the state.
+        manager.set_provider_access(sealed, false).unwrap();
+        manager.register(connection, registration(sealed));
+        assert_eq!(manager.provider_access_enabled(sealed), Some(false));
+    }
+
+    #[test]
+    fn clearing_session_data_does_not_reopen_airlock() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let session = SessionId::new();
+        manager.register(ConnectionId::new(), registration(session));
+        manager.set_provider_access(session, false).unwrap();
+
+        manager.clear_session_data(session, true).unwrap();
+
+        assert_eq!(manager.provider_access_enabled(session), Some(false));
+        assert!(!manager.data_inventory()[0].provider_access_enabled);
+        assert!(
+            manager
+                .context(session, None)
+                .is_some_and(|context| !context.provider_access_enabled)
+        );
     }
 
     #[test]
@@ -1543,7 +1675,7 @@ mod tests {
             .unwrap();
         assert!(manager.push_chat(session, true, "private chat".to_owned()));
         let (cancellation, _) = manager
-            .begin_request(session, RequestId::new(), ActiveRequestKind::Chat)
+            .begin_provider_request(session, RequestId::new(), ActiveRequestKind::Chat)
             .unwrap();
         let clearing = CommandId::new();
         assert!(manager.start_command(

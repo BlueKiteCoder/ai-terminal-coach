@@ -19,11 +19,12 @@ use aicoach_core::{
     source_card_from_output, source_queries, strip_terminal_sequences, try_collect_git_context,
 };
 use aicoach_ipc::{
-    AiRequestOutcome, AiRequestPurpose, CheckpointOperation, ClientCapabilities, ClientKind,
-    CompletionOperation, CompletionResult, DaemonDataResult, DataClearScope, DataOperation, Event,
-    EventBody, Hint, Message, PROTOCOL_VERSION, PrivacyReceipt, Request, RequestBody, Response,
-    ResponseResult, RiskLensResult, SafetyClassification, SessionContext, SessionId, Severity,
-    WireProtocol, decode_incoming, encode_outgoing,
+    AiRequestOutcome, AiRequestPurpose, AirlockOperation, AirlockStatus, CheckpointOperation,
+    ClientCapabilities, ClientKind, CompletionOperation, CompletionResult, DaemonDataResult,
+    DataClearScope, DataOperation, Event, EventBody, Hint, Message, PROTOCOL_VERSION,
+    PrivacyReceipt, Request, RequestBody, Response, ResponseResult, RiskLensResult,
+    SafetyClassification, SessionContext, SessionId, Severity, WireProtocol, decode_incoming,
+    encode_outgoing,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -44,8 +45,8 @@ use tracing::{debug, info, warn};
 use crate::{
     capture::capture_screen_tail,
     state::{
-        ActiveRequestKind, AnalysisJob, CheckpointError, ConnectionId, FinishCommand,
-        SessionLimits, SessionManager,
+        ActiveRequestKind, AnalysisJob, BeginRequestError, CheckpointError, ConnectionId,
+        FinishCommand, SessionLimits, SessionManager,
     },
 };
 
@@ -670,13 +671,20 @@ impl Daemon {
                     return;
                 }
 
-                let Some((cancellation, superseded)) = self.sessions.begin_request(
+                let (cancellation, superseded) = match self.sessions.begin_provider_request(
                     session_id,
                     request.request_id,
                     ActiveRequestKind::Completion,
-                ) else {
-                    send_unknown_session(&sender, &request).await;
-                    return;
+                ) {
+                    Ok(active) => active,
+                    Err(BeginRequestError::SessionNotFound) => {
+                        send_unknown_session(&sender, &request).await;
+                        return;
+                    }
+                    Err(BeginRequestError::AirlockSealed) => {
+                        send_airlock_sealed(&sender, &request, &self.options.coach_language).await;
+                        return;
+                    }
                 };
                 if !self.route_request(session_id, request.request_id, connection_id) {
                     cancellation.cancel();
@@ -802,13 +810,20 @@ impl Daemon {
                     send_missing_session(&sender, &request).await;
                     return;
                 };
-                let Some((cancellation, _)) = self.sessions.begin_request(
+                let (cancellation, _) = match self.sessions.begin_provider_request(
                     session_id,
                     request.request_id,
                     ActiveRequestKind::Chat,
-                ) else {
-                    send_unknown_session(&sender, &request).await;
-                    return;
+                ) {
+                    Ok(active) => active,
+                    Err(BeginRequestError::SessionNotFound) => {
+                        send_unknown_session(&sender, &request).await;
+                        return;
+                    }
+                    Err(BeginRequestError::AirlockSealed) => {
+                        send_airlock_sealed(&sender, &request, &self.options.coach_language).await;
+                        return;
+                    }
                 };
                 self.subscribe_session(session_id, connection_id);
                 if !self.route_request(session_id, request.request_id, connection_id) {
@@ -860,6 +875,66 @@ impl Daemon {
                     .await;
                 } else {
                     send_unknown_session(&sender, &request).await;
+                }
+            }
+            RequestBody::Airlock(params) => {
+                let Some(session_id) = request.session_id else {
+                    send_missing_session(&sender, &request).await;
+                    return;
+                };
+                let (enabled, changed, cancelled) = match params.operation {
+                    AirlockOperation::Status => {
+                        let Some(enabled) = self.sessions.provider_access_enabled(session_id)
+                        else {
+                            send_unknown_session(&sender, &request).await;
+                            return;
+                        };
+                        (enabled, false, Vec::new())
+                    }
+                    AirlockOperation::Seal => {
+                        let Some((changed, cancelled)) =
+                            self.sessions.set_provider_access(session_id, false)
+                        else {
+                            send_unknown_session(&sender, &request).await;
+                            return;
+                        };
+                        (false, changed, cancelled)
+                    }
+                    AirlockOperation::Open => {
+                        let Some((changed, cancelled)) =
+                            self.sessions.set_provider_access(session_id, true)
+                        else {
+                            send_unknown_session(&sender, &request).await;
+                            return;
+                        };
+                        (true, changed, cancelled)
+                    }
+                };
+                for cancelled_request in &cancelled {
+                    self.send_request_event(Event::new(
+                        session_id,
+                        Some(*cancelled_request),
+                        EventBody::RequestCancelled,
+                    ))
+                    .await;
+                    self.unroute_request(session_id, *cancelled_request);
+                }
+                let status = AirlockStatus {
+                    provider_access_enabled: enabled,
+                    cancelled_requests: count_u64(cancelled.len()),
+                };
+                send_response(
+                    &sender,
+                    Response::ok(&request, ResponseResult::Airlock(status.clone())),
+                )
+                .await;
+                if changed {
+                    self.send_session_event(Event::new(
+                        session_id,
+                        Some(request.request_id),
+                        EventBody::AirlockChanged(status),
+                    ))
+                    .await;
                 }
             }
             RequestBody::Checkpoint(params) => {
@@ -1000,14 +1075,35 @@ impl Daemon {
                         )
                     }
                     DataOperation::ClearAllTransient => {
+                        let clear_memory = {
+                            let mut memory = self.failure_memory.lock();
+                            memory
+                                .as_mut()
+                                .map(aicoach_core::FailureMemory::clear)
+                                .transpose()
+                        };
+                        let cleared_memory = match clear_memory {
+                            Ok(cleared) => cleared,
+                            Err(error) => {
+                                warn!(error = %error, "could not clear local failure memory");
+                                send_error(
+                                    &sender,
+                                    &request,
+                                    "data_clear_failed",
+                                    "failure memory could not be cleared; session data was preserved",
+                                    false,
+                                )
+                                .await;
+                                return;
+                            }
+                        };
                         let (affected, mut removed) = self
                             .sessions
                             .clear_all_transient(params.exclude_active_command);
-                        removed.pending_failures = self
-                            .failure_memory
-                            .lock()
-                            .as_mut()
-                            .map_or(0, aicoach_core::FailureMemory::clear_all_pending);
+                        if let Some((fingerprints, pending)) = cleared_memory {
+                            removed.failure_fingerprints = fingerprints;
+                            removed.pending_failures = pending;
+                        }
                         removed.source_card_cache_entries = {
                             let mut cache = self.source_card_cache.write();
                             let count = cache.len();
@@ -1150,19 +1246,55 @@ impl Daemon {
         if !local.needs_response() {
             return;
         }
-        let Some((cancellation, _)) = self.sessions.begin_request(
+        if !local.needs_ai {
+            let result =
+                localized_local_analysis(local.into_result(), &self.options.coach_language);
+            if result.need_response {
+                self.send_session_event(Event::new(
+                    job.session_id,
+                    Some(job.request_id),
+                    EventBody::Hint(hint_from_analysis(&result, &self.options.coach_language)),
+                ))
+                .await;
+            }
+            return;
+        }
+        let (cancellation, _) = match self.sessions.begin_provider_request(
             job.session_id,
             job.request_id,
             ActiveRequestKind::Analysis,
-        ) else {
-            return;
+        ) {
+            Ok(active) => active,
+            Err(BeginRequestError::SessionNotFound) => return,
+            Err(BeginRequestError::AirlockSealed) => {
+                let mut result =
+                    localized_local_analysis(local.into_result(), &self.options.coach_language);
+                let notice = localized_text(
+                    &self.options.coach_language,
+                    "Session Airlock is sealed; provider analysis was skipped.",
+                    "会话气闸已密封；已跳过 Provider 分析。",
+                );
+                if !result.message.is_empty() {
+                    result.message.push_str("\n\n");
+                }
+                result.message.push_str(notice);
+                if result.need_response {
+                    self.send_session_event(Event::new(
+                        job.session_id,
+                        Some(job.request_id),
+                        EventBody::Hint(hint_from_analysis(&result, &self.options.coach_language)),
+                    ))
+                    .await;
+                }
+                return;
+            }
         };
         if !self.route_request(job.session_id, job.request_id, origin) {
             cancellation.cancel();
             self.sessions.end_request(job.session_id, job.request_id);
             return;
         }
-        let result = if local.needs_ai {
+        let result = {
             let (provider_input, redactions) = self
                 .options
                 .privacy_redactor
@@ -1216,8 +1348,6 @@ impl Daemon {
                 return;
             };
             result
-        } else {
-            localized_local_analysis(local.into_result(), &self.options.coach_language)
         };
         if result.need_response && !cancellation.is_cancelled() {
             self.send_session_event(Event::new(
@@ -1799,7 +1929,10 @@ impl Daemon {
     async fn send_session_event(&self, event: Event) {
         let suppress_shell_hint =
             !self.options.inline_hint && matches!(event.body, EventBody::Hint(_));
-        let content_free_observer_only = matches!(event.body, EventBody::PrivacyReceipt(_));
+        let content_free_observer_only = matches!(
+            event.body,
+            EventBody::PrivacyReceipt(_) | EventBody::AirlockChanged(_)
+        );
         let owner = self.sessions.connection_for(event.session_id);
         let mut targets = HashSet::new();
         if let Some(owner) = owner {
@@ -2188,6 +2321,21 @@ async fn send_unknown_session(sender: &mpsc::Sender<Message>, request: &Request)
         request,
         "session_not_found",
         "session is not registered",
+        false,
+    )
+    .await;
+}
+
+async fn send_airlock_sealed(sender: &mpsc::Sender<Message>, request: &Request, language: &str) {
+    send_error(
+        sender,
+        request,
+        "airlock_sealed",
+        localized_text(
+            language,
+            "Session Airlock is sealed; no provider request was sent",
+            "会话气闸已密封；未向 Provider 发送请求",
+        ),
         false,
     )
     .await;
@@ -3015,6 +3163,7 @@ fn request_method(body: &RequestBody) -> &'static str {
         RequestBody::Cancel(_) => "cancel",
         RequestBody::Chat(_) => "chat",
         RequestBody::Context(_) => "context",
+        RequestBody::Airlock(_) => "airlock",
         RequestBody::Checkpoint(_) => "checkpoint",
         RequestBody::Data(_) => "data",
         RequestBody::InsertBuffer(_) => "insert_buffer",

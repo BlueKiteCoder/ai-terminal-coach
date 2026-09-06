@@ -4,7 +4,7 @@ AI Terminal Coach uses a versioned local protocol between Zsh, the CLI, the TUI,
 This guide explains the contract contributors must preserve. The authoritative types are in
 `crates/aicoach-ipc/src/protocol.rs`; codecs and frame handling live beside them.
 
-Current protocol version: **3**
+Current protocol version: **4**
 
 ## Transport
 
@@ -72,6 +72,7 @@ error code, and structured fields.
 | `cancel` | yes | Cancel one request by ID | Cancellation is session-scoped |
 | `chat` | yes | Ask a terminal-inline or TUI question | Redacted; stream events return to origin |
 | `context` | yes | Read bounded session context | Also subscribes the client to notifications |
+| `airlock` | yes | Inspect, seal, or open the session's provider boundary | Seal atomically blocks new provider work and cancels active work |
 | `checkpoint` | yes | Start, resolve, inspect, or clear a marker | Marker never enters provider prompts |
 | `data` | varies | Inventory or clear typed local-data scopes | Inventory contains counts, never content |
 | `insert_buffer` | yes | Ask the daemon to hand a visible proposal to ZLE | Daemon recomputes safety classification |
@@ -94,12 +95,14 @@ Events have four routing classes:
    subscribed to that session through context or chat.
 3. **Shell mutation events** — insert-buffer proposals go only to the current shell owner whose
    negotiated capabilities permit insertion. They never go to a TUI observer.
-4. **Observer metadata events** — live Privacy Receipts go only to non-shell clients subscribed to
-   the session. They are deliberately suppressed for shell clients so asynchronous metadata never
-   disturbs ZLE or terminal output.
+4. **Observer metadata events** — live Privacy Receipts and Session Airlock changes go only to
+   non-shell clients subscribed to the session. They are deliberately suppressed for shell clients
+   so asynchronous metadata never disturbs ZLE or terminal output. The synchronous response to an
+   explicit Airlock command still returns to its caller.
 
 Current event bodies are `hint`, `completion`, `chat_delta`, `chat_done`, `chat_failed`,
-`insert_buffer`, `request_cancelled`, `data_cleared`, `privacy_receipt`, and `session_closed`.
+`insert_buffer`, `request_cancelled`, `data_cleared`, `airlock_changed`, `privacy_receipt`, and
+`session_closed`.
 
 The bounded outbound queue applies backpressure. A disconnected or slow observer must not block the
 shell hook or cause work to be executed elsewhere.
@@ -117,6 +120,11 @@ sessions use an LRU limit and TTL; connected sessions are not evicted.
 Active completion/chat/analysis work has a cancellation token. Disconnect, replacement requests,
 and data clearing cancel the relevant work. A completion response may be valid at the protocol
 level but ZLE still rejects it if the user's current buffer differs from the original snapshot.
+
+Every new session begins with provider access enabled. The Session Airlock flag is retained only in
+daemon memory and is isolated from every other session. Re-registering or clearing data for an
+existing session preserves the flag; a daemon restart or session eviction removes it, so a later
+session starts open again.
 
 ## Security and privacy contract
 
@@ -155,14 +163,38 @@ persistent store. A Coach window must already be subscribed to observe it; the d
 replay old receipts. It proves what this application prepared at its provider boundary, not how an
 external provider stores or processes a request.
 
+### Session Airlock
+
+`airlock` has three actions: `status`, `seal`, and `open`. Its response and change event carry only:
+
+| Field | Meaning |
+|---|---|
+| `provider_access_enabled` | `false` while the session is sealed; `true` while open |
+| `cancelled_requests` | Number of active provider requests cancelled by this operation |
+
+`seal` sets the flag and removes/cancels all active completion, analysis, and chat requests under
+the same state lock. A provider request cannot race through after the seal. New provider-bound
+operations fail with the stable, non-retryable `airlock_sealed` error before a prompt or chat entry
+is prepared. Already-started attempts finish their normal cancellation path and may emit a
+content-free Privacy Receipt with outcome `cancelled`.
+
+The boundary does not disable local Risk Lens, Source Cards, failure recognition, Environment
+Drift, data controls, context, or diagnostics. Automatic failure analysis falls back to its local
+result and emits no Privacy Receipt when the seal prevented provider access entirely. `open` allows
+future provider requests but never sends one by itself. Data clearing does not change the flag.
+The flag is intentionally memory-only: manually restarting the daemon resets all sessions, and a
+new or re-created session starts open. The TUI displays the state continuously; shells never receive
+the asynchronous `airlock_changed` observer event.
+
 ## Compatibility rules
 
 An additive field is compatible when old readers can ignore it and new readers provide a serde
 default when it is absent. Adding an enum variant can still break exhaustive clients, so document
 the minimum compatible release.
 
-Protocol v3 is the minimum version for `privacy_receipt`; the new event variant required the
-version bump so exhaustive v2 clients fail the handshake instead of misinterpreting the stream.
+Protocol v3 is the minimum version for `privacy_receipt`. Protocol v4 adds `airlock`,
+`airlock_changed`, and the default-true provider-access field in context/inventory. The enum variants
+required a bump so exhaustive v3 clients fail the handshake instead of misinterpreting the stream.
 
 Bump `PROTOCOL_VERSION` when changing an existing serialized field name or type, removing a field or
 variant, changing envelope/tag shape, changing identifier meaning, or making previously optional
