@@ -427,6 +427,15 @@ pub fn encode_message(message: &Message) -> Result<String, ZshProtocolError> {
                     serde_json::to_string(context)
                         .map_err(|_| ZshProtocolError::UnsupportedMessage)?,
                 ],
+                ResponseResult::Airlock(status) => vec![
+                    "AIRLOCK".to_owned(),
+                    response
+                        .session_id
+                        .map_or_else(String::new, |value| value.to_string()),
+                    response.request_id.to_string(),
+                    status.provider_access_enabled.to_string(),
+                    status.cancelled_requests.to_string(),
+                ],
                 ResponseResult::Checkpoint { checkpoint } => vec![
                     "CHECKPOINT".to_owned(),
                     response
@@ -535,6 +544,15 @@ pub fn encode_message(message: &Message) -> Result<String, ZshProtocolError> {
                     crate::protocol::DataClearScope::AllTransient => "all_transient",
                 }
                 .to_owned(),
+            ],
+            EventBody::AirlockChanged(status) => vec![
+                "AIRLOCK".to_owned(),
+                event.session_id.to_string(),
+                event
+                    .request_id
+                    .map_or_else(String::new, |value| value.to_string()),
+                status.provider_access_enabled.to_string(),
+                status.cancelled_requests.to_string(),
             ],
             EventBody::PrivacyReceipt(receipt) => vec![
                 "PRIVACY_RECEIPT".to_owned(),
@@ -801,6 +819,21 @@ mod tests {
                 "PRIVACY_RECEIPT\t{session}\t{request}\tanalysis\tlocal_fallback\t900\t4\t3\ttrue\t75"
             )
         );
+    }
+
+    #[test]
+    fn airlock_shell_shape_contains_state_only() {
+        let session = SessionId::new();
+        let encoded = encode_message(&Message::from(Event::new(
+            session,
+            None,
+            EventBody::AirlockChanged(crate::protocol::AirlockStatus {
+                provider_access_enabled: false,
+                cancelled_requests: 2,
+            }),
+        )))
+        .unwrap();
+        assert_eq!(encoded, format!("AIRLOCK\t{session}\t\tfalse\t2"));
     }
 
     #[test]

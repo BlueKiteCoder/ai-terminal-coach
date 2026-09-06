@@ -1,7 +1,7 @@
 use super::{
     DataAction, DataArgs, DataClearArgs, DataScope, MANAGED_END, MANAGED_START, OutputArgs, Paths,
     atomic_write, capsule, ensure_macos, is_daemon_running, keychain_key_exists,
-    remove_file_if_exists, start, stop,
+    remove_file_if_exists,
 };
 use aicoach_ipc::{
     ClientCapabilities, ClientKind, DaemonDataResult, DataOperation, DataParams,
@@ -80,7 +80,7 @@ struct DaemonInventoryReport {
     source_card_cache_entries: Option<usize>,
     limits: Option<SessionDataLimits>,
     read_error: Option<String>,
-    retained_categories: [&'static str; 14],
+    retained_categories: [&'static str; 15],
     provider_boundary: &'static str,
 }
 
@@ -215,11 +215,11 @@ fn print_sessions(paths: &Paths, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "SESSION                               LINK  CMD  CHAT  ENV  CP  BASE  RUN  DROP  AI  PENDING"
+        "SESSION                               LINK  CMD  CHAT  ENV  CP  BASE  RUN  DROP  AI  PENDING  PROVIDER"
     );
     for session in sessions {
         println!(
-            "{}  {:<4}  {:>3}  {:>4}  {:>3}  {:>2}  {:>4}  {:>3}  {:>4}  {:>2}  {:>7}",
+            "{}  {:<4}  {:>3}  {:>4}  {:>3}  {:>2}  {:>4}  {:>3}  {:>4}  {:>2}  {:>7}  {:>8}",
             session.session_id,
             if session.connected { "yes" } else { "no" },
             session.command_records,
@@ -231,6 +231,11 @@ fn print_sessions(paths: &Paths, json: bool) -> Result<()> {
             session.discarded_finish_markers,
             session.active_ai_requests,
             yes_no_short(session.pending_failure),
+            if session.provider_access_enabled {
+                "open"
+            } else {
+                "sealed"
+            },
         );
     }
     println!(
@@ -312,39 +317,20 @@ fn clear_all(paths: &Paths) -> Result<()> {
         )?)?;
     }
     removed.persisted_chat_messages = history_counts(&paths.history).1.unwrap_or_default();
-    let log_files = with_daemon_stopped(paths, || {
-        remove_file_if_exists(&paths.history)?;
-        remove_file_if_exists(&paths.failure_memory)?;
-        remove_file_if_exists(&paths.window_state)?;
-        remove_file_if_exists(&paths.run_dir.join("active-session"))?;
-        remove_file_if_exists(&paths.run_dir.join("active-tty"))?;
-        clear_log_files(&paths.logs_dir, false)
-    })?;
+    remove_file_if_exists(&paths.history)?;
+    remove_file_if_exists(&paths.failure_memory)?;
+    remove_file_if_exists(&paths.window_state)?;
+    remove_file_if_exists(&paths.run_dir.join("active-session"))?;
+    remove_file_if_exists(&paths.run_dir.join("active-tty"))?;
+    let log_files = clear_log_files(&paths.logs_dir, was_running)?;
     print_removed("All transient daemon data", &removed);
     println!(
-        "Persistent history, fingerprints, window state, runtime markers, and {log_files} log files were removed."
+        "Persistent history, fingerprints, window state, runtime markers, and {log_files} log files were cleared."
     );
-    println!("Configuration, installed support files, Shell backup, and Keychain were preserved.");
+    println!(
+        "Configuration, installed support files, Shell backup, Keychain, and Session Airlock state were preserved."
+    );
     Ok(())
-}
-
-fn with_daemon_stopped<T>(paths: &Paths, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-    let was_running = is_daemon_running(paths).0;
-    if was_running {
-        stop(paths)?;
-    }
-    let result = operation();
-    let restart = if was_running { start(paths) } else { Ok(()) };
-    match (result, restart) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => {
-            Err(error).context("local data was cleared but daemon restart failed")
-        }
-        (Err(error), Err(restart_error)) => {
-            bail!("{error:#}; daemon restart also failed: {restart_error:#}")
-        }
-    }
 }
 
 fn inventory(paths: &Paths) -> DataInventoryReport {
@@ -534,7 +520,7 @@ fn inventory(paths: &Paths) -> DataInventoryReport {
     }
 }
 
-const fn daemon_categories() -> [&'static str; 14] {
+const fn daemon_categories() -> [&'static str; 15] {
     [
         "session ID",
         "tty",
@@ -548,6 +534,7 @@ const fn daemon_categories() -> [&'static str; 14] {
         "checkpoint",
         "last-success environment baseline",
         "active request IDs and cancellation handles",
+        "per-session Provider access (Session Airlock)",
         "content-free discarded FINISH markers",
         "local manual Source Card cache",
     ]

@@ -21,9 +21,10 @@ use aicoach_core::{
     AnalysisCoverage, Config, ProductPaths, RiskLevel, SafetyEngine, strip_terminal_sequences,
 };
 use aicoach_ipc::{
-    AiRequestOutcome, AiRequestPurpose, ChatParams, ClientCapabilities, ClientKind, ContextParams,
-    EventBody, HelloParams, Hint, InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION,
-    PrivacyReceipt, RegisterSessionParams, Request, RequestBody, ResponseOutcome, ResponseResult,
+    AiRequestOutcome, AiRequestPurpose, AirlockOperation, AirlockParams, AirlockStatus, ChatParams,
+    ClientCapabilities, ClientKind, ContextParams, EventBody, HelloParams, Hint,
+    InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION, PrivacyReceipt,
+    RegisterSessionParams, Request, RequestBody, ResponseOutcome, ResponseResult,
     SafetyClassification, SessionContext, SessionId,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -141,6 +142,7 @@ struct App {
     show_help: bool,
     show_privacy: bool,
     privacy_receipt: Option<PrivacyReceipt>,
+    provider_access_enabled: bool,
     history_enabled: bool,
     history_limit: usize,
     history_path: PathBuf,
@@ -206,6 +208,7 @@ impl App {
             show_help: false,
             show_privacy: false,
             privacy_receipt: None,
+            provider_access_enabled: true,
             history_enabled: config.history.enabled,
             history_limit: config.history.max_messages,
             history_path: paths.history_file.clone(),
@@ -487,7 +490,10 @@ async fn refresh_context(client: &IpcClient, app: &mut App) {
         Ok(response) => match response.outcome {
             ResponseOutcome::Ok {
                 result: ResponseResult::Context(context),
-            } => app.context = Some(context),
+            } => {
+                app.provider_access_enabled = context.provider_access_enabled;
+                app.context = Some(context);
+            }
             ResponseOutcome::Error { error } => {
                 app.status = format!(
                     "{}: {}",
@@ -537,6 +543,21 @@ async fn handle_key(key: KeyEvent, client: &IpcClient, app: &mut App) -> Result<
         app.should_quit = true;
         return Ok(());
     }
+    if is_privacy_shortcut(key) {
+        if app.privacy_receipt.is_some() {
+            app.show_privacy = !app.show_privacy;
+            app.show_help = false;
+        } else {
+            app.status = app
+                .language
+                .text("No live Privacy Receipt yet", "暂时还没有实时隐私回执")
+                .to_owned();
+        }
+        return Ok(());
+    }
+    if is_airlock_shortcut(key) {
+        return toggle_airlock(client, app).await;
+    }
     if is_insert_shortcut(key, app.input.is_empty()) {
         return insert_selected(client, app).await;
     }
@@ -554,17 +575,6 @@ async fn handle_key(key: KeyEvent, client: &IpcClient, app: &mut App) -> Result<
             app.show_help = !app.show_help;
             app.show_privacy = false;
         }
-        KeyCode::Char('p' | 'P') if app.input.is_empty() => {
-            if app.privacy_receipt.is_some() {
-                app.show_privacy = !app.show_privacy;
-                app.show_help = false;
-            } else {
-                app.status = app
-                    .language
-                    .text("No live Privacy Receipt yet", "暂时还没有实时隐私回执")
-                    .to_owned();
-            }
-        }
         KeyCode::Enter => submit_chat(client, app).await?,
         KeyCode::Backspace => remove_before_cursor(&mut app.input, &mut app.input_cursor),
         KeyCode::Delete => remove_at_cursor(&mut app.input, app.input_cursor),
@@ -576,11 +586,7 @@ async fn handle_key(key: KeyEvent, client: &IpcClient, app: &mut App) -> Result<
         KeyCode::Down if app.input.is_empty() => select_next(app),
         KeyCode::PageUp => scroll_chat_up(app, 5),
         KeyCode::PageDown => scroll_chat_down(app, 5),
-        KeyCode::Char(character)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
-        {
+        KeyCode::Char(character) if is_plain_input_character(key) => {
             insert_text(
                 &mut app.input,
                 &mut app.input_cursor,
@@ -593,25 +599,12 @@ async fn handle_key(key: KeyEvent, client: &IpcClient, app: &mut App) -> Result<
 }
 
 async fn submit_chat(client: &IpcClient, app: &mut App) -> Result<()> {
-    let message = app.input.trim().to_owned();
-    if message.is_empty() || app.streaming {
+    let Some(message) = pending_chat_message(app) else {
         return Ok(());
-    }
-    app.input.clear();
-    app.input_cursor = 0;
-    app.messages.push(UiMessage {
-        speaker: Speaker::User,
-        content: message.clone(),
-    });
-    app.messages.push(UiMessage {
-        speaker: Speaker::Coach,
-        content: String::new(),
-    });
-    app.follow_tail = true;
-    app.streaming = true;
+    };
     app.status = app
         .language
-        .text("AI is responding…", "AI 正在回答…")
+        .text("Contacting daemon…", "正在联系后台服务…")
         .to_owned();
     let cwd = app.context.as_ref().map(|context| context.cwd.clone());
     let response = client
@@ -619,7 +612,7 @@ async fn submit_chat(client: &IpcClient, app: &mut App) -> Result<()> {
             Request::new(
                 Some(app.session_id),
                 RequestBody::Chat(ChatParams {
-                    message,
+                    message: message.clone(),
                     stream: true,
                     cwd,
                     buffer: None,
@@ -632,40 +625,165 @@ async fn submit_chat(client: &IpcClient, app: &mut App) -> Result<()> {
         Ok(response) => match response.outcome {
             ResponseOutcome::Ok {
                 result: ResponseResult::Accepted,
-            } => {}
-            ResponseOutcome::Ok {
-                result: ResponseResult::Chat { message },
             } => {
-                app.push_assistant_delta(&message);
+                app.input.clear();
+                app.input_cursor = 0;
+                app.messages.push(UiMessage {
+                    speaker: Speaker::User,
+                    content: message,
+                });
+                app.messages.push(UiMessage {
+                    speaker: Speaker::Coach,
+                    content: String::new(),
+                });
+                app.follow_tail = true;
+                app.streaming = true;
+                app.status = app
+                    .language
+                    .text("AI is responding…", "AI 正在回答…")
+                    .to_owned();
+            }
+            ResponseOutcome::Ok {
+                result: ResponseResult::Chat { message: answer },
+            } => {
+                app.input.clear();
+                app.input_cursor = 0;
+                app.messages.push(UiMessage {
+                    speaker: Speaker::User,
+                    content: message,
+                });
+                app.messages.push(UiMessage {
+                    speaker: Speaker::Coach,
+                    content: sanitize_terminal_text(&answer, true),
+                });
+                app.follow_tail = true;
                 app.finish_stream();
             }
             ResponseOutcome::Error { error } => {
-                app.push_assistant_delta(&format!(
-                    "{}: {}",
-                    app.language
-                        .text("AI service is temporarily unavailable", "AI 服务暂时不可用"),
-                    error.message
-                ));
-                app.finish_stream();
+                app.status = sanitize_terminal_text(&error.message, false);
             }
             _ => {
-                app.push_assistant_delta(app.language.text(
-                    "The daemon returned an unrecognized response.",
-                    "后台返回了无法识别的响应。",
-                ));
-                app.finish_stream();
+                app.status = app
+                    .language
+                    .text(
+                        "The daemon returned an unrecognized response; question preserved",
+                        "后台返回了无法识别的响应；问题已保留",
+                    )
+                    .to_owned();
             }
         },
         Err(error) => {
-            app.push_assistant_delta(&format!(
+            app.status = format!(
                 "{}: {error}",
-                app.language
-                    .text("AI service is temporarily unavailable", "AI 服务暂时不可用")
-            ));
-            app.finish_stream();
+                app.language.text(
+                    "Daemon unavailable; question preserved",
+                    "后台不可用；问题已保留"
+                )
+            );
         }
     }
     Ok(())
+}
+
+fn pending_chat_message(app: &mut App) -> Option<String> {
+    let message = app.input.trim().to_owned();
+    if message.is_empty() || app.streaming {
+        return None;
+    }
+    if !app.provider_access_enabled {
+        app.status = app
+            .language
+            .text(
+                "Session Airlock is sealed; question preserved and no provider request was sent",
+                "会话气闸已密封；问题已保留，未向 Provider 发送请求",
+            )
+            .to_owned();
+        return None;
+    }
+    Some(message)
+}
+
+async fn toggle_airlock(client: &IpcClient, app: &mut App) -> Result<()> {
+    let operation = airlock_toggle_operation(app.provider_access_enabled);
+    app.status = app
+        .language
+        .text("Changing Session Airlock…", "正在切换会话气闸…")
+        .to_owned();
+    let response = client
+        .send_timeout(
+            Request::new(
+                Some(app.session_id),
+                RequestBody::Airlock(AirlockParams { operation }),
+            ),
+            IPC_REQUEST_TIMEOUT,
+        )
+        .await;
+    match response {
+        Ok(response) => match response.outcome {
+            ResponseOutcome::Ok {
+                result: ResponseResult::Airlock(status),
+            } => apply_airlock_status(app, &status),
+            ResponseOutcome::Error { error } => {
+                app.status = sanitize_terminal_text(&error.message, false);
+            }
+            _ => {
+                app.status = app
+                    .language
+                    .text(
+                        "The daemon returned an unrecognized Airlock response",
+                        "后台返回了无法识别的气闸响应",
+                    )
+                    .to_owned();
+            }
+        },
+        Err(error) => {
+            app.status = format!(
+                "{}: {error}",
+                app.language
+                    .text("Unable to change Session Airlock", "无法切换会话气闸")
+            );
+        }
+    }
+    Ok(())
+}
+
+const fn airlock_toggle_operation(provider_access_enabled: bool) -> AirlockOperation {
+    if provider_access_enabled {
+        AirlockOperation::Seal
+    } else {
+        AirlockOperation::Open
+    }
+}
+
+fn apply_airlock_status(app: &mut App, status: &AirlockStatus) {
+    app.provider_access_enabled = status.provider_access_enabled;
+    if let Some(context) = app.context.as_mut() {
+        context.provider_access_enabled = status.provider_access_enabled;
+    }
+    app.status = if status.provider_access_enabled {
+        app.language
+            .text(
+                "Session Airlock OPEN · future provider requests are allowed",
+                "会话气闸已开启 · 允许后续 Provider 请求",
+            )
+            .to_owned()
+    } else if status.cancelled_requests > 0 {
+        format!(
+            "{} {}",
+            app.language.text(
+                "Session Airlock SEALED · local-only · cancelled active requests:",
+                "会话气闸已密封 · 仅本地 · 已取消活动请求：",
+            ),
+            status.cancelled_requests
+        )
+    } else {
+        app.language
+            .text(
+                "Session Airlock SEALED · local-only · no provider request was sent",
+                "会话气闸已密封 · 仅本地 · 未向 Provider 发送请求",
+            )
+            .to_owned()
+    };
 }
 
 fn handle_ipc_event(event: EventBody, app: &mut App) {
@@ -741,6 +859,7 @@ fn handle_ipc_event(event: EventBody, app: &mut App) {
                 .to_owned();
             app.persist_history();
         }
+        EventBody::AirlockChanged(status) => apply_airlock_status(app, &status),
         EventBody::PrivacyReceipt(receipt) => {
             app.status = privacy_receipt_summary(&receipt, app.language);
             app.privacy_receipt = Some(receipt);
@@ -971,35 +1090,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         ])
         .split(area);
 
-    let cwd = app.context.as_ref().map_or_else(
-        || {
-            app.language
-                .text("Waiting for context…", "等待上下文…")
-                .to_owned()
-        },
-        |context| sanitize_terminal_text(&context.cwd.display().to_string(), false),
-    );
-    let mut header_spans = vec![
-        Span::styled(
-            " AI Terminal Coach ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {cwd}"), Style::default().fg(Color::DarkGray)),
-    ];
-    if let Some(receipt) = app.privacy_receipt.as_ref() {
-        header_spans.push(Span::styled(
-            format!("  {}", privacy_receipt_badge(receipt, app.language)),
-            Style::default().fg(privacy_receipt_color(receipt.outcome)),
-        ));
-    }
-    let header = Paragraph::new(Line::from(header_spans)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
-    );
-    frame.render_widget(header, vertical[0]);
+    draw_header(frame, vertical[0], app);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -1028,6 +1119,64 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         vertical[2].y + 1,
     ));
 
+    draw_footer(frame, vertical[3], app);
+
+    if app.show_help {
+        draw_help(frame, centered_rect(70, 70, area), app.language);
+    } else if app.show_privacy
+        && let Some(receipt) = app.privacy_receipt.as_ref()
+    {
+        draw_privacy_receipt(frame, centered_rect(70, 70, area), receipt, app.language);
+    }
+}
+
+fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let cwd = app.context.as_ref().map_or_else(
+        || {
+            app.language
+                .text("Waiting for context…", "等待上下文…")
+                .to_owned()
+        },
+        |context| sanitize_terminal_text(&context.cwd.display().to_string(), false),
+    );
+    let mut spans = vec![
+        Span::styled(
+            " AI Terminal Coach ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {cwd}"), Style::default().fg(Color::DarkGray)),
+    ];
+    if app.provider_access_enabled {
+        spans.push(Span::styled(
+            app.language.text("  Airlock OPEN", "  气闸已开启"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        spans.push(Span::styled(
+            app.language
+                .text("  AIRLOCK SEALED · LOCAL ONLY", "  气闸已密封 · 仅本地"),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(receipt) = app.privacy_receipt.as_ref() {
+        spans.push(Span::styled(
+            format!("  {}", privacy_receipt_badge(receipt, app.language)),
+            Style::default().fg(privacy_receipt_color(receipt.outcome)),
+        ));
+    }
+    let header = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+    frame.render_widget(header, area);
+}
+
+fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
         Span::raw(app.language.text(" Return  ", " 返回终端  ")),
@@ -1042,22 +1191,16 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         Span::raw(app.language.text(" Select  ", " 选择  ")),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(app.language.text(" Help  ", " 帮助  ")),
-        Span::styled("P", Style::default().fg(Color::Yellow)),
+        Span::styled("⌃O", Style::default().fg(Color::Yellow)),
+        Span::raw(app.language.text(" Airlock  ", " 气闸  ")),
+        Span::styled("⌃P", Style::default().fg(Color::Yellow)),
         Span::raw(app.language.text(" Privacy  ", " 隐私回执  ")),
         Span::styled("Ctrl-Q", Style::default().fg(Color::Yellow)),
         Span::raw(app.language.text(" Quit  ", " 退出  ")),
         Span::styled(&app.status, Style::default().fg(Color::DarkGray)),
     ]))
     .alignment(Alignment::Left);
-    frame.render_widget(footer, vertical[3]);
-
-    if app.show_help {
-        draw_help(frame, centered_rect(70, 70, area), app.language);
-    } else if app.show_privacy
-        && let Some(receipt) = app.privacy_receipt.as_ref()
-    {
-        draw_privacy_receipt(frame, centered_rect(70, 70, area), receipt, app.language);
-    }
+    frame.render_widget(footer, area);
 }
 
 fn draw_context(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -1222,8 +1365,12 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, language: UiLanguage) {
             "PgUp/PgDn 或鼠标滚轮  滚动对话",
         )),
         Line::from(language.text(
-            "P          Inspect the latest live Privacy Receipt",
-            "P          查看最近一次实时 Privacy Receipt",
+            "Ctrl+O     Seal/open Session Airlock (provider boundary)",
+            "Ctrl+O     密封/开启会话气闸（Provider 边界）",
+        )),
+        Line::from(language.text(
+            "Ctrl+P     Inspect the latest live Privacy Receipt",
+            "Ctrl+P     查看最近一次实时 Privacy Receipt",
         )),
         Line::from(language.text("Ctrl+Q     Quit Coach", "Ctrl+Q     退出 Coach")),
         Line::default(),
@@ -1314,7 +1461,10 @@ fn draw_privacy_receipt(
         Paragraph::new(text)
             .block(
                 Block::default()
-                    .title(language.text("Privacy (P/Esc to close)", "隐私回执（P/Esc 关闭）"))
+                    .title(language.text(
+                        "Privacy (Ctrl+P/Esc to close)",
+                        "隐私回执（Ctrl+P/Esc 关闭）",
+                    ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
             )
@@ -1407,6 +1557,21 @@ fn is_insert_shortcut(key: KeyEvent, input_is_empty: bool) -> bool {
         // configured as Meta. F2/Tab remain reliable on every key layout.
         || matches!(key.code, KeyCode::Char('ˆ') | KeyCode::F(2))
         || (input_is_empty && key.code == KeyCode::Tab)
+}
+
+fn is_privacy_shortcut(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('p' | 'P'))
+}
+
+fn is_airlock_shortcut(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('o' | 'O'))
+}
+
+fn is_plain_input_character(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }
 
 fn wrap_display_line(value: &str, width: u16) -> Vec<String> {
@@ -1848,6 +2013,51 @@ mod tests {
             KeyCode::Char('y'),
             KeyModifiers::CONTROL
         )));
+        assert!(is_privacy_shortcut(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_airlock_shortcut(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL
+        )));
+        for character in ['p', 'P', 'o', 'O'] {
+            let plain = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert!(is_plain_input_character(plain));
+            assert!(!is_privacy_shortcut(plain));
+            assert!(!is_airlock_shortcut(plain));
+        }
+        assert_eq!(airlock_toggle_operation(true), AirlockOperation::Seal);
+        assert_eq!(airlock_toggle_operation(false), AirlockOperation::Open);
+    }
+
+    #[test]
+    fn sealed_airlock_preserves_typed_question_and_event_updates_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ProductPaths::from_home(directory.path());
+        let mut app = App::new(SessionId::new(), &Config::default(), &paths, false);
+        app.input = "  explain this failure  ".to_owned();
+        app.input_cursor = app.input.chars().count();
+        app.provider_access_enabled = false;
+
+        assert!(pending_chat_message(&mut app).is_none());
+        assert_eq!(app.input, "  explain this failure  ");
+        assert_eq!(app.input_cursor, app.input.chars().count());
+        assert!(app.messages.is_empty());
+        assert!(app.status.contains("question preserved"));
+
+        handle_ipc_event(
+            EventBody::AirlockChanged(AirlockStatus {
+                provider_access_enabled: true,
+                cancelled_requests: 0,
+            }),
+            &mut app,
+        );
+        assert!(app.provider_access_enabled);
+        assert_eq!(
+            pending_chat_message(&mut app).as_deref(),
+            Some("explain this failure")
+        );
     }
 
     #[test]
@@ -1960,5 +2170,35 @@ mod tests {
         assert!(rendered.contains("Payload after redaction: 1234 chars"));
         assert!(rendered.contains("Provider elapsed: 48 ms"));
         assert!(rendered.contains("provider succeeded"));
+    }
+
+    #[test]
+    fn airlock_state_is_always_visible_in_the_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ProductPaths::from_home(directory.path());
+        let mut app = App::new(SessionId::new(), &Config::default(), &paths, false);
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let open = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(open.contains("Airlock OPEN"));
+
+        app.provider_access_enabled = false;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let sealed = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(sealed.contains("AIRLOCK SEALED · LOCAL ONLY"));
     }
 }

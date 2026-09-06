@@ -75,6 +75,9 @@ Terminal.app / iTerm2 / 其他 macOS 终端
 - 每次真正到达 Provider 边界的补全、失败分析或聊天都会产生一张实时 **Privacy
   Receipt（隐私回执）**：只显示脱敏后的 payload 字符数、项数、隐藏片段总数、耗时和
   成功/失败/取消/本地回退状态，不保存 prompt、回复、命中值、模型或 endpoint。
+- **Session Airlock（会话气闸）** 可对当前终端一键密封 Provider 边界：原子取消正在进行
+  的 AI 请求并阻止后续上行，同时保留 Risk Lens、Source Cards、环境漂移和数据控制等
+  本地能力；其他终端 session 不受影响。
 - `aicoach capsule` 把当前终端最近的命令、状态、耗时和已保留的可用输出整理成可分享的
   Markdown。它完全在本机生成、强制脱敏并清除终端控制序列，可一键复制到剪贴板。
 - `aicoach support` 生成适合公开 issue 的中英文 Markdown，只输出 allowlist 系统类别和
@@ -234,7 +237,8 @@ aicoach restart
 | TUI | `Option+I` | 仅把明确选中的建议插入原终端 Buffer，显示本地安全评级后返回；仍需自行按 Enter |
 | TUI | `Option+Y` | 仅复制所选建议并显示本地安全评级；不会执行命令 |
 | TUI | `↑/↓` | 选择建议 |
-| TUI | `P` | 查看最近一次实时 Privacy Receipt；不显示或保存正文 |
+| TUI | `Ctrl+O` | 密封/开启当前 Session Airlock；密封后仅运行本地能力 |
+| TUI | `Ctrl+P` | 查看最近一次实时 Privacy Receipt；不显示或保存正文 |
 | TUI | `Ctrl+Q` | 退出窗口 |
 
 macOS 终端需将 Option 配置为 Meta/Esc 前缀。若快捷键冲突，可在 source 之前覆盖：
@@ -308,13 +312,19 @@ Source Cards 不联网，也不把手册内容发给 Provider。Git 帮助只调
 Tauri、React 或 Vue。它自动挂到最近聚焦的 shell session，展示 cwd、最近命令、
 错误提示、建议和 streaming 对话。Chat history 默认每 session 保留 50 条，可关闭。
 
-Provider 请求结束后，标题栏会显示一枚简短的 `Privacy` 徽标；输入框为空时按 `P`
+Provider 请求结束后，标题栏会显示一枚简短的 `Privacy` 徽标；按 `Ctrl+P`
 可以查看详细回执。字符数是脱敏后的应用请求 JSON 在加入模型、endpoint 和 HTTP 外层
 之前的 Unicode 字符数；“项数”分别表示补全上下文项、分析上下文记录或聊天 messages。
 回执只发送给当时已订阅 session 的 Coach，不补发历史、不进入聊天记录或任何本地存储。
 纯本地分析不会生成回执，因为没有对外请求；若配置关闭脱敏，回执会明确显示关闭且隐藏
 数为 0。它证明本应用在 Provider 边界准备了什么类型和规模的数据，不证明外部 Provider
 如何保存或处理请求。
+
+标题栏也会始终显示 Session Airlock 状态。按 `Ctrl+O` 密封后，当前 session 立即变成
+`LOCAL ONLY`：正在进行的 completion、analysis 和 chat 会被取消，新的 Provider 请求会在
+构造上行 payload 前被拒绝；输入框中的问题会原样保留。本地 Risk Lens、Source Cards、
+Failure Fingerprints、Environment Drift、Context 与数据控制仍可使用。再次按 `Ctrl+O`
+只允许未来请求，不会自行发送任何内容。
 
 每条建议旁都会先显示本地 Risk Lens 徽标，例如 `[LOW]`、`[HIGH/PARTIAL]` 或
 `[UNRATED]`；未识别和部分识别不会被伪装成低风险。`Option+I` 是 **insert only**：
@@ -371,6 +381,23 @@ aicoach checkpoint clear
 不会写入 Failure Fingerprints，也不会进入 completion、analysis 或 chat provider prompt。
 Capsule 导出时仍会强制执行密钥、主目录和自定义隐私规则脱敏。
 
+## Session Airlock：当前终端立即切换为仅本地
+
+不想关闭全局 Provider 配置，也不想影响其他终端时，可以只密封当前 session：
+
+```zsh
+aicoach airlock seal
+aicoach airlock status
+aicoach airlock status --json
+aicoach airlock open
+```
+
+气闸按 session 隔离，只保存在 daemon 内存。`seal` 与活动请求取消在同一个原子状态更新中
+完成；密封后新请求返回 `airlock_sealed`，不会写入被拒绝的聊天问题，也不会生成虚假的
+Privacy Receipt。失败命令仍会给出本地分析，并明确说明跳过了 Provider。`open` 只开放
+未来请求。所有 `aicoach data clear ...` 操作都会保留气闸状态；显式重启 daemon 会丢弃
+全部 session，因此之后重新建立的 session 默认重新开启 Provider 访问。
+
 ## 本地数据控制中心
 
 aicoach data 只读取路径、字节数、条目数、保留上限和布尔状态，不打印命令、输出、
@@ -393,7 +420,8 @@ aicoach data clear all
 clear session 会清除该 session 的命令/输出摘要、daemon 与 TUI 聊天、允许列表环境快照、
 Session Checkpoint、Environment Drift 基线、待关联失败和活跃 AI 请求，但保留正在使用的
 Shell 连接；清理命令自身也不会重新写回上下文。clear history 只清聊天，clear all
-还会清除所有 daemon 瞬时数据、Failure Fingerprints、日志、窗口状态和运行标记。
+还会清除 daemon 内容数据、Failure Fingerprints、日志、窗口状态和运行标记，但不会为了
+清日志重启正在运行的 daemon，也不会改变任何 session 的 Airlock 状态。
 单独清理 fingerprints 或 logs 不会重启 daemon，也不会顺带丢失 session 上下文。
 
 所有 clear 操作都保留 config.toml、安装支持文件、~/.zshrc.aicoach.backup 和 macOS
@@ -482,6 +510,7 @@ aicoach config show|path|validate|set|edit|set-key|delete-key
 aicoach logs [-n 100] [--follow]
 aicoach capsule [--last 20] [--failed-only] [--copy] [--output FILE]
 aicoach checkpoint [--session UUID] [start NAME | resolve [RESOLUTION] | status [--json] | clear]
+aicoach airlock [--session UUID] [status [--json] | seal | open]
 aicoach data [status [--json] | sessions [--json] | clear session|history|fingerprints|logs|all]
 aicoach memory [status [--json] | list [--json] | clear]
 aicoach toggle [--session UUID] [--tty /dev/ttys001]
@@ -599,7 +628,7 @@ homebrew/               Formula 模板
 ```
 
 贡献者可以从 [架构与模块边界](docs/ARCHITECTURE.md) 开始，并在修改跨进程消息前阅读
-[IPC Protocol v3](docs/PROTOCOL.md)。两份文档包含本地规则、持久化数据、协议操作和
+[IPC Protocol v4](docs/PROTOCOL.md)。两份文档包含本地规则、持久化数据、协议操作和
 终端适配器的扩展步骤，以及不能被弱化的隐私与执行权约束。
 
 ## 已知限制
@@ -620,6 +649,9 @@ homebrew/               Formula 模板
   完成时更新。
 - Privacy Receipt 是仅对已打开 Coach 实时推送的应用侧元数据，不是 Provider 的删除、
   保留或合规证明；Coach 未订阅时不会事后补发。
+- Session Airlock 是本应用 daemon 边界上的 session 级开关，不是操作系统网络沙箱；它
+  不约束其他进程，也不能证明外部 Provider 如何处理密封前已经收到的请求。daemon 重启
+  会清除该内存状态，新 session 默认开启 Provider 访问。
 - 当前 Formula 只支持显式 `--HEAD` 源码安装；稳定 tap 必须等首个公开 tag 和真实
   源码 SHA-256 后才能发布。
 - `package-release.sh` 生成当前机器架构、可复现但仅 ad-hoc 签名的本地测试包。公开
@@ -658,7 +690,8 @@ Command Patches, local-manual Source Cards, AI-assisted completion, quick
 terminal chat, share-ready privacy-scrubbed Session Capsules, local-only Failure
 Fingerprints, memory-only Session Checkpoints, a provider-free Environment Drift
 Lens, a public-safe local Support Report, live content-free Privacy Receipts, and a standalone
-Ratatui Coach window.
+Ratatui Coach window. A per-session Session Airlock can atomically cancel active AI work and block
+new provider requests while every local diagnostic remains available.
 It never presses Enter or executes an AI suggestion.
 
 The workflow image above is generated from the real local analyzer, Risk Lens,
@@ -697,7 +730,13 @@ Keychain, runtime, and daemon-memory category using metadata and counts only.
 Typed clear scopes can erase one session, chat history, failure fingerprints,
 logs, or all transient data. Session clearing cancels active AI work and removes
 its own bookkeeping command without disconnecting the live shell; configuration,
-support files, the shell backup, and Keychain credentials remain separate.
+support files, the shell backup, Keychain credentials, and Session Airlock state remain separate.
+
+Use `aicoach airlock seal|status|open` or `Ctrl+O` in the Coach to control one session. Sealing is
+atomic with cancellation, affects no other terminal, preserves an unsent question, and leaves Risk
+Lens and other local features available. Opening permits future requests but sends nothing itself.
+The flag is daemon-memory-only; data clearing preserves it, while a deliberate daemon restart means
+newly created sessions start open.
 
 Build and install:
 

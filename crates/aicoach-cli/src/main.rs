@@ -1,5 +1,6 @@
 #![allow(clippy::items_after_statements, clippy::too_many_lines)]
 
+mod airlock;
 mod capsule;
 mod checkpoint;
 mod data;
@@ -72,6 +73,8 @@ enum Commands {
     Memory(MemoryArgs),
     /// Name, resolve, or clear the active terminal troubleshooting checkpoint.
     Checkpoint(CheckpointArgs),
+    /// Block or allow AI provider access for one terminal session.
+    Airlock(AirlockArgs),
     /// Inventory and precisely clear local data without exposing its contents.
     Data(DataArgs),
     /// Toggle the native Terminal.app/iTerm2 Coach window.
@@ -201,6 +204,25 @@ enum CheckpointAction {
     Status(OutputArgs),
     /// Clear the active checkpoint without deleting terminal command context.
     Clear,
+}
+
+#[derive(Args, Debug)]
+struct AirlockArgs {
+    /// Shell session UUID. Defaults to the most recently focused terminal.
+    #[arg(long, default_value = "")]
+    session: String,
+    #[command(subcommand)]
+    action: Option<AirlockAction>,
+}
+
+#[derive(Subcommand, Debug)]
+enum AirlockAction {
+    /// Show whether this session may contact the configured AI provider.
+    Status(OutputArgs),
+    /// Cancel active AI work and block new provider requests for this session.
+    Seal,
+    /// Allow future provider requests for this session; sends nothing by itself.
+    Open,
 }
 
 #[derive(Args, Debug)]
@@ -362,6 +384,7 @@ fn run() -> Result<()> {
         Commands::Capsule(args) => capsule::export(&paths, &args),
         Commands::Memory(args) => memory_command(&paths, args.action),
         Commands::Checkpoint(args) => checkpoint::run(&paths, &args),
+        Commands::Airlock(args) => airlock::run(&paths, &args),
         Commands::Data(args) => data::run(&paths, &args),
         Commands::Toggle(args) => toggle(&paths, &args),
     }
@@ -1788,6 +1811,41 @@ mod tests {
             status.command,
             Commands::Checkpoint(CheckpointArgs {
                 action: Some(CheckpointAction::Status(OutputArgs { json: true })),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn airlock_commands_parse_session_actions_and_json_status() {
+        let seal = Cli::try_parse_from([
+            "aicoach",
+            "airlock",
+            "--session",
+            "00000000-0000-4000-8000-000000000001",
+            "seal",
+        ])
+        .unwrap();
+        assert!(matches!(
+            seal.command,
+            Commands::Airlock(AirlockArgs {
+                action: Some(AirlockAction::Seal),
+                ..
+            })
+        ));
+        let status = Cli::try_parse_from(["aicoach", "airlock", "status", "--json"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Airlock(AirlockArgs {
+                action: Some(AirlockAction::Status(OutputArgs { json: true })),
+                ..
+            })
+        ));
+        let open = Cli::try_parse_from(["aicoach", "airlock", "open"]).unwrap();
+        assert!(matches!(
+            open.command,
+            Commands::Airlock(AirlockArgs {
+                action: Some(AirlockAction::Open),
                 ..
             })
         ));

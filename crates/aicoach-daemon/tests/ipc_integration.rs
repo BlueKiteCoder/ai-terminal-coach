@@ -19,13 +19,13 @@ use aicoach_core::{
 };
 use aicoach_daemon::{Daemon, DaemonOptions};
 use aicoach_ipc::{
-    AiRequestOutcome, AiRequestPurpose, CancelParams, ChatParams, CheckpointOperation,
-    CheckpointParams, ClientCapabilities, ClientKind, CommandFinishedParams, CommandId,
-    CommandStartedParams, CompletionParams, ContextParams, DaemonDataResult, DataClearScope,
-    DataOperation, DataParams, DataRemovalSummary, Event, EventBody, HelloParams,
-    InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION, RegisterSessionParams, Request,
-    RequestBody, Response, ResponseOutcome, ResponseResult, RiskLensParams, SafetyClassification,
-    SessionCheckpoint, SessionDataSummary, SessionId,
+    AiRequestOutcome, AiRequestPurpose, AirlockOperation, AirlockParams, AirlockStatus,
+    CancelParams, ChatParams, CheckpointOperation, CheckpointParams, ClientCapabilities,
+    ClientKind, CommandFinishedParams, CommandId, CommandStartedParams, CompletionParams,
+    ContextParams, DaemonDataResult, DataClearScope, DataOperation, DataParams, DataRemovalSummary,
+    Event, EventBody, HelloParams, InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION,
+    RegisterSessionParams, Request, RequestBody, Response, ResponseOutcome, ResponseResult,
+    RiskLensParams, SafetyClassification, SessionCheckpoint, SessionDataSummary, SessionId,
 };
 use async_trait::async_trait;
 use futures_util::stream;
@@ -420,6 +420,41 @@ async fn session_data(client: &IpcClient, session: SessionId) -> SessionDataSumm
         .unwrap()
 }
 
+async fn update_airlock(
+    client: &IpcClient,
+    session: SessionId,
+    operation: AirlockOperation,
+) -> AirlockStatus {
+    let response = client
+        .send_request(
+            Some(session),
+            RequestBody::Airlock(AirlockParams { operation }),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Ok {
+        result: ResponseResult::Airlock(status),
+    } = response.outcome
+    else {
+        panic!("expected Airlock response")
+    };
+    status
+}
+
+async fn request_completion(client: &IpcClient, session: SessionId, buffer: &str) -> Response {
+    client
+        .send_request(
+            Some(session),
+            RequestBody::Completion(CompletionParams {
+                buffer: buffer.to_owned(),
+                cursor: buffer.chars().count(),
+                cwd: PathBuf::from("/tmp"),
+            }),
+        )
+        .await
+        .unwrap()
+}
+
 async fn clear_session_from_shell(shell: &IpcClient, session: SessionId) -> DataRemovalSummary {
     let command_id = CommandId::new();
     shell
@@ -611,6 +646,234 @@ async fn multiple_sessions_keep_context_isolated() {
     assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
     first.close().await.unwrap();
     second.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn session_airlock_blocks_only_provider_work_and_survives_data_clear() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start(Arc::clone(&provider)).await;
+    let first = IpcClient::connect(&running.socket).await.unwrap();
+    let second = IpcClient::connect(&running.socket).await.unwrap();
+    let first_id = register(&first, None, "/dev/ttys026").await;
+    let second_id = register(&second, None, "/dev/ttys027").await;
+
+    let sealed = update_airlock(&first, first_id, AirlockOperation::Seal).await;
+    assert!(!sealed.provider_access_enabled);
+    assert_eq!(sealed.cancelled_requests, 0);
+
+    let blocked_completion = request_completion(&first, first_id, "provider-only-token").await;
+    assert!(matches!(
+        blocked_completion.outcome,
+        ResponseOutcome::Error { ref error }
+            if error.code == "airlock_sealed" && !error.retryable
+    ));
+
+    let blocked_chat = first
+        .send_request(
+            Some(first_id),
+            RequestBody::Chat(ChatParams {
+                message: "provider question".to_owned(),
+                stream: true,
+                cwd: None,
+                buffer: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        blocked_chat.outcome,
+        ResponseOutcome::Error { ref error } if error.code == "airlock_sealed"
+    ));
+
+    let local_lens = first
+        .send_request(
+            Some(first_id),
+            RequestBody::RiskLens(RiskLensParams {
+                buffer: "rm -rf ~/Downloads/cache".to_owned(),
+                cwd: PathBuf::from("/tmp"),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        local_lens.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::RiskLens(_)
+        }
+    ));
+
+    let other_completion = request_completion(&second, second_id, "other-session").await;
+    assert!(matches!(
+        other_completion.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Completion(_)
+        }
+    ));
+    assert_eq!(provider.completion_calls.load(Ordering::SeqCst), 1);
+    assert!(provider.chat_requests.lock().unwrap().is_empty());
+    let first_summary = session_data(&first, first_id).await;
+    assert!(!first_summary.provider_access_enabled);
+    assert_eq!(first_summary.chat_messages, 0);
+
+    data_operation(&first, Some(first_id), DataOperation::ClearSession, false).await;
+    assert!(!session_data(&first, first_id).await.provider_access_enabled);
+    data_operation(&first, None, DataOperation::ClearAllTransient, false).await;
+    assert!(!session_data(&first, first_id).await.provider_access_enabled);
+
+    let opened = update_airlock(&first, first_id, AirlockOperation::Open).await;
+    assert!(opened.provider_access_enabled);
+    let unblocked = request_completion(&first, first_id, "provider-again").await;
+    assert!(matches!(
+        unblocked.outcome,
+        ResponseOutcome::Ok {
+            result: ResponseResult::Completion(_)
+        }
+    ));
+    assert_eq!(provider.completion_calls.load(Ordering::SeqCst), 2);
+
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn sealing_airlock_cancels_active_work_and_notifies_observers_not_shells() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start(Arc::clone(&provider)).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys028").await;
+    let mut shell_events = shell.subscribe();
+    let observer = IpcClient::connect(&running.socket).await.unwrap();
+    subscribe_tui(&observer, session, "airlock-observer").await;
+    let mut observer_events = observer.subscribe();
+
+    let completion = Request::new(
+        Some(session),
+        RequestBody::Completion(CompletionParams {
+            buffer: "wait".to_owned(),
+            cursor: 4,
+            cwd: PathBuf::from("/tmp"),
+        }),
+    );
+    let completion_id = completion.request_id;
+    let pending_client = shell.clone();
+    let pending = tokio::spawn(async move { pending_client.send(completion).await.unwrap() });
+    for _ in 0..100 {
+        if provider.completion_calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(provider.completion_calls.load(Ordering::SeqCst), 1);
+
+    let status = update_airlock(&observer, session, AirlockOperation::Seal).await;
+    assert!(!status.provider_access_enabled);
+    assert_eq!(status.cancelled_requests, 1);
+    let completion_response = tokio::time::timeout(Duration::from_secs(1), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        completion_response.outcome,
+        ResponseOutcome::Error { ref error } if error.code == "cancelled"
+    ));
+
+    let shell_event = tokio::time::timeout(Duration::from_secs(1), shell_events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shell_event.request_id, Some(completion_id));
+    assert!(matches!(shell_event.body, EventBody::RequestCancelled));
+
+    let mut saw_changed = false;
+    let mut saw_cancelled_receipt = false;
+    for _ in 0..4 {
+        let event = tokio::time::timeout(Duration::from_secs(1), observer_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event.body {
+            EventBody::AirlockChanged(ref changed) => {
+                assert!(!changed.provider_access_enabled);
+                assert_eq!(changed.cancelled_requests, 1);
+                saw_changed = true;
+            }
+            EventBody::PrivacyReceipt(ref receipt) => {
+                assert_eq!(event.request_id, Some(completion_id));
+                assert_eq!(receipt.purpose, AiRequestPurpose::Completion);
+                assert_eq!(receipt.outcome, AiRequestOutcome::Cancelled);
+                saw_cancelled_receipt = true;
+            }
+            _ => {}
+        }
+        if saw_changed && saw_cancelled_receipt {
+            break;
+        }
+    }
+    assert!(saw_changed);
+    assert!(saw_cancelled_receipt);
+    let unchanged = update_airlock(&observer, session, AirlockOperation::Seal).await;
+    assert!(!unchanged.provider_access_enabled);
+    assert_eq!(unchanged.cancelled_requests, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), observer_events.recv())
+            .await
+            .is_err(),
+        "an idempotent seal must not broadcast a false state change"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), shell_events.recv())
+            .await
+            .is_err(),
+        "the shell must not receive the asynchronous AirlockChanged event"
+    );
+
+    shell.close().await.unwrap();
+    observer.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn sealed_airlock_keeps_failed_command_analysis_local_and_receipt_free() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start(Arc::clone(&provider)).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys029").await;
+    update_airlock(&shell, session, AirlockOperation::Seal).await;
+
+    let observer = IpcClient::connect(&running.socket).await.unwrap();
+    subscribe_tui(&observer, session, "sealed-analysis-observer").await;
+    let mut events = observer.subscribe();
+    complete_command(
+        &shell,
+        session,
+        "mystery-command --flag",
+        1,
+        Some("unclassified failure"),
+    )
+    .await;
+
+    let hint = loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let EventBody::Hint(hint) = event.body {
+            break hint;
+        }
+    };
+    assert!(hint.message.contains("Session Airlock is sealed"));
+    assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err(),
+        "a provider-free local fallback must not emit a Privacy Receipt"
+    );
+
+    shell.close().await.unwrap();
+    observer.close().await.unwrap();
     running.stop().await;
 }
 
@@ -1291,6 +1554,39 @@ async fn failure_memory_clear_preserves_live_session_context() {
     assert_eq!(removed.failure_fingerprints, 1);
     assert_eq!(removed.pending_failures, 0);
     assert_eq!(session_data(&shell, session).await.command_records, 2);
+
+    let snapshot = aicoach_core::FailureMemorySnapshot::load(
+        running.directory.path().join("failure-memory.json"),
+    )
+    .unwrap();
+    assert!(snapshot.entries.is_empty());
+
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn clear_all_transient_clears_live_failure_memory_without_reopening_airlock() {
+    let running = RunningDaemon::start_with_failure_memory(Arc::new(TestProvider::default())).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys022").await;
+    complete_command(&shell, session, "cargo test", 1, Some("failed")).await;
+    complete_command(&shell, session, "cargo clean", 0, None).await;
+    assert!(
+        !update_airlock(&shell, session, AirlockOperation::Seal)
+            .await
+            .provider_access_enabled
+    );
+
+    let DaemonDataResult::Cleared { scope, removed } =
+        data_operation(&shell, None, DataOperation::ClearAllTransient, true).await
+    else {
+        panic!("expected clear result")
+    };
+    assert_eq!(scope, DataClearScope::AllTransient);
+    assert_eq!(removed.failure_fingerprints, 1);
+    assert_eq!(session_data(&shell, session).await.command_records, 0);
+    assert!(!session_data(&shell, session).await.provider_access_enabled);
 
     let snapshot = aicoach_core::FailureMemorySnapshot::load(
         running.directory.path().join("failure-memory.json"),

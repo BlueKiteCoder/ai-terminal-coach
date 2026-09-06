@@ -26,6 +26,8 @@ All notable user-visible changes are recorded here. This project follows
   facts and content-free capability results, paired with an evidence-based compatibility template.
 - Live Privacy Receipts expose the post-redaction provider payload size, item count, aggregate
   hidden-span count, elapsed time, and outcome for completion, analysis, and chat in the Coach UI.
+- Session Airlock lets the CLI or Coach atomically cancel and block provider work for one terminal
+  session while local Risk Lens, diagnostics, memory, context, and data controls remain available.
 
 ### Security
 
@@ -44,11 +46,18 @@ All notable user-visible changes are recorded here. This project follows
 - Privacy Receipts contain no prompt, response, matched value, rule, model, endpoint, path, or
   history content; they are suppressed for shells, never persisted, and honestly mark disabled
   redaction, cancellation, provider failure, and local analysis fallback.
+- Session Airlock checks and changes share the daemon's session-state lock, so no provider request
+  can race past a seal; blocked questions are preserved, other sessions remain open, observer state
+  is hidden from shells, and every data-clear scope preserves the seal.
 
 ### Fixed
 
 - Source Card process integration tests tolerate contended CI scheduling without changing the
   product's 800ms local-documentation timeout.
+- Plain `p`/`P` remains normal Coach input; Privacy Receipt moved to `Ctrl+P`, with `Ctrl+O`
+  reserved for Session Airlock.
+- `aicoach data clear all` clears open log files in place instead of restarting the daemon, so a
+  memory-only Session Airlock cannot be silently reopened by a data-erasure command.
 
 ## [0.1.0] - 2026-09-04
 
