@@ -72,6 +72,9 @@ Terminal.app / iTerm2 / 其他 macOS 终端
   analysis、独立 fast/smart 模型、超时、并发限制、取消和有限瞬态重试。
 - 默认对 API 上行内容启用 API key/token/password/Authorization/Cookie/JWT/
   private key/SSH key/敏感环境变量脱敏；可以关闭。
+- 每次真正到达 Provider 边界的补全、失败分析或聊天都会产生一张实时 **Privacy
+  Receipt（隐私回执）**：只显示脱敏后的 payload 字符数、项数、隐藏片段总数、耗时和
+  成功/失败/取消/本地回退状态，不保存 prompt、回复、命中值、模型或 endpoint。
 - `aicoach capsule` 把当前终端最近的命令、状态、耗时和已保留的可用输出整理成可分享的
   Markdown。它完全在本机生成、强制脱敏并清除终端控制序列，可一键复制到剪贴板。
 - `aicoach support` 生成适合公开 issue 的中英文 Markdown，只输出 allowlist 系统类别和
@@ -231,6 +234,7 @@ aicoach restart
 | TUI | `Option+I` | 仅把明确选中的建议插入原终端 Buffer，显示本地安全评级后返回；仍需自行按 Enter |
 | TUI | `Option+Y` | 仅复制所选建议并显示本地安全评级；不会执行命令 |
 | TUI | `↑/↓` | 选择建议 |
+| TUI | `P` | 查看最近一次实时 Privacy Receipt；不显示或保存正文 |
 | TUI | `Ctrl+Q` | 退出窗口 |
 
 macOS 终端需将 Option 配置为 Meta/Esc 前缀。若快捷键冲突，可在 source 之前覆盖：
@@ -303,6 +307,14 @@ Source Cards 不联网，也不把手册内容发给 Provider。Git 帮助只调
 `aicoach-ui` 是纯 Ratatui/Crossterm 应用，不包含浏览器、Web server、Electron、
 Tauri、React 或 Vue。它自动挂到最近聚焦的 shell session，展示 cwd、最近命令、
 错误提示、建议和 streaming 对话。Chat history 默认每 session 保留 50 条，可关闭。
+
+Provider 请求结束后，标题栏会显示一枚简短的 `Privacy` 徽标；输入框为空时按 `P`
+可以查看详细回执。字符数是脱敏后的应用请求 JSON 在加入模型、endpoint 和 HTTP 外层
+之前的 Unicode 字符数；“项数”分别表示补全上下文项、分析上下文记录或聊天 messages。
+回执只发送给当时已订阅 session 的 Coach，不补发历史、不进入聊天记录或任何本地存储。
+纯本地分析不会生成回执，因为没有对外请求；若配置关闭脱敏，回执会明确显示关闭且隐藏
+数为 0。它证明本应用在 Provider 边界准备了什么类型和规模的数据，不证明外部 Provider
+如何保存或处理请求。
 
 每条建议旁都会先显示本地 Risk Lens 徽标，例如 `[LOW]`、`[HIGH/PARTIAL]` 或
 `[UNRATED]`；未识别和部分识别不会被伪装成低风险。`Option+I` 是 **insert only**：
@@ -587,7 +599,7 @@ homebrew/               Formula 模板
 ```
 
 贡献者可以从 [架构与模块边界](docs/ARCHITECTURE.md) 开始，并在修改跨进程消息前阅读
-[IPC Protocol v2](docs/PROTOCOL.md)。两份文档包含本地规则、持久化数据、协议操作和
+[IPC Protocol v3](docs/PROTOCOL.md)。两份文档包含本地规则、持久化数据、协议操作和
 终端适配器的扩展步骤，以及不能被弱化的隐私与执行权约束。
 
 ## 已知限制
@@ -606,6 +618,8 @@ homebrew/               Formula 模板
 - 为避免意外收集 secret，本项目不快照任意环境变量；只维护一组与终端体验有关的
   非敏感 allowlist（locale、`TERM`/`COLORTERM` 和虚拟环境元数据），并在每次命令
   完成时更新。
+- Privacy Receipt 是仅对已打开 Coach 实时推送的应用侧元数据，不是 Provider 的删除、
+  保留或合规证明；Coach 未订阅时不会事后补发。
 - 当前 Formula 只支持显式 `--HEAD` 源码安装；稳定 tap 必须等首个公开 tag 和真实
   源码 SHA-256 后才能发布。
 - `package-release.sh` 生成当前机器架构、可复现但仅 ad-hoc 签名的本地测试包。公开
@@ -643,7 +657,8 @@ safety warnings, a provider-free preflight Risk Lens, explainable token-level
 Command Patches, local-manual Source Cards, AI-assisted completion, quick
 terminal chat, share-ready privacy-scrubbed Session Capsules, local-only Failure
 Fingerprints, memory-only Session Checkpoints, a provider-free Environment Drift
-Lens, a public-safe local Support Report, and a standalone Ratatui Coach window.
+Lens, a public-safe local Support Report, live content-free Privacy Receipts, and a standalone
+Ratatui Coach window.
 It never presses Enter or executes an AI suggestion.
 
 The workflow image above is generated from the real local analyzer, Risk Lens,
@@ -701,6 +716,11 @@ widgets in a clean Zsh process. Use `aicoach onboard --check` for a read-only ch
 Use `aicoach support --copy` to generate a Markdown report for public issues without
 including usernames, paths, sessions, terminal content, logs, endpoints, models, or
 credentials; no provider or network request is made.
+For every provider-bound completion, analysis, or chat attempt, the open Coach receives a live
+Privacy Receipt containing only post-redaction application-payload size, item count, aggregate
+replacement count, elapsed time, and outcome. Receipts contain no prompt, response, match, model,
+endpoint, or path; they are neither replayed nor persisted and do not attest to provider-side
+retention.
 See the Chinese sections above for configuration, shortcuts, privacy boundaries,
 troubleshooting, and release requirements. Licensed under the
 [MIT License](LICENSE).

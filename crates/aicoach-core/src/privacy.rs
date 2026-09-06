@@ -135,11 +135,32 @@ impl PrivacyRedactor {
     }
 
     pub fn redact(&self, input: &str) -> String {
+        self.redact_with_stats(input).0
+    }
+
+    /// Redact a string and return the number of matched secret-shaped spans.
+    ///
+    /// The count is metadata only: it does not identify the rule or preserve
+    /// the matched value. Matches are counted in the same sequential pass used
+    /// to produce the returned text.
+    pub fn redact_with_stats(&self, input: &str) -> (String, usize) {
         if !self.enabled || input.is_empty() {
-            return input.to_owned();
+            return (input.to_owned(), 0);
         }
         let mut output = input.to_owned();
+        let mut replacements = 0usize;
         for rule in &self.rules {
+            let changed_matches = rule
+                .captures_iter(&output)
+                .filter(|captures| {
+                    let prefix = captures.name("prefix").map_or("", |value| value.as_str());
+                    let suffix = captures.name("suffix").map_or("", |value| value.as_str());
+                    captures.get(0).is_some_and(|matched| {
+                        matched.as_str() != format!("{prefix}{}{suffix}", self.replacement)
+                    })
+                })
+                .count();
+            replacements = replacements.saturating_add(changed_matches);
             output = rule
                 .replace_all(&output, |captures: &Captures<'_>| {
                     let prefix = captures.name("prefix").map_or("", |value| value.as_str());
@@ -148,7 +169,7 @@ impl PrivacyRedactor {
                 })
                 .into_owned();
         }
-        output
+        (output, replacements)
     }
 
     pub fn redact_command_record(&self, record: &CommandRecord) -> CommandRecord {
@@ -169,35 +190,72 @@ impl PrivacyRedactor {
     }
 
     pub fn redact_analysis_input(&self, input: &AnalysisInput) -> AnalysisInput {
+        self.redact_analysis_input_with_stats(input).0
+    }
+
+    /// Redact an analysis input and return only an aggregate replacement count.
+    /// No matched value or rule identifier is retained in the metadata.
+    pub fn redact_analysis_input_with_stats(
+        &self,
+        input: &AnalysisInput,
+    ) -> (AnalysisInput, usize) {
         let mut redacted = input.clone();
-        redacted.shell = self.redact(&redacted.shell);
-        redacted.cwd = self.redact_path(&redacted.cwd);
-        redacted.command = self.redact(&redacted.command);
-        redacted.stdout = self.redact(&redacted.stdout);
-        redacted.stderr = self.redact(&redacted.stderr);
-        redacted.context = redacted
-            .context
+        let mut replacements = 0usize;
+        redacted.shell = self.redact_accumulating(&input.shell, &mut replacements);
+        redacted.cwd = std::path::PathBuf::from(
+            self.redact_accumulating(&input.cwd.to_string_lossy(), &mut replacements),
+        );
+        redacted.command = self.redact_accumulating(&input.command, &mut replacements);
+        redacted.stdout = self.redact_accumulating(&input.stdout, &mut replacements);
+        redacted.stderr = self.redact_accumulating(&input.stderr, &mut replacements);
+        for (record, original) in redacted.context.iter_mut().zip(&input.context) {
+            record.command = self.redact_accumulating(&original.command, &mut replacements);
+            record.cwd = std::path::PathBuf::from(
+                self.redact_accumulating(&original.cwd.to_string_lossy(), &mut replacements),
+            );
+            record.stdout = self.redact_accumulating(&original.stdout, &mut replacements);
+            record.stderr = self.redact_accumulating(&original.stderr, &mut replacements);
+        }
+        redacted.environment = input
+            .environment
             .iter()
-            .map(|record| self.redact_command_record(record))
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    self.redact_environment_value_accumulating(key, value, &mut replacements),
+                )
+            })
             .collect();
-        redacted.environment = self.redact_environment(&redacted.environment);
-        redacted.environment_changes = redacted
+        redacted.environment_changes = input
             .environment_changes
             .iter()
             .map(|(key, value)| {
                 (
                     key.clone(),
-                    value
-                        .as_deref()
-                        .map(|value| self.redact_environment_value(key, value)),
+                    value.as_deref().map(|value| {
+                        self.redact_environment_value_accumulating(key, value, &mut replacements)
+                    }),
                 )
             })
             .collect();
-        redacted.git = redacted
-            .git
-            .as_ref()
-            .map(|git| self.redact_git_context(git));
-        redacted
+        if let (Some(redacted_git), Some(original_git)) =
+            (redacted.git.as_mut(), input.git.as_ref())
+        {
+            redacted_git.repo_root =
+                std::path::PathBuf::from(self.redact_accumulating(
+                    &original_git.repo_root.to_string_lossy(),
+                    &mut replacements,
+                ));
+            redacted_git.branch = original_git
+                .branch
+                .as_deref()
+                .map(|value| self.redact_accumulating(value, &mut replacements));
+            redacted_git.remote = original_git
+                .remote
+                .as_deref()
+                .map(|value| self.redact_accumulating(value, &mut replacements));
+        }
+        (redacted, replacements)
     }
 
     pub fn redact_terminal_context(&self, context: &TerminalContext) -> TerminalContext {
@@ -241,6 +299,25 @@ impl PrivacyRedactor {
             .map_or(assignment.as_str(), |(_, value)| value)
             .to_owned()
     }
+
+    fn redact_accumulating(&self, input: &str, total: &mut usize) -> String {
+        let (redacted, replacements) = self.redact_with_stats(input);
+        *total = total.saturating_add(replacements);
+        redacted
+    }
+
+    fn redact_environment_value_accumulating(
+        &self,
+        key: &str,
+        value: &str,
+        total: &mut usize,
+    ) -> String {
+        let assignment = self.redact_accumulating(&format!("{key}={value}"), total);
+        assignment
+            .split_once('=')
+            .map_or(assignment.as_str(), |(_, value)| value)
+            .to_owned()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -268,6 +345,35 @@ mod tests {
         let input = format!("key={synthetic_key} model=sk-example");
         let output = redactor().redact(&input);
         assert_eq!(output, "key=[REDACTED] model=sk-example");
+    }
+
+    #[test]
+    fn redaction_stats_count_matches_without_retaining_values() {
+        let first = ["sk", "abcdefghijklmnopqrstuvwxyz123456"].join("-");
+        let second = ["ghp", "abcdefghijklmnopqrstuvwxyz123456"].join("_");
+        let input = format!("first={first} second={second} model=sk-example");
+
+        let (output, replacements) = redactor().redact_with_stats(&input);
+        assert_eq!(replacements, 2);
+        assert_eq!(output.matches("[REDACTED]").count(), 2);
+        assert!(!output.contains(&first));
+        assert!(!output.contains(&second));
+
+        let (unchanged, replacements) = PrivacyRedactor::disabled().redact_with_stats(&input);
+        assert_eq!(unchanged, input);
+        assert_eq!(replacements, 0);
+    }
+
+    #[test]
+    fn structured_analysis_stats_are_aggregate_only() {
+        let secret = ["sk", "abcdefghijklmnopqrstuvwxyz123456"].join("-");
+        let mut input = AnalysisInput::new(format!("curl --api-key={secret}"), 1, "/tmp");
+        input.stderr = format!("Authorization: Bearer {secret}");
+
+        let (redacted, replacements) = redactor().redact_analysis_input_with_stats(&input);
+        let encoded = serde_json::to_string(&redacted).unwrap();
+        assert_eq!(replacements, 2);
+        assert!(!encoded.contains(&secret));
     }
 
     #[test]

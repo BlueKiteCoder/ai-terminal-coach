@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use aicoach_core::{AnalysisCoverage, RiskLensReport, RiskLevel, SourceCard};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 4 * 1024 * 1024;
 pub const SHELL_ENVIRONMENT_ALLOWLIST: [&str; 7] = [
     "LANG",
@@ -592,7 +592,42 @@ pub enum EventBody {
     InsertBuffer(InsertBufferParams),
     RequestCancelled,
     DataCleared { scope: DataClearScope },
+    PrivacyReceipt(PrivacyReceipt),
     SessionClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiRequestPurpose {
+    Completion,
+    Analysis,
+    Chat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiRequestOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    LocalFallback,
+}
+
+/// Content-free metadata describing one provider-bound operation.
+///
+/// It deliberately contains no prompt, response, endpoint, model, rule name,
+/// matched value, path, or session history. `payload_chars` measures the
+/// serialized provider-application request after redaction, before provider
+/// configuration or HTTP framing is added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivacyReceipt {
+    pub purpose: AiRequestPurpose,
+    pub outcome: AiRequestOutcome,
+    pub payload_chars: u64,
+    pub payload_items: u64,
+    pub redactions: u64,
+    pub redaction_enabled: bool,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -704,6 +739,32 @@ mod tests {
         .unwrap();
         assert_eq!(value["type"], "replace");
         assert!(value.get("operation").is_none());
+    }
+
+    #[test]
+    fn privacy_receipt_is_content_free_and_round_trips() {
+        let event = Event::new(
+            SessionId::new(),
+            Some(RequestId::new()),
+            EventBody::PrivacyReceipt(PrivacyReceipt {
+                purpose: AiRequestPurpose::Chat,
+                outcome: AiRequestOutcome::LocalFallback,
+                payload_chars: 1_234,
+                payload_items: 7,
+                redactions: 2,
+                redaction_enabled: true,
+                elapsed_ms: 84,
+            }),
+        );
+        let message = Message::from(event.clone());
+        let encoded = serde_json::to_string(&message).unwrap();
+
+        assert!(encoded.contains(r#""event":"privacy_receipt""#));
+        assert!(encoded.contains(r#""outcome":"local_fallback""#));
+        for forbidden in ["prompt", "response", "endpoint", "model", "matched_value"] {
+            assert!(!encoded.contains(forbidden));
+        }
+        assert_eq!(serde_json::from_str::<Message>(&encoded).unwrap(), message);
     }
 
     #[test]

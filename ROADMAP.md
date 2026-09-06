@@ -23,6 +23,8 @@ honest privacy boundary.
 - [x] Local failure analysis and pre-execution safety warnings.
 - [x] English and Simplified Chinese UI/output.
 - [x] Privacy-first provider boundary and macOS Keychain integration.
+- [x] **Live Privacy Receipts:** content-free, non-persistent evidence for every provider-bound
+  completion, analysis, and chat attempt, including redaction and fallback state.
 - [x] **Session Capsule:** locally export a redacted, terminal-safe Markdown incident report.
 - [ ] Signed and notarized Apple Silicon and Intel release artifacts.
 - [ ] Working Homebrew tap with an upgrade-safe install flow.

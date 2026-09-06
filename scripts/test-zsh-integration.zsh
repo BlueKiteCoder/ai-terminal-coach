@@ -269,5 +269,13 @@ assert_eq "$last_notice_severity" 'warning'
   test_failed=1
 }
 
+# Privacy Receipts are observer-only. Even a stray frame from a mismatched
+# daemon must be ignored without changing the shell buffer or user message.
+typeset -g BUFFER='echo unchanged'
+typeset -g last_notice_message='unchanged notice'
+_aicoach_handle_line $'PRIVACY_RECEIPT\t'$AICOACH_SESSION_ID$'\treq-privacy\tchat\tsucceeded\t128\t2\t1\ttrue\t20'
+assert_eq "$BUFFER" 'echo unchanged'
+assert_eq "$last_notice_message" 'unchanged notice'
+
 (( test_failed == 0 )) && print 'zsh integration tests: ok'
 exit $test_failed
