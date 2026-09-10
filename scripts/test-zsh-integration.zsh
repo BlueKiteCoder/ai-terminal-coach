@@ -2,6 +2,7 @@
 set -euo pipefail
 
 typeset -g test_failed=0
+typeset -g last_print=""
 assert_eq() {
   if [[ $1 != $2 ]]; then
     print -u2 -r -- "FAIL: expected <$2>, got <$1>"
@@ -50,10 +51,16 @@ bindkey() {
 add-zsh-hook() { return 0 }
 add-zle-hook-widget() { return 0 }
 print() {
-  [[ ${1:-} == -u2 ]] && builtin print "$@" || return 0
+  if [[ ${1:-} == -u2 ]]; then
+    builtin print "$@"
+  else
+    last_print=${(j: :)@}
+  fi
+  return 0
 }
 source "${0:A:h:h}/shell/aicoach.zsh"
 
+assert_eq "$AICOACH_INTEGRATION_VERSION" '3'
 assert_eq "$AICOACH_LANGUAGE" 'en-US'
 _aicoach_text thinking
 assert_eq "$REPLY" 'Thinking…'
@@ -103,6 +110,24 @@ override_binding=$(
   builtin print -u2 -r -- 'FAIL: explicit pre-source shortcut override lost precedence'
   test_failed=1
 }
+
+# Cross-version sourcing replaces stale widget definitions while preserving
+# the original classification of generated versus user-supplied settings.
+upgrade_probe=$(
+  AICOACH_TEST_MODE=1 \
+  AICOACH_SETTINGS_FILE=$AICOACH_SETTINGS_FILE \
+  AICOACH_SETTINGS_VERSION_FILE=$AICOACH_SETTINGS_VERSION_FILE \
+  AICOACH_VERIFY_SCRIPT="${0:A:h:h}/shell/aicoach.zsh" \
+    /bin/zsh -dfc '
+      source "$AICOACH_VERIFY_SCRIPT"
+      typeset -gx AICOACH_INTEGRATION_VERSION=2
+      _aicoach_request_status_begin() { return 77 }
+      source "$AICOACH_VERIFY_SCRIPT"
+      _aicoach_request_status_begin upgrade-probe ready
+      print -r -- "$AICOACH_INTEGRATION_VERSION:$AICOACH_STATUS_REQUEST_ID:$AICOACH_CHAT_KEY_USER_SET"
+    '
+)
+assert_eq "$upgrade_probe" '3:upgrade-probe:0'
 
 _aicoach_encode $'hello\t世界\n100%'
 encoded=$REPLY
@@ -160,17 +185,27 @@ typeset -g BUFFER='docker ps --forma'
 typeset -g CURSOR=${#BUFFER}
 typeset -g AICOACH_COMPLETION_ID=req-1
 typeset -g AICOACH_COMPLETION_SNAPSHOT=$BUFFER
+typeset -g AICOACH_COMPLETION_CURSOR=$CURSOR
+_aicoach_request_status_begin req-1 'Generating completion…'
+# A fast socket response may arrive before the outer key widget has committed
+# its BUFFER. The request snapshot remains authoritative in that callback.
+typeset -g BUFFER=''
+typeset -g CURSOR=0
 _aicoach_handle_line $'COMPLETE\t'$AICOACH_SESSION_ID$'\treq-1\treplace\t18\tdocker ps --format\t修正参数'
 assert_eq "$BUFFER" 'docker ps --format'
 assert_eq "$CURSOR" '18'
+assert_eq "$AICOACH_COMPLETION_ID" ''
 assert_eq "$last_zle_message" '[AI Coach] 修正参数'
 
 typeset -g BUFFER='echo'
 typeset -g CURSOR=${#BUFFER}
 typeset -g AICOACH_COMPLETION_ID=req-2
 typeset -g AICOACH_COMPLETION_SNAPSHOT=$BUFFER
+_aicoach_request_status_begin req-2 'Generating completion…'
 _aicoach_handle_line $'COMPLETE\t'$AICOACH_SESSION_ID$'\treq-2\treplace\t8\trm -rf /\tbad'
 assert_eq "$BUFFER" 'echo'
+assert_eq "$AICOACH_COMPLETION_ID" ''
+assert_eq "$last_zle_message" ''
 
 typeset -g AICOACH_DEFER_INSERT=1
 _aicoach_handle_line $'INSERT\t'$AICOACH_SESSION_ID$'\tprintf queued\tlow\trecognized\ttrue'
@@ -215,9 +250,44 @@ _aicoach_risk_lens_widget
 }
 assert_eq "$last_zle_message" '[AI Coach] Inspecting command impact locally…'
 lens_request=$AICOACH_RISK_LENS_ID
+typeset -g BUFFER=''
 _aicoach_handle_line $'LENS\t'$AICOACH_SESSION_ID$'\t'$lens_request$'\thigh\tRisk Lens · HIGH%0AImpact: modify Git worktree'
 assert_eq "$AICOACH_RISK_LENS_ID" ''
-assert_eq "$BUFFER" 'git reset --hard'
+[[ $last_print == *'Risk Lens · HIGH'* ]] || {
+  builtin print -u2 -r -- 'FAIL: fast Risk Lens response was discarded with an uncommitted callback buffer'
+  test_failed=1
+}
+assert_eq "$last_zle_message" ''
+
+# Completion/lens errors and cancellation events must release both the request
+# record and its transient busy indicator.
+typeset -g AICOACH_COMPLETION_ID=req-error
+typeset -g AICOACH_COMPLETION_SNAPSHOT='echo err'
+_aicoach_request_status_begin req-error 'Generating completion…'
+_aicoach_handle_line $'ERROR\t'$AICOACH_SESSION_ID$'\treq-error\tai_unavailable\tprovider unavailable\ttrue'
+assert_eq "$AICOACH_COMPLETION_ID" ''
+assert_eq "$last_zle_message" ''
+
+typeset -g AICOACH_RISK_LENS_ID=req-cancel
+typeset -g AICOACH_RISK_LENS_SNAPSHOT='echo cancel'
+_aicoach_request_status_begin req-cancel 'Inspecting command impact locally…'
+_aicoach_handle_line $'CANCELLED\t'$AICOACH_SESSION_ID$'\treq-cancel'
+assert_eq "$AICOACH_RISK_LENS_ID" ''
+assert_eq "$last_zle_message" ''
+
+# A late response from an older request cannot erase the active request's
+# status message.
+typeset -g AICOACH_COMPLETION_ID=req-new
+typeset -g AICOACH_COMPLETION_SNAPSHOT='echo new'
+_aicoach_request_status_begin req-new 'Generating completion…'
+_aicoach_request_status_end req-old
+assert_eq "$last_zle_message" '[AI Coach] Generating completion…'
+_aicoach_handle_line $'CANCELLED\t'$AICOACH_SESSION_ID$'\treq-old'
+assert_eq "$AICOACH_COMPLETION_ID" 'req-new'
+assert_eq "$last_zle_message" '[AI Coach] Generating completion…'
+_aicoach_handle_line $'CANCELLED\t'$AICOACH_SESSION_ID$'\treq-new'
+assert_eq "$AICOACH_COMPLETION_ID" ''
+assert_eq "$last_zle_message" ''
 
 typeset -g sent_chat_line=""
 _aicoach_send() {
@@ -254,11 +324,20 @@ _aicoach_notice() {
   last_notice_severity=$1
   last_notice_message=$2
 }
+# A newer completion owns the shared ZLE message slot. Finishing the older
+# chat may restore its POSTDISPLAY, but must leave that completion status alone.
+typeset -g AICOACH_COMPLETION_ID='parallel-completion'
+typeset -g AICOACH_COMPLETION_SNAPSHOT='echo parallel'
+_aicoach_request_status_begin parallel-completion 'Generating completion…'
 _aicoach_handle_line $'ANSWER_DONE\t'$AICOACH_SESSION_ID$'\t'$stream_request
 assert_eq "$last_notice_severity" 'info'
 assert_eq "$last_notice_message" $'你好，世界\n\n- 列表项\n  echo ok'
 assert_eq "$AICOACH_CHAT_ID" ''
 assert_eq "$POSTDISPLAY" ''
+assert_eq "$AICOACH_STATUS_REQUEST_ID" 'parallel-completion'
+assert_eq "$last_zle_message" '[AI Coach] Generating completion…'
+_aicoach_handle_line $'CANCELLED\t'$AICOACH_SESSION_ID$'\tparallel-completion'
+assert_eq "$last_zle_message" ''
 
 typeset -g AICOACH_CHAT_ID='stream-failure'
 typeset -g AICOACH_CHAT_STREAM_CONTENT='已生成部分'
