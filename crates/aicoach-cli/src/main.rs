@@ -30,6 +30,8 @@ const MANAGED_START: &str = "# >>> AI Terminal Coach >>>";
 const MANAGED_END: &str = "# <<< AI Terminal Coach <<<";
 const DAEMON_LABEL: &str = "com.aicoach.daemon";
 const HOTKEY_LABEL: &str = "com.aicoach.hotkey";
+const LAUNCHCTL_BOOTSTRAP_ATTEMPTS: usize = 3;
+const LAUNCHCTL_BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -1383,23 +1385,63 @@ fn launch_agent_plist(
 
 fn bootstrap_agent(plist: &Path, label: &str, kickstart: bool) -> Result<()> {
     let domain = launch_domain()?;
+    bootstrap_agent_with(
+        Path::new("/bin/launchctl"),
+        &domain,
+        plist,
+        label,
+        kickstart,
+        LAUNCHCTL_BOOTSTRAP_RETRY_DELAY,
+    )
+}
+
+fn bootstrap_agent_with(
+    launchctl: &Path,
+    domain: &str,
+    plist: &Path,
+    label: &str,
+    kickstart: bool,
+    retry_delay: Duration,
+) -> Result<()> {
     let service = format!("{domain}/{label}");
-    let _ = Command::new("/bin/launchctl")
+    let _ = Command::new(launchctl)
         .args(["bootout", &service])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let status = Command::new("/bin/launchctl")
-        .arg("bootstrap")
-        .arg(&domain)
-        .arg(plist)
-        .status()
-        .context("launchctl bootstrap")?;
-    if !status.success() {
-        bail!("launchctl could not load {}", plist.display());
+
+    let mut loaded = false;
+    let mut last_error = String::new();
+    for attempt in 0..LAUNCHCTL_BOOTSTRAP_ATTEMPTS {
+        let output = Command::new(launchctl)
+            .arg("bootstrap")
+            .arg(domain)
+            .arg(plist)
+            .output()
+            .context("launchctl bootstrap")?;
+        if output.status.success() {
+            loaded = true;
+            break;
+        }
+        last_error = aicoach_core::terminal::strip_terminal_sequences(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            false,
+        )
+        .chars()
+        .take(500)
+        .collect();
+        if attempt + 1 < LAUNCHCTL_BOOTSTRAP_ATTEMPTS {
+            thread::sleep(retry_delay);
+        }
+    }
+    if !loaded {
+        if last_error.is_empty() {
+            bail!("launchctl could not load {}", plist.display());
+        }
+        bail!("launchctl could not load {}: {last_error}", plist.display());
     }
     if kickstart {
-        let status = Command::new("/bin/launchctl")
+        let status = Command::new(launchctl)
             .args(["kickstart", "-k", &service])
             .status()
             .context("launchctl kickstart")?;
@@ -1725,6 +1767,59 @@ mod tests {
         assert!(plist.contains("x&amp;y"));
         assert!(plist.contains("/tmp/a&amp;b"));
         assert!(plist.contains("<true/>"));
+    }
+
+    #[test]
+    fn launch_agent_bootstrap_retries_a_transient_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let launchctl = directory.path().join("launchctl");
+        fs::write(
+            &launchctl,
+            "#!/bin/sh\nif [ \"$1\" = bootstrap ]; then\n  count_file=\"$0.count\"\n  count=0\n  [ ! -f \"$count_file\" ] || read -r count < \"$count_file\"\n  count=$((count + 1))\n  printf '%s' \"$count\" > \"$count_file\"\n  [ \"$count\" -lt 2 ] && exit 5\nfi\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o700)).unwrap();
+
+        bootstrap_agent_with(
+            &launchctl,
+            "gui/501",
+            &directory.path().join("agent.plist"),
+            "com.aicoach.test",
+            true,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("launchctl.count")).unwrap(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn launch_agent_bootstrap_stops_after_bounded_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let launchctl = directory.path().join("launchctl");
+        fs::write(
+            &launchctl,
+            "#!/bin/sh\nif [ \"$1\" = bootstrap ]; then\n  count_file=\"$0.count\"\n  count=0\n  [ ! -f \"$count_file\" ] || read -r count < \"$count_file\"\n  count=$((count + 1))\n  printf '%s' \"$count\" > \"$count_file\"\n  echo 'simulated I/O error' >&2\n  exit 5\nfi\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = bootstrap_agent_with(
+            &launchctl,
+            "gui/501",
+            &directory.path().join("agent.plist"),
+            "com.aicoach.test",
+            false,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("simulated I/O error"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("launchctl.count")).unwrap(),
+            LAUNCHCTL_BOOTSTRAP_ATTEMPTS.to_string()
+        );
     }
 
     #[test]
