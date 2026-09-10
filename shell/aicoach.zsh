@@ -3,34 +3,38 @@
 
 [[ -o interactive || -n ${AICOACH_TEST_MODE:-} ]] || return 0
 if [[ -n ${AICOACH_ZSH_LOADED:-} ]]; then
-  # Re-sourcing is an explicit request to pick up generated settings. Older
-  # integrations do not have the reload function, so fall through once during
-  # an upgrade and replace their definitions in-place.
-  if (( $+functions[_aicoach_reload_settings] )); then
+  # Same-version sourcing only refreshes generated settings. A newer script
+  # closes the old socket and replaces every function/widget in-place.
+  if [[ ${AICOACH_INTEGRATION_VERSION:-0} == <-> ]] &&
+      (( AICOACH_INTEGRATION_VERSION >= 3 )) &&
+      (( $+functions[_aicoach_reload_settings] )); then
     _aicoach_reload_settings
     return 0
   fi
+  (( $+functions[_aicoach_close] )) && _aicoach_close
   unset AICOACH_ZSH_LOADED
 fi
 typeset -g AICOACH_ZSH_LOADED=1
-typeset -gx AICOACH_INTEGRATION_VERSION=2
+typeset -gx AICOACH_INTEGRATION_VERSION=3
 
 # Remember settings explicitly supplied before this file was sourced. Generated
 # config can then hot-reload without overriding intentional .zshrc customizations.
-typeset -gi AICOACH_COMPLETION_KEY_USER_SET=${+AICOACH_COMPLETION_KEY}
-typeset -g AICOACH_COMPLETION_KEY_USER_VALUE=${AICOACH_COMPLETION_KEY-}
-typeset -gi AICOACH_CHAT_KEY_USER_SET=${+AICOACH_CHAT_KEY}
-typeset -g AICOACH_CHAT_KEY_USER_VALUE=${AICOACH_CHAT_KEY-}
-typeset -gi AICOACH_RISK_LENS_KEY_USER_SET=${+AICOACH_RISK_LENS_KEY}
-typeset -g AICOACH_RISK_LENS_KEY_USER_VALUE=${AICOACH_RISK_LENS_KEY-}
-typeset -gi AICOACH_TOGGLE_KEY_USER_SET=${+AICOACH_TOGGLE_KEY}
-typeset -g AICOACH_TOGGLE_KEY_USER_VALUE=${AICOACH_TOGGLE_KEY-}
-typeset -gi AICOACH_LANGUAGE_USER_SET=${+AICOACH_LANGUAGE}
-typeset -g AICOACH_LANGUAGE_USER_VALUE=${AICOACH_LANGUAGE-}
-typeset -gi AICOACH_SAFETY_ENABLED_USER_SET=${+AICOACH_SAFETY_ENABLED}
-typeset -g AICOACH_SAFETY_ENABLED_USER_VALUE=${AICOACH_SAFETY_ENABLED-}
-typeset -gi AICOACH_INLINE_HINT_USER_SET=${+AICOACH_INLINE_HINT}
-typeset -g AICOACH_INLINE_HINT_USER_VALUE=${AICOACH_INLINE_HINT-}
+if (( ! ${+AICOACH_COMPLETION_KEY_USER_SET} )); then
+  typeset -gi AICOACH_COMPLETION_KEY_USER_SET=${+AICOACH_COMPLETION_KEY}
+  typeset -g AICOACH_COMPLETION_KEY_USER_VALUE=${AICOACH_COMPLETION_KEY-}
+  typeset -gi AICOACH_CHAT_KEY_USER_SET=${+AICOACH_CHAT_KEY}
+  typeset -g AICOACH_CHAT_KEY_USER_VALUE=${AICOACH_CHAT_KEY-}
+  typeset -gi AICOACH_RISK_LENS_KEY_USER_SET=${+AICOACH_RISK_LENS_KEY}
+  typeset -g AICOACH_RISK_LENS_KEY_USER_VALUE=${AICOACH_RISK_LENS_KEY-}
+  typeset -gi AICOACH_TOGGLE_KEY_USER_SET=${+AICOACH_TOGGLE_KEY}
+  typeset -g AICOACH_TOGGLE_KEY_USER_VALUE=${AICOACH_TOGGLE_KEY-}
+  typeset -gi AICOACH_LANGUAGE_USER_SET=${+AICOACH_LANGUAGE}
+  typeset -g AICOACH_LANGUAGE_USER_VALUE=${AICOACH_LANGUAGE-}
+  typeset -gi AICOACH_SAFETY_ENABLED_USER_SET=${+AICOACH_SAFETY_ENABLED}
+  typeset -g AICOACH_SAFETY_ENABLED_USER_VALUE=${AICOACH_SAFETY_ENABLED-}
+  typeset -gi AICOACH_INLINE_HINT_USER_SET=${+AICOACH_INLINE_HINT}
+  typeset -g AICOACH_INLINE_HINT_USER_VALUE=${AICOACH_INLINE_HINT-}
+fi
 
 zmodload zsh/net/socket 2>/dev/null || return 0
 zmodload zsh/system 2>/dev/null || return 0
@@ -49,8 +53,10 @@ typeset -g AICOACH_COMMAND_ID=""
 typeset -gF AICOACH_COMMAND_STARTED=0
 typeset -g AICOACH_COMPLETION_ID=""
 typeset -g AICOACH_COMPLETION_SNAPSHOT=""
+typeset -g AICOACH_COMPLETION_CURSOR=""
 typeset -g AICOACH_RISK_LENS_ID=""
 typeset -g AICOACH_RISK_LENS_SNAPSHOT=""
+typeset -g AICOACH_STATUS_REQUEST_ID=""
 typeset -g AICOACH_CHAT_ID=""
 typeset -g AICOACH_CHAT_STREAM_CONTENT=""
 typeset -g AICOACH_CHAT_STREAM_PENDING=""
@@ -71,6 +77,8 @@ typeset -g AICOACH_PENDING_COMPLETION_OPERATION=""
 typeset -g AICOACH_PENDING_COMPLETION_COMMAND=""
 typeset -g AICOACH_PENDING_COMPLETION_CURSOR=""
 typeset -g AICOACH_PENDING_COMPLETION_DESCRIPTION=""
+typeset -g AICOACH_PENDING_COMPLETION_BASE=""
+typeset -g AICOACH_PENDING_COMPLETION_BASE_CURSOR=""
 typeset -g AICOACH_LAST_DANGER_BUFFER=""
 
 typeset -g AICOACH_SETTINGS_FILE=${AICOACH_SETTINGS_FILE:-$HOME/.config/aicoach/keybindings.zsh}
@@ -276,12 +284,57 @@ _aicoach_safe_buffer() {
   [[ $value != *$'\e'* && $value != *$'\r'* && $value != *$'\n'* && $value != *[[:cntrl:]]* ]]
 }
 
+# ZLE has one transient message slot. Associate busy messages with the request
+# that owns them so a late response cannot clear a newer request's status.
+_aicoach_request_status_begin() {
+  local request_id=$1 message=$2
+  typeset -g AICOACH_STATUS_REQUEST_ID=$request_id
+  zle -M "[AI Coach] $message" 2>/dev/null || true
+}
+
+_aicoach_request_status_end() {
+  local request_id=$1
+  [[ -n $request_id && $AICOACH_STATUS_REQUEST_ID == $request_id ]] || return 0
+  typeset -g AICOACH_STATUS_REQUEST_ID=""
+  zle -M "" 2>/dev/null || true
+}
+
+_aicoach_request_status_reset() {
+  [[ -n $AICOACH_STATUS_REQUEST_ID ]] || return 0
+  typeset -g AICOACH_STATUS_REQUEST_ID=""
+  zle -M "" 2>/dev/null || true
+}
+
+_aicoach_completion_finish() {
+  local request_id=$1
+  [[ -n $request_id && $request_id == $AICOACH_COMPLETION_ID ]] || return 1
+  typeset -g AICOACH_COMPLETION_ID=""
+  typeset -g AICOACH_COMPLETION_SNAPSHOT=""
+  typeset -g AICOACH_COMPLETION_CURSOR=""
+  _aicoach_request_status_end "$request_id"
+}
+
+_aicoach_risk_lens_finish() {
+  local request_id=$1
+  [[ -n $request_id && $request_id == $AICOACH_RISK_LENS_ID ]] || return 1
+  typeset -g AICOACH_RISK_LENS_ID=""
+  typeset -g AICOACH_RISK_LENS_SNAPSHOT=""
+  _aicoach_request_status_end "$request_id"
+}
+
 _aicoach_close() {
   if [[ -n $AICOACH_FD ]]; then
     zle -F "$AICOACH_FD" 2>/dev/null || true
     exec {AICOACH_FD}>&- 2>/dev/null || true
   fi
   typeset -g AICOACH_FD=""
+  typeset -g AICOACH_COMPLETION_ID=""
+  typeset -g AICOACH_COMPLETION_SNAPSHOT=""
+  typeset -g AICOACH_COMPLETION_CURSOR=""
+  typeset -g AICOACH_RISK_LENS_ID=""
+  typeset -g AICOACH_RISK_LENS_SNAPSHOT=""
+  _aicoach_chat_stream_reset
+  _aicoach_request_status_reset
 }
 
 _aicoach_maybe_start() {
@@ -446,9 +499,9 @@ _aicoach_apply_chat_display_widget() {
   POSTDISPLAY=$AICOACH_CHAT_POSTDISPLAY_DESIRED
   zle redisplay 2>/dev/null || true
   if (( AICOACH_CHAT_STREAM_STARTED )) && [[ -n $AICOACH_CHAT_MESSAGE_DESIRED ]]; then
-    zle -M "[AI Coach] ${AICOACH_CHAT_MESSAGE_DESIRED}"
-  else
-    zle -M ""
+    _aicoach_request_status_begin "$AICOACH_CHAT_ID" "$AICOACH_CHAT_MESSAGE_DESIRED"
+  elif [[ -n $AICOACH_CHAT_ID ]]; then
+    _aicoach_request_status_end "$AICOACH_CHAT_ID"
   fi
 }
 
@@ -482,11 +535,11 @@ _aicoach_handle_line() {
       ;;
     COMPLETE)
       local request_id=${fields[3]:-} operation=${fields[4]:-suggest} cursor=${fields[5]:--1}
-      local command description
+      local command description snapshot=$AICOACH_COMPLETION_SNAPSHOT snapshot_cursor=$AICOACH_COMPLETION_CURSOR
       _aicoach_decode "${fields[6]:-}"; command=$REPLY
       _aicoach_decode "${fields[7]:-}"; description=$REPLY
       [[ $request_id == $AICOACH_COMPLETION_ID ]] || return 0
-      [[ $BUFFER == $AICOACH_COMPLETION_SNAPSHOT ]] || return 0
+      _aicoach_completion_finish "$request_id" || return 0
       if ! _aicoach_safe_buffer "$command"; then
         _aicoach_text rejected_completion
         _aicoach_notice error "$REPLY"
@@ -503,6 +556,8 @@ _aicoach_handle_line() {
           typeset -g AICOACH_PENDING_COMPLETION_COMMAND=$command
           typeset -g AICOACH_PENDING_COMPLETION_CURSOR=$cursor
           typeset -g AICOACH_PENDING_COMPLETION_DESCRIPTION=$description
+          typeset -g AICOACH_PENDING_COMPLETION_BASE=$snapshot
+          typeset -g AICOACH_PENDING_COMPLETION_BASE_CURSOR=$snapshot_cursor
           zle aicoach-apply-completion
           ;;
         *)
@@ -513,12 +568,8 @@ _aicoach_handle_line() {
       ;;
     LENS)
       local request_id=${fields[3]:-} severity=${fields[4]:-unrated} message
-      local snapshot=$AICOACH_RISK_LENS_SNAPSHOT
       _aicoach_decode "${fields[5]:-}"; message=$REPLY
-      [[ $request_id == $AICOACH_RISK_LENS_ID ]] || return 0
-      typeset -g AICOACH_RISK_LENS_ID=""
-      typeset -g AICOACH_RISK_LENS_SNAPSHOT=""
-      [[ $BUFFER == $snapshot ]] || return 0
+      _aicoach_risk_lens_finish "$request_id" || return 0
       [[ $severity == unrated ]] && severity=warning
       _aicoach_notice "$severity" "$message"
       ;;
@@ -577,6 +628,8 @@ _aicoach_handle_line() {
     ERROR)
       local request_id=${fields[3]:-} message partial=""
       _aicoach_decode "${fields[5]:-${fields[4]:-}}"; message=$REPLY
+      _aicoach_completion_finish "$request_id" 2>/dev/null || true
+      _aicoach_risk_lens_finish "$request_id" 2>/dev/null || true
       if [[ -n $AICOACH_CHAT_ID && $request_id == $AICOACH_CHAT_ID ]]; then
         partial=$AICOACH_CHAT_STREAM_CONTENT
         _aicoach_chat_stream_reset
@@ -591,6 +644,14 @@ _aicoach_handle_line() {
       else
         _aicoach_text unavailable
         _aicoach_notice error "${message:-$REPLY}"
+      fi
+      ;;
+    CANCELLED)
+      local request_id=${fields[3]:-}
+      _aicoach_completion_finish "$request_id" 2>/dev/null || true
+      _aicoach_risk_lens_finish "$request_id" 2>/dev/null || true
+      if [[ -n $AICOACH_CHAT_ID && $request_id == $AICOACH_CHAT_ID ]]; then
+        _aicoach_chat_stream_reset
       fi
       ;;
   esac
@@ -666,10 +727,14 @@ _aicoach_apply_completion_widget() {
   local command=$AICOACH_PENDING_COMPLETION_COMMAND
   local cursor=$AICOACH_PENDING_COMPLETION_CURSOR
   local description=$AICOACH_PENDING_COMPLETION_DESCRIPTION
+  local base=$AICOACH_PENDING_COMPLETION_BASE
+  local base_cursor=$AICOACH_PENDING_COMPLETION_BASE_CURSOR
   typeset -g AICOACH_PENDING_COMPLETION_OPERATION=""
   typeset -g AICOACH_PENDING_COMPLETION_COMMAND=""
   typeset -g AICOACH_PENDING_COMPLETION_CURSOR=""
   typeset -g AICOACH_PENDING_COMPLETION_DESCRIPTION=""
+  typeset -g AICOACH_PENDING_COMPLETION_BASE=""
+  typeset -g AICOACH_PENDING_COMPLETION_BASE_CURSOR=""
   case $operation in
     replace)
       BUFFER=$command
@@ -680,6 +745,12 @@ _aicoach_apply_completion_widget() {
       fi
       ;;
     insert)
+      BUFFER=$base
+      if [[ $base_cursor == <-> ]] && (( base_cursor >= 0 && base_cursor <= ${#BUFFER} )); then
+        CURSOR=$base_cursor
+      else
+        CURSOR=${#BUFFER}
+      fi
       local left=${BUFFER[1,CURSOR]} right=${BUFFER[CURSOR+1,-1]}
       BUFFER="${left}${command}${right}"
       (( CURSOR += ${#command} ))
@@ -734,15 +805,23 @@ _aicoach_complete_widget() {
     _aicoach_notice critical "$REPLY"
     return 0
   fi
-  [[ -n $AICOACH_COMPLETION_ID ]] && _aicoach_send $'ZSH\tCANCEL\t'"$AICOACH_SESSION_ID"$'\t'"$AICOACH_COMPLETION_ID" || true
+  if [[ -n $AICOACH_COMPLETION_ID ]]; then
+    local previous_request=$AICOACH_COMPLETION_ID
+    _aicoach_send $'ZSH\tCANCEL\t'"$AICOACH_SESSION_ID"$'\t'"$previous_request" || true
+    _aicoach_completion_finish "$previous_request" 2>/dev/null || true
+  fi
   _aicoach_request_id; typeset -g AICOACH_COMPLETION_ID=$REPLY
+  local request_id=$AICOACH_COMPLETION_ID
   typeset -g AICOACH_COMPLETION_SNAPSHOT=$BUFFER
+  typeset -g AICOACH_COMPLETION_CURSOR=$CURSOR
   local encoded_cwd encoded_buffer
   _aicoach_encode "$PWD"; encoded_cwd=$REPLY
   _aicoach_encode "$BUFFER"; encoded_buffer=$REPLY
-  if _aicoach_send $'ZSH\tCOMPLETE\t'"$AICOACH_SESSION_ID"$'\t'"$AICOACH_COMPLETION_ID"$'\t'"$CURSOR"$'\t'"$encoded_cwd"$'\t'"$encoded_buffer"; then
-    _aicoach_text generating_completion; zle -M "[AI Coach] $REPLY"
+  if _aicoach_send $'ZSH\tCOMPLETE\t'"$AICOACH_SESSION_ID"$'\t'"$request_id"$'\t'"$CURSOR"$'\t'"$encoded_cwd"$'\t'"$encoded_buffer"; then
+    _aicoach_text generating_completion
+    _aicoach_request_status_begin "$request_id" "$REPLY"
   else
+    _aicoach_completion_finish "$request_id" 2>/dev/null || true
     _aicoach_text daemon_stopped; zle -M "[AI Coach] $REPLY"
   fi
 }
@@ -777,16 +856,18 @@ _aicoach_risk_lens_widget() {
     _aicoach_text lens_empty; zle -M "[AI Coach] $REPLY"
     return 0
   fi
+  [[ -n $AICOACH_RISK_LENS_ID ]] && _aicoach_risk_lens_finish "$AICOACH_RISK_LENS_ID" 2>/dev/null || true
   _aicoach_request_id; typeset -g AICOACH_RISK_LENS_ID=$REPLY
+  local request_id=$AICOACH_RISK_LENS_ID
   typeset -g AICOACH_RISK_LENS_SNAPSHOT=$BUFFER
   local encoded_cwd encoded_buffer
   _aicoach_encode "$PWD"; encoded_cwd=$REPLY
   _aicoach_encode "$BUFFER"; encoded_buffer=$REPLY
-  if _aicoach_send $'ZSH\tLENS\t'"$AICOACH_SESSION_ID"$'\t'"$AICOACH_RISK_LENS_ID"$'\t'"$encoded_cwd"$'\t'"$encoded_buffer"; then
-    _aicoach_text inspecting_locally; zle -M "[AI Coach] $REPLY"
+  if _aicoach_send $'ZSH\tLENS\t'"$AICOACH_SESSION_ID"$'\t'"$request_id"$'\t'"$encoded_cwd"$'\t'"$encoded_buffer"; then
+    _aicoach_text inspecting_locally
+    _aicoach_request_status_begin "$request_id" "$REPLY"
   else
-    typeset -g AICOACH_RISK_LENS_ID=""
-    typeset -g AICOACH_RISK_LENS_SNAPSHOT=""
+    _aicoach_risk_lens_finish "$request_id" 2>/dev/null || true
     _aicoach_text daemon_stopped; zle -M "[AI Coach] $REPLY"
   fi
 }
@@ -809,10 +890,13 @@ _aicoach_line_pre_redraw() {
   fi
   # Typing after a completion request makes its response stale. Tell the daemon
   # early so provider capacity is immediately released.
-  if [[ -n $AICOACH_COMPLETION_ID && $BUFFER != $AICOACH_COMPLETION_SNAPSHOT ]]; then
-    _aicoach_send $'ZSH\tCANCEL\t'"$AICOACH_SESSION_ID"$'\t'"$AICOACH_COMPLETION_ID" || true
-    typeset -g AICOACH_COMPLETION_ID=""
-    typeset -g AICOACH_COMPLETION_SNAPSHOT=""
+  if [[ -n $AICOACH_COMPLETION_ID && ( $BUFFER != $AICOACH_COMPLETION_SNAPSHOT || $CURSOR != $AICOACH_COMPLETION_CURSOR ) ]]; then
+    local stale_request=$AICOACH_COMPLETION_ID
+    _aicoach_send $'ZSH\tCANCEL\t'"$AICOACH_SESSION_ID"$'\t'"$stale_request" || true
+    _aicoach_completion_finish "$stale_request" 2>/dev/null || true
+  fi
+  if [[ -n $AICOACH_RISK_LENS_ID && $BUFFER != $AICOACH_RISK_LENS_SNAPSHOT ]]; then
+    _aicoach_risk_lens_finish "$AICOACH_RISK_LENS_ID" 2>/dev/null || true
   fi
 }
 
