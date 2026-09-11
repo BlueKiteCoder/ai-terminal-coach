@@ -69,6 +69,10 @@ _aicoach_text thinking
 assert_eq "$REPLY" '正在思考…'
 typeset -g AICOACH_LANGUAGE='en-US'
 
+meta_completion_emacs=$'emacs:\e\t'
+meta_completion_viins=$'viins:\e\t'
+assert_eq "${test_bindings[$meta_completion_emacs]:-}" 'aicoach-complete'
+assert_eq "${test_bindings[$meta_completion_viins]:-}" 'aicoach-complete'
 meta_chat_binding=$'emacs:\e/'
 native_chat_binding='viins:÷'
 assert_eq "${test_bindings[$meta_chat_binding]:-}" 'aicoach-chat'
@@ -161,6 +165,13 @@ _aicoach_safe_buffer $'echo ok\nrm -rf /' && test_failed=1 || true
 
 # zsh uses plain `name+=value` for an existing scalar. Combining `typeset`
 # with `name+=` is a runtime error and previously broke every socket callback.
+typeset -g socket_handler_calls=0 socket_handler_line=""
+functions[_aicoach_handle_line_saved]=$functions[_aicoach_handle_line]
+_aicoach_handle_line() {
+  (( ++socket_handler_calls ))
+  socket_handler_line=$1
+  _aicoach_handle_line_saved "$@"
+}
 sysread() {
   local target=${@[-1]}
   eval "$target=\$'PONG\\n'"
@@ -169,7 +180,11 @@ sysread() {
 typeset -g AICOACH_READ_BUFFER=""
 _aicoach_socket_ready 99
 assert_eq "$AICOACH_READ_BUFFER" ""
+assert_eq "$socket_handler_calls" "1"
+assert_eq "$socket_handler_line" "PONG"
 unfunction sysread
+functions[_aicoach_handle_line]=$functions[_aicoach_handle_line_saved]
+unfunction _aicoach_handle_line_saved
 
 _aicoach_local_danger 'rm -rf /'
 assert_eq "$?" 0
@@ -358,6 +373,10 @@ assert_eq "$last_notice_message" 'unchanged notice'
 _aicoach_handle_line $'AIRLOCK\t'$AICOACH_SESSION_ID$'\t\tfalse\t1'
 assert_eq "$BUFFER" 'echo unchanged'
 assert_eq "$last_notice_message" 'unchanged notice'
+
+if ! /bin/zsh "${0:A:h}/test-zsh-interactive.zsh"; then
+  test_failed=1
+fi
 
 (( test_failed == 0 )) && print 'zsh integration tests: ok'
 exit $test_failed

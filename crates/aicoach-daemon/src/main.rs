@@ -6,7 +6,10 @@ use std::{
 };
 
 use aicoach_ai::{AiModels, AiTimeouts, NoopAiProvider, OpenAiCompatibleProvider, OpenAiConfig};
-use aicoach_core::{Config, FailureMemoryOptions, PrivacyRedactor, ProductPaths};
+use aicoach_core::{
+    AiConfig, Config, FailureMemoryOptions, PrivacyRedactor, ProductPaths,
+    provider_authorization_digest,
+};
 use aicoach_daemon::{Daemon, DaemonOptions, RuntimeFiles, SessionLimits};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -33,6 +36,12 @@ struct Arguments {
     /// Accept one connection, useful for deterministic integration tests.
     #[arg(long)]
     once: bool,
+    /// Bind provider access to the credential source authorized by the CLI.
+    #[arg(long, hide = true)]
+    credential_source: Option<String>,
+    /// Non-secret digest authorizing the configured provider target.
+    #[arg(long, hide = true)]
+    provider_authorization: Option<String>,
 }
 
 #[tokio::main]
@@ -58,39 +67,11 @@ async fn main() -> Result<()> {
     let runtime = RuntimeFiles::acquire(socket_path.clone(), pid_path)
         .context("could not acquire daemon runtime files")?;
 
-    let provider: Arc<dyn aicoach_ai::AiProvider> = if config.ai.provider == "disabled"
-        || config.ai.provider == "none"
-    {
-        Arc::new(NoopAiProvider)
-    } else {
-        let provider_config = OpenAiConfig {
-            base_url: config.ai.base_url.clone(),
-            api_key_env: config.ai.api_key_env.clone(),
-            models: AiModels {
-                completion: config.ai.models.completion.clone(),
-                analysis: config.ai.models.error_analysis.clone(),
-                chat: config.ai.models.chat.clone(),
-            },
-            temperature: config.ai.temperature,
-            timeouts: AiTimeouts {
-                completion: Duration::from_millis(config.ai.timeouts_ms.completion),
-                analysis: Duration::from_millis(config.ai.timeouts_ms.error_analysis),
-                chat: Duration::from_millis(config.ai.timeouts_ms.chat),
-            },
-            max_concurrency: config.ai.max_concurrent_requests,
-            ..OpenAiConfig::default()
-        };
-        match OpenAiCompatibleProvider::new(provider_config) {
-            Ok(provider) => Arc::new(provider),
-            Err(error) => {
-                // The terminal must remain fully usable if credentials or the
-                // network provider are unavailable. Local safety and analyzer
-                // responses continue through the explicit offline provider.
-                warn!(error = %error, "AI provider unavailable; daemon is running in local-only mode");
-                Arc::new(NoopAiProvider)
-            }
-        }
-    };
+    let provider = configured_provider(
+        &config,
+        arguments.credential_source.as_deref(),
+        arguments.provider_authorization.as_deref(),
+    );
 
     let privacy_redactor = PrivacyRedactor::from_config(&config.privacy)
         .context("could not initialize privacy redaction")?;
@@ -143,6 +124,66 @@ async fn main() -> Result<()> {
         .await;
     runtime.cleanup();
     result.context("daemon stopped with an error")
+}
+
+fn configured_provider(
+    config: &Config,
+    credential_source: Option<&str>,
+    provider_authorization: Option<&str>,
+) -> Arc<dyn aicoach_ai::AiProvider> {
+    let provider_authorized =
+        provider_network_is_authorized(&config.ai, credential_source, provider_authorization);
+    if provider_is_disabled(&config.ai) || !provider_authorized {
+        if !provider_is_disabled(&config.ai) && !provider_authorized {
+            warn!("AI provider authorization was rejected; daemon is running in local-only mode");
+        }
+        return Arc::new(NoopAiProvider);
+    }
+
+    let provider_config = OpenAiConfig {
+        base_url: config.ai.base_url.clone(),
+        api_key_env: config.ai.api_key_env.clone(),
+        models: AiModels {
+            completion: config.ai.models.completion.clone(),
+            analysis: config.ai.models.error_analysis.clone(),
+            chat: config.ai.models.chat.clone(),
+        },
+        temperature: config.ai.temperature,
+        timeouts: AiTimeouts {
+            completion: Duration::from_millis(config.ai.timeouts_ms.completion),
+            analysis: Duration::from_millis(config.ai.timeouts_ms.error_analysis),
+            chat: Duration::from_millis(config.ai.timeouts_ms.chat),
+        },
+        max_concurrency: config.ai.max_concurrent_requests,
+        ..OpenAiConfig::default()
+    };
+    match OpenAiCompatibleProvider::new(provider_config) {
+        Ok(provider) => Arc::new(provider),
+        Err(error) => {
+            // The terminal must remain fully usable if credentials or the
+            // network provider are unavailable. Local safety and analyzer
+            // responses continue through the explicit offline provider.
+            warn!(error = %error, "AI provider unavailable; daemon is running in local-only mode");
+            Arc::new(NoopAiProvider)
+        }
+    }
+}
+
+fn provider_is_disabled(config: &AiConfig) -> bool {
+    matches!(config.provider.trim(), "disabled" | "none")
+}
+
+fn provider_network_is_authorized(
+    config: &AiConfig,
+    credential_source: Option<&str>,
+    provider_authorization: Option<&str>,
+) -> bool {
+    match (credential_source, provider_authorization) {
+        (Some(source @ ("keychain" | "environment")), Some(authorization)) => {
+            authorization == provider_authorization_digest(config, source)
+        }
+        _ => false,
+    }
 }
 
 fn init_logging(logs_dir: &Path) -> tracing_appender::non_blocking::WorkerGuard {
@@ -231,4 +272,141 @@ fn install_signal_handlers(shutdown: CancellationToken) {
         }
         shutdown.cancel();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aicoach_ai::{AiError, ChatMessage, ChatRequest};
+    use std::{io, net::TcpListener};
+    use tokio_util::sync::CancellationToken;
+
+    fn configured_ai() -> AiConfig {
+        AiConfig {
+            provider: "openai-compatible".to_owned(),
+            base_url: "https://provider.example/v1".to_owned(),
+            models: aicoach_core::AiModels {
+                completion: "completion-model".to_owned(),
+                error_analysis: "analysis-model".to_owned(),
+                chat: "chat-model".to_owned(),
+            },
+            ..AiConfig::default()
+        }
+    }
+
+    #[test]
+    fn matching_keychain_and_environment_authorizations_allow_network_provider() {
+        let config = configured_ai();
+        for source in ["keychain", "environment"] {
+            let authorization = provider_authorization_digest(&config, source);
+            assert!(provider_network_is_authorized(
+                &config,
+                Some(source),
+                Some(&authorization)
+            ));
+        }
+    }
+
+    #[test]
+    fn changed_config_is_rejected_after_authorization() {
+        let authorized_config = configured_ai();
+        let authorization = provider_authorization_digest(&authorized_config, "keychain");
+        let mut loaded_config = authorized_config;
+        loaded_config.base_url = "https://other.example/v1".to_owned();
+
+        assert!(!provider_network_is_authorized(
+            &loaded_config,
+            Some("keychain"),
+            Some(&authorization)
+        ));
+    }
+
+    #[test]
+    fn local_only_unknown_and_incomplete_authorizations_are_rejected() {
+        let config = configured_ai();
+        let local_only = provider_authorization_digest(&config, "local-only");
+        let unknown = provider_authorization_digest(&config, "unknown");
+
+        assert!(!provider_network_is_authorized(
+            &config,
+            Some("local-only"),
+            Some(&local_only)
+        ));
+        assert!(!provider_network_is_authorized(
+            &config,
+            Some("unknown"),
+            Some(&unknown)
+        ));
+        assert!(!provider_network_is_authorized(
+            &config,
+            Some("keychain"),
+            None
+        ));
+        assert!(!provider_network_is_authorized(
+            &config,
+            None,
+            Some("sha256:unused")
+        ));
+    }
+
+    #[test]
+    fn arguments_absent_fail_closed_for_legacy_launchers() {
+        assert!(!provider_network_is_authorized(
+            &configured_ai(),
+            None,
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_or_stale_authorization_makes_no_provider_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut loaded = Config {
+            ai: configured_ai(),
+            ..Config::default()
+        };
+        loaded.ai.base_url = format!("http://{address}/loaded/v1");
+        // PATH is guaranteed to be populated by Cargo and is used only so a
+        // guard regression would construct a real provider and reach this
+        // loopback listener. Its value is never read by the test server.
+        loaded.ai.api_key_env = "PATH".to_owned();
+        loaded.ai.timeouts_ms.chat = 25;
+
+        let mut authorized = loaded.clone();
+        authorized.ai.base_url = format!("http://{address}/reviewed/v1");
+        let stale_digest = provider_authorization_digest(&authorized.ai, "keychain");
+
+        for (source, digest) in [
+            (None, None),
+            (Some("keychain"), None),
+            (Some("keychain"), Some(stale_digest.as_str())),
+        ] {
+            let provider = configured_provider(&loaded, source, digest);
+            let result = provider
+                .chat(
+                    ChatRequest::new([ChatMessage::user("local guard test")]),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(result, Err(AiError::Offline)));
+        }
+
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn disabled_provider_names_use_the_same_normalization_as_validation() {
+        for provider in ["disabled", " disabled ", "none", "\tnone\n"] {
+            let config = AiConfig {
+                provider: provider.to_owned(),
+                ..AiConfig::default()
+            };
+            assert!(provider_is_disabled(&config));
+        }
+        assert!(!provider_is_disabled(&configured_ai()));
+    }
 }

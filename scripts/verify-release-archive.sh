@@ -170,9 +170,9 @@ if [[ $require_signed == 1 ]]; then
 else
   /usr/bin/grep -Eq -- '"signature": "(ad-hoc|developer-id)"' "$package/manifest.json"
 fi
-removed_private_values='wanjie''data|243c''0411'
-if /usr/bin/grep -R -E -n -- "$removed_private_values" "$package" >/dev/null; then
-  print -u2 'release archive contains a removed private provider value'
+credential_pattern='s''k-[A-Za-z0-9_-]{20,}'
+if /usr/bin/grep -R -E -n -- "$credential_pattern" "$package" >/dev/null; then
+  print -u2 'release archive contains a credential-like token'
   exit 1
 fi
 if [[ $(uname -m) == $expected_arch ]]; then

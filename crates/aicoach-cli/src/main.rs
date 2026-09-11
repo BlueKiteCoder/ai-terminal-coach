@@ -5,11 +5,12 @@ mod capsule;
 mod checkpoint;
 mod data;
 mod onboarding;
+mod provider_setup;
 mod support;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     fs::OpenOptions,
@@ -32,6 +33,88 @@ const DAEMON_LABEL: &str = "com.aicoach.daemon";
 const HOTKEY_LABEL: &str = "com.aicoach.hotkey";
 const LAUNCHCTL_BOOTSTRAP_ATTEMPTS: usize = 3;
 const LAUNCHCTL_BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_millis(200);
+const DAEMON_AUTHORIZATION_VERSION: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonCredentialMode {
+    Keychain,
+    Environment,
+    LocalOnly,
+}
+
+impl DaemonCredentialMode {
+    fn authorization_name(self) -> &'static str {
+        match self {
+            Self::Keychain => "keychain",
+            Self::Environment => "environment",
+            Self::LocalOnly => "local-only",
+        }
+    }
+
+    fn from_authorization_name(value: &str) -> Option<Self> {
+        match value {
+            "keychain" => Some(Self::Keychain),
+            "environment" => Some(Self::Environment),
+            "local-only" => Some(Self::LocalOnly),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DaemonAuthorization {
+    mode: DaemonCredentialMode,
+    api_key_env: String,
+    digest: Option<String>,
+}
+
+impl DaemonAuthorization {
+    fn legacy(mode: DaemonCredentialMode, api_key_env: String) -> Self {
+        Self {
+            mode,
+            api_key_env,
+            digest: None,
+        }
+    }
+
+    fn bound(config: &aicoach_core::AiConfig, mode: DaemonCredentialMode) -> Self {
+        let source = mode.authorization_name();
+        Self {
+            mode,
+            api_key_env: config.api_key_env.clone(),
+            digest: Some(aicoach_core::provider_authorization_digest(config, source)),
+        }
+    }
+
+    fn daemon_args(&self) -> Vec<String> {
+        let digest = self
+            .digest
+            .as_deref()
+            .or_else(|| (self.mode == DaemonCredentialMode::LocalOnly).then_some("local-only"));
+        let Some(digest) = digest else {
+            return Vec::new();
+        };
+        vec![
+            "--credential-source".to_owned(),
+            self.mode.authorization_name().to_owned(),
+            "--provider-authorization".to_owned(),
+            digest.to_owned(),
+        ]
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StoredDaemonAuthorization {
+    version: u8,
+    credential_source: String,
+    api_key_env: String,
+    provider_authorization: String,
+}
+
+enum KeyStorageAuthorization {
+    Rebind(DaemonAuthorization),
+    Preserve(DaemonAuthorization),
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -115,6 +198,8 @@ struct ConfigArgs {
 
 #[derive(Subcommand, Debug)]
 enum ConfigAction {
+    /// Configure and optionally verify an OpenAI-compatible provider.
+    Setup,
     /// Print the active configuration.
     Show,
     /// Print the active configuration path.
@@ -266,6 +351,7 @@ struct Paths {
     home: PathBuf,
     config_dir: PathBuf,
     config: PathBuf,
+    provider_authorization: PathBuf,
     data_dir: PathBuf,
     state_dir: PathBuf,
     run_dir: PathBuf,
@@ -297,6 +383,7 @@ impl Paths {
         Self {
             home,
             config: config_dir.join("config.toml"),
+            provider_authorization: config_dir.join("provider-authorization.toml"),
             data_dir,
             failure_memory: state_dir.join("failure-memory.json"),
             history: state_dir.join("history.json"),
@@ -341,6 +428,20 @@ struct Check {
     status: &'static str,
     detail: String,
     required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProviderCredentialState {
+    Disabled,
+    KeychainReady,
+    EnvironmentReady(String),
+    KeychainMissing,
+    EnvironmentMissing(String),
+    AuthorizationReviewRequired,
+    AuthorizationMetadataInvalid,
+    LegacyKeychainReady,
+    LegacyEnvironmentReady(String),
+    LegacyMissing(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -394,6 +495,7 @@ fn run() -> Result<()> {
 
 fn install(paths: &Paths, args: &InstallArgs) -> Result<()> {
     ensure_macos()?;
+    let daemon_was_running = is_daemon_running(paths).0;
     paths.create_runtime()?;
     atomic_write(
         &paths.config_dir.join("aicoach.zsh"),
@@ -413,7 +515,8 @@ fn install(paths: &Paths, args: &InstallArgs) -> Result<()> {
     write_shell_settings(paths)?;
 
     install_zshrc(paths)?;
-    write_direct_daemon_plist(paths)?;
+    let daemon_authorization = resolve_daemon_authorization(paths)?;
+    configure_daemon_launcher(paths, &daemon_authorization, false)?;
     let cli = sibling_executable("aicoach")?;
     let path_env = executable_path_env(&cli);
 
@@ -430,6 +533,7 @@ fn install(paths: &Paths, args: &InstallArgs) -> Result<()> {
             true,
             &paths.logs_dir.join("hotkey.log"),
             &path_env,
+            None,
         );
         atomic_write(&paths.hotkey_plist, &plist, 0o600)?;
         true
@@ -437,11 +541,17 @@ fn install(paths: &Paths, args: &InstallArgs) -> Result<()> {
         false
     };
 
+    if daemon_was_running {
+        stop(paths)?;
+        thread::sleep(Duration::from_millis(250));
+    }
     if !args.no_start {
         start(paths)?;
         if helper_installed {
             bootstrap_agent(&paths.hotkey_plist, HOTKEY_LABEL, false)?;
         }
+    } else if helper_installed {
+        stop_agent(&paths.hotkey_plist, HOTKEY_LABEL);
     }
 
     println!("\x1b[32mAI Terminal Coach installed.\x1b[0m");
@@ -449,6 +559,17 @@ fn install(paths: &Paths, args: &InstallArgs) -> Result<()> {
         "Open a new Zsh session, or run: source {}",
         paths.config_dir.join("aicoach.zsh").display()
     );
+    if let (Some(expected), Some(loaded)) = (
+        expected_shell_integration_version(),
+        env::var("AICOACH_INTEGRATION_VERSION")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok()),
+    ) && loaded < expected
+    {
+        println!(
+            "\x1b[33mThis terminal tab still has integration v{loaded} in memory; reload it before testing v{expected}.\x1b[0m"
+        );
+    }
     println!("Next: run `aicoach onboard` to verify the shortcuts your terminal actually sends.");
     if !helper_installed && !args.no_hotkey {
         println!(
@@ -502,47 +623,63 @@ fn uninstall(paths: &Paths, args: &UninstallArgs) -> Result<()> {
 }
 
 fn start(paths: &Paths) -> Result<()> {
+    let authorization = resolve_daemon_authorization(paths)?;
+    start_with_authorization(paths, &authorization, false)
+}
+
+fn start_with_authorization(
+    paths: &Paths,
+    authorization: &DaemonAuthorization,
+    require_credential: bool,
+) -> Result<()> {
     ensure_macos()?;
     paths.create_runtime()?;
-    let key_env = configured_key_env(paths)?;
-    let has_environment_key = env::var_os(&key_env).is_some_and(|value| !value.is_empty());
-    let has_keychain_key = keychain_key_exists();
-    if has_keychain_key {
-        write_keychain_wrapper(paths)?;
+    if authorization.digest.is_none()
+        && aicoach_core::Config::load_from(&paths.config)
+            .is_ok_and(|config| !matches!(config.ai.provider.trim(), "disabled" | "none"))
+    {
+        eprintln!(
+            "\x1b[33mProvider access is not yet bound to its target; the daemon will start in local-only mode. Run `aicoach config setup` to review and activate it.\x1b[0m"
+        );
     }
+    let credential_available = configure_daemon_launcher(paths, authorization, require_credential)?;
     if ping_socket(&paths.socket) {
         println!("aicoachd is already running");
         return Ok(());
     }
+    start_prepared_daemon(paths, authorization, credential_available)
+}
 
-    if has_environment_key && !has_keychain_key {
+fn start_prepared_daemon(
+    paths: &Paths,
+    authorization: &DaemonAuthorization,
+    credential_available: bool,
+) -> Result<()> {
+    if authorization.mode == DaemonCredentialMode::Environment && credential_available {
         // launchd does not inherit variables exported by the invoking shell.
         // A detached child does, and the daemon writes its own rolling log.
         stop_agent(&paths.daemon_plist, DAEMON_LABEL);
         let daemon = sibling_executable("aicoachd")?;
-        Command::new(&daemon)
+        let mut command = Command::new(&daemon);
+        command.args(authorization.daemon_args());
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        command
             .spawn()
             .with_context(|| format!("start {}", daemon.display()))?;
     } else if paths.daemon_plist.exists() {
         bootstrap_agent(&paths.daemon_plist, DAEMON_LABEL, true)?;
     } else {
-        let daemon = sibling_executable("aicoachd")?;
-        Command::new(&daemon)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("start {}", daemon.display()))?;
+        bail!("daemon launcher is missing after configuration");
     }
 
     // Keychain access through the launchd wrapper can take several seconds on
-    // the first request after login. Wait long enough for that normal path,
-    // while still returning immediately as soon as the socket is available.
+    // the first request after login. A stale socket path is not readiness: wait
+    // until the new daemon completes an IPC round trip.
     for _ in 0..100 {
-        if paths.socket.exists() {
+        if ping_socket(&paths.socket) {
             println!("aicoachd started");
             return Ok(());
         }
@@ -552,6 +689,55 @@ fn start(paths: &Paths) -> Result<()> {
         "daemon did not create {} within 10 seconds; inspect `aicoach logs`",
         paths.socket.display()
     )
+}
+
+fn configure_daemon_launcher(
+    paths: &Paths,
+    authorization: &DaemonAuthorization,
+    require_credential: bool,
+) -> Result<bool> {
+    let credential_available = authorization.digest.is_some()
+        && match authorization.mode {
+            DaemonCredentialMode::Keychain => keychain_key_exists(),
+            DaemonCredentialMode::Environment => {
+                env::var_os(&authorization.api_key_env).is_some_and(|value| !value.is_empty())
+            }
+            DaemonCredentialMode::LocalOnly => false,
+        };
+    if require_credential && !credential_available {
+        bail!(
+            "the confirmed {} credential is no longer available",
+            match authorization.mode {
+                DaemonCredentialMode::Keychain => "macOS Keychain",
+                DaemonCredentialMode::Environment => "shell",
+                DaemonCredentialMode::LocalOnly => "provider",
+            }
+        );
+    }
+    match authorization.mode {
+        DaemonCredentialMode::Keychain if credential_available => {
+            write_keychain_wrapper(paths, authorization)?;
+        }
+        DaemonCredentialMode::Keychain
+        | DaemonCredentialMode::Environment
+        | DaemonCredentialMode::LocalOnly => {
+            remove_file_if_exists(&paths.data_dir.join("aicoachd-keychain"))?;
+            let local_only;
+            let launcher_authorization =
+                if credential_available || authorization.mode == DaemonCredentialMode::LocalOnly {
+                    authorization
+                } else {
+                    local_only = DaemonAuthorization {
+                        mode: DaemonCredentialMode::LocalOnly,
+                        api_key_env: authorization.api_key_env.clone(),
+                        digest: authorization.digest.clone(),
+                    };
+                    &local_only
+                };
+            write_direct_daemon_plist(paths, launcher_authorization)?;
+        }
+    }
+    Ok(credential_available)
 }
 
 fn stop(paths: &Paths) -> Result<()> {
@@ -649,17 +835,163 @@ fn doctor(paths: &Paths, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+fn expected_shell_integration_version() -> Option<u64> {
+    SHELL_INTEGRATION.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("typeset -gx AICOACH_INTEGRATION_VERSION=")?
+            .parse()
+            .ok()
+    })
+}
+
+fn active_shell_check(paths: &Paths, loaded: Option<&str>) -> Check {
+    let integration = paths.config_dir.join("aicoach.zsh");
+    let Some(expected) = expected_shell_integration_version() else {
+        return Check {
+            name: "Active shell",
+            status: "warn",
+            detail: "embedded integration version is unavailable".to_owned(),
+            required: false,
+        };
+    };
+    match loaded.and_then(|value| value.parse::<u64>().ok()) {
+        Some(version) if version >= expected => Check {
+            name: "Active shell",
+            status: "ok",
+            detail: format!("integration v{version} loaded"),
+            required: false,
+        },
+        Some(version) => Check {
+            name: "Active shell",
+            status: "warn",
+            detail: format!(
+                "integration v{version} loaded, but v{expected} is installed; run `source {}` or open a new terminal tab",
+                integration.display()
+            ),
+            required: false,
+        },
+        None => Check {
+            name: "Active shell",
+            status: "warn",
+            detail: format!(
+                "loaded integration is not visible here; if shortcuts do not respond, run `source {}` in that terminal tab",
+                integration.display()
+            ),
+            required: false,
+        },
+    }
+}
+
+fn provider_credential_state(
+    paths: &Paths,
+    config: &aicoach_core::Config,
+) -> ProviderCredentialState {
+    if matches!(config.ai.provider.trim(), "disabled" | "none") {
+        return ProviderCredentialState::Disabled;
+    }
+    match load_daemon_authorization(paths) {
+        Err(_) => ProviderCredentialState::AuthorizationMetadataInvalid,
+        Ok(Some(authorization))
+            if authorization.mode == DaemonCredentialMode::LocalOnly
+                || !authorization_matches_config(&authorization, &config.ai) =>
+        {
+            ProviderCredentialState::AuthorizationReviewRequired
+        }
+        Ok(Some(authorization)) => match authorization.mode {
+            DaemonCredentialMode::Keychain if keychain_key_exists() => {
+                ProviderCredentialState::KeychainReady
+            }
+            DaemonCredentialMode::Keychain => ProviderCredentialState::KeychainMissing,
+            DaemonCredentialMode::Environment
+                if env::var_os(&authorization.api_key_env)
+                    .is_some_and(|value| !value.is_empty()) =>
+            {
+                ProviderCredentialState::EnvironmentReady(authorization.api_key_env)
+            }
+            DaemonCredentialMode::Environment => {
+                ProviderCredentialState::EnvironmentMissing(authorization.api_key_env)
+            }
+            DaemonCredentialMode::LocalOnly => unreachable!("handled above"),
+        },
+        Ok(None) if keychain_key_exists() => ProviderCredentialState::LegacyKeychainReady,
+        Ok(None) if env::var_os(&config.ai.api_key_env).is_some_and(|value| !value.is_empty()) => {
+            ProviderCredentialState::LegacyEnvironmentReady(config.ai.api_key_env.clone())
+        }
+        Ok(None) => ProviderCredentialState::LegacyMissing(config.ai.api_key_env.clone()),
+    }
+}
+
+fn provider_credential_check(paths: &Paths, config: Option<&aicoach_core::Config>) -> Check {
+    let Some(config) = config else {
+        return Check {
+            name: "AI credential",
+            status: "warn",
+            detail: "credential state unavailable until configuration validates".to_owned(),
+            required: false,
+        };
+    };
+    let state = provider_credential_state(paths, config);
+    let (status, detail) = match state {
+        ProviderCredentialState::Disabled => ("ok", "not required in local-only mode".to_owned()),
+        ProviderCredentialState::KeychainReady => (
+            "ok",
+            "authorized macOS Keychain credential is present".to_owned(),
+        ),
+        ProviderCredentialState::EnvironmentReady(name) => (
+            "ok",
+            format!("authorized environment variable {name} is set"),
+        ),
+        ProviderCredentialState::KeychainMissing => (
+            "warn",
+            "authorized macOS Keychain credential is missing; run `aicoach config set-key`"
+                .to_owned(),
+        ),
+        ProviderCredentialState::EnvironmentMissing(name) => (
+            "warn",
+            format!(
+                "authorized environment variable {name} is not set; export it in this shell or run `aicoach config set-key`"
+            ),
+        ),
+        ProviderCredentialState::AuthorizationReviewRequired => (
+            "warn",
+            "provider target or credential source changed; rerun `aicoach config setup`".to_owned(),
+        ),
+        ProviderCredentialState::AuthorizationMetadataInvalid => (
+            "warn",
+            "provider authorization metadata is invalid; rerun `aicoach config setup`".to_owned(),
+        ),
+        ProviderCredentialState::LegacyKeychainReady => (
+            "warn",
+            "macOS Keychain credential is present but not target-bound; run `aicoach config setup`"
+                .to_owned(),
+        ),
+        ProviderCredentialState::LegacyEnvironmentReady(name) => (
+            "warn",
+            format!(
+                "environment variable {name} is set but not target-bound; run `aicoach config setup`"
+            ),
+        ),
+        ProviderCredentialState::LegacyMissing(name) => {
+            ("warn", format!("environment variable {name} is not set"))
+        }
+    };
+    Check {
+        name: "AI credential",
+        status,
+        detail,
+        required: false,
+    }
+}
+
 fn collect_doctor_checks(paths: &Paths) -> Vec<Check> {
     let config_text = fs::read_to_string(&paths.config).ok();
     let config_value = config_text
         .as_deref()
         .and_then(|text| toml::from_str::<toml::Value>(text).ok());
-    let key_env = config_value
-        .as_ref()
-        .and_then(|value| value.get("ai"))
-        .and_then(|value| value.get("api_key_env"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or("AI_COACH_API_KEY");
+    let validated_config = config_text
+        .as_deref()
+        .and_then(|text| toml::from_str::<aicoach_core::Config>(text).ok())
+        .filter(|config| config.validate().is_ok());
     let (running, _) = is_daemon_running(paths);
     let zshrc = fs::read_to_string(paths.home.join(".zshrc")).unwrap_or_default();
     let terminal = env::var("TERM_PROGRAM").unwrap_or_else(|_| "unknown".to_owned());
@@ -686,6 +1018,10 @@ fn collect_doctor_checks(paths: &Paths) -> Vec<Check> {
             detail: paths.config_dir.join("aicoach.zsh").display().to_string(),
             required: true,
         },
+        active_shell_check(
+            paths,
+            env::var("AICOACH_INTEGRATION_VERSION").ok().as_deref(),
+        ),
         Check {
             name: "Config",
             status: if config_value.is_some() { "ok" } else { "fail" },
@@ -712,23 +1048,7 @@ fn collect_doctor_checks(paths: &Paths) -> Vec<Check> {
             detail: paths.socket.display().to_string(),
             required: true,
         },
-        Check {
-            name: "AI credential",
-            status: if env::var_os(key_env).is_some_and(|v| !v.is_empty()) || keychain_key_exists()
-            {
-                "ok"
-            } else {
-                "warn"
-            },
-            detail: if env::var_os(key_env).is_some_and(|v| !v.is_empty()) {
-                format!("environment variable {key_env} is set")
-            } else if keychain_key_exists() {
-                "stored in macOS Keychain".to_owned()
-            } else {
-                format!("environment variable {key_env} is not set")
-            },
-            required: false,
-        },
+        provider_credential_check(paths, validated_config.as_ref()),
         Check {
             name: "Terminal",
             status: if public_terminal_name(&terminal).is_some() {
@@ -754,7 +1074,7 @@ fn collect_doctor_checks(paths: &Paths) -> Vec<Check> {
             required: false,
         },
         Check {
-            name: "Key bindings",
+            name: "Installed bindings",
             status: if paths.config_dir.join("keybindings.zsh").is_file() {
                 "ok"
             } else {
@@ -804,10 +1124,15 @@ fn public_terminal_name(value: &str) -> Option<&'static str> {
 
 fn config_command(paths: &Paths, action: Option<ConfigAction>) -> Result<()> {
     paths.create_runtime()?;
+    if matches!(action.as_ref(), Some(ConfigAction::Setup)) {
+        provider_setup::run(paths)?;
+        return Ok(());
+    }
     if !paths.config.exists() {
         atomic_write(&paths.config, DEFAULT_CONFIG, 0o600)?;
     }
     match action.unwrap_or(ConfigAction::Show) {
+        ConfigAction::Setup => unreachable!("setup is handled before creating a default config"),
         ConfigAction::Show => print!("{}", fs::read_to_string(&paths.config)?),
         ConfigAction::Path => println!("{}", paths.config.display()),
         ConfigAction::Validate => {
@@ -1341,20 +1666,25 @@ fn executable_path_env(cli: &Path) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_agent_plist(
     label: &str,
     program: &Path,
-    args: &[&str],
+    args: &[String],
     run_at_load: bool,
     keep_alive: bool,
     log: &Path,
     path_env: &str,
+    cleared_env: Option<&str>,
 ) -> String {
     let arguments = std::iter::once(program.display().to_string())
-        .chain(args.iter().map(|s| (*s).to_owned()))
+        .chain(args.iter().cloned())
         .map(|arg| format!("      <string>{}</string>", xml_escape(&arg)))
         .collect::<Vec<_>>()
         .join("\n");
+    let cleared_env = cleared_env.map_or_else(String::new, |name| {
+        format!("<key>{}</key><string></string>", xml_escape(name))
+    });
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1369,7 +1699,7 @@ fn launch_agent_plist(
   <key>KeepAlive</key><{keep}/>
   <key>ProcessType</key><string>Interactive</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>{path_env}</string></dict>
+  <dict><key>PATH</key><string>{path_env}</string>{cleared_env}</dict>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict>
@@ -1380,6 +1710,7 @@ fn launch_agent_plist(
         run = if run_at_load { "true" } else { "false" },
         log = xml_escape(&log.display().to_string()),
         path_env = xml_escape(path_env),
+        cleared_env = cleared_env,
     )
 }
 
@@ -1479,20 +1810,201 @@ fn launch_domain() -> Result<String> {
     ))
 }
 
-fn configured_key_env(paths: &Paths) -> Result<String> {
-    if !paths.config.exists() {
-        return Ok("AI_COACH_API_KEY".to_owned());
-    }
+fn resolve_daemon_authorization(paths: &Paths) -> Result<DaemonAuthorization> {
     let config = aicoach_core::Config::load_from(&paths.config)
         .with_context(|| format!("load {}", paths.config.display()))?;
-    Ok(config.ai.api_key_env)
+    match load_daemon_authorization(paths) {
+        Ok(Some(authorization)) if authorization_matches_config(&authorization, &config.ai) => {
+            return Ok(authorization);
+        }
+        Ok(Some(_)) => {
+            eprintln!(
+                "\x1b[33mProvider authorization no longer matches the configuration; starting in local-only mode. Run `aicoach config setup` to review it.\x1b[0m"
+            );
+            return Ok(DaemonAuthorization::bound(
+                &config.ai,
+                DaemonCredentialMode::LocalOnly,
+            ));
+        }
+        Err(_) => {
+            eprintln!(
+                "\x1b[33mProvider authorization metadata is invalid; starting in local-only mode. Run `aicoach config setup` to replace it.\x1b[0m"
+            );
+            return Ok(DaemonAuthorization::bound(
+                &config.ai,
+                DaemonCredentialMode::LocalOnly,
+            ));
+        }
+        Ok(None) => {}
+    }
+    let api_key_env = config.ai.api_key_env;
+    let has_environment_key = env::var_os(&api_key_env).is_some_and(|value| !value.is_empty());
+    let has_keychain_key = keychain_key_exists();
+    let mode = select_daemon_credential_mode(None, has_keychain_key, has_environment_key);
+    Ok(DaemonAuthorization::legacy(mode, api_key_env))
+}
+
+fn select_daemon_credential_mode(
+    authorized: Option<DaemonCredentialMode>,
+    has_keychain_key: bool,
+    has_environment_key: bool,
+) -> DaemonCredentialMode {
+    match authorized {
+        Some(mode) => mode,
+        None if has_keychain_key => DaemonCredentialMode::Keychain,
+        None if has_environment_key => DaemonCredentialMode::Environment,
+        None => DaemonCredentialMode::LocalOnly,
+    }
+}
+
+fn load_daemon_authorization(paths: &Paths) -> Result<Option<DaemonAuthorization>> {
+    let contents = match fs::read_to_string(&paths.provider_authorization) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read {}", paths.provider_authorization.display()));
+        }
+    };
+    let stored: StoredDaemonAuthorization = toml::from_str(&contents)
+        .with_context(|| format!("parse {}", paths.provider_authorization.display()))?;
+    let mode = DaemonCredentialMode::from_authorization_name(&stored.credential_source)
+        .ok_or_else(|| anyhow!("provider authorization has an unknown credential source"))?;
+    if stored.version != DAEMON_AUTHORIZATION_VERSION
+        || !valid_api_key_env_name(&stored.api_key_env)
+        || !valid_provider_authorization_digest(&stored.provider_authorization)
+    {
+        bail!("provider authorization metadata is invalid; rerun `aicoach config setup`");
+    }
+    Ok(Some(DaemonAuthorization {
+        mode,
+        api_key_env: stored.api_key_env,
+        digest: Some(stored.provider_authorization),
+    }))
+}
+
+fn save_daemon_authorization(paths: &Paths, authorization: &DaemonAuthorization) -> Result<()> {
+    let source = authorization.mode.authorization_name();
+    let digest = authorization
+        .digest
+        .as_ref()
+        .ok_or_else(|| anyhow!("legacy credential mode cannot be saved as an authorization"))?;
+    let stored = StoredDaemonAuthorization {
+        version: DAEMON_AUTHORIZATION_VERSION,
+        credential_source: source.to_owned(),
+        api_key_env: authorization.api_key_env.clone(),
+        provider_authorization: digest.clone(),
+    };
+    atomic_write(
+        &paths.provider_authorization,
+        &toml::to_string(&stored)?,
+        0o600,
+    )
+}
+
+fn valid_api_key_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn valid_provider_authorization_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn authorization_matches_config(
+    authorization: &DaemonAuthorization,
+    config: &aicoach_core::AiConfig,
+) -> bool {
+    let Some(digest) = authorization.digest.as_deref() else {
+        return false;
+    };
+    digest
+        == aicoach_core::provider_authorization_digest(
+            config,
+            authorization.mode.authorization_name(),
+        )
+}
+
+fn authorization_after_key_storage(
+    config: &aicoach_core::AiConfig,
+    existing: Option<DaemonAuthorization>,
+) -> KeyStorageAuthorization {
+    let provider_enabled = config.provider.trim() == "openai-compatible";
+    let existing_matches = existing.as_ref().is_some_and(|authorization| {
+        matches!(
+            authorization.mode,
+            DaemonCredentialMode::Keychain | DaemonCredentialMode::Environment
+        ) && authorization_matches_config(authorization, config)
+    });
+    if provider_enabled && existing_matches {
+        KeyStorageAuthorization::Rebind(DaemonAuthorization::bound(
+            config,
+            DaemonCredentialMode::Keychain,
+        ))
+    } else if let Some(existing) = existing {
+        KeyStorageAuthorization::Preserve(existing)
+    } else {
+        KeyStorageAuthorization::Rebind(DaemonAuthorization::bound(
+            config,
+            DaemonCredentialMode::LocalOnly,
+        ))
+    }
 }
 
 fn set_keychain_key(paths: &Paths) -> Result<()> {
+    store_keychain_key()?;
+    let config = aicoach_core::Config::load_from(&paths.config)
+        .with_context(|| format!("load {}", paths.config.display()))?;
+    let existing_authorization = load_daemon_authorization(paths).unwrap_or(None);
+    let decision = authorization_after_key_storage(&config.ai, existing_authorization);
+    let (restarted, keychain_authorized) = match decision {
+        KeyStorageAuthorization::Rebind(authorization) => {
+            let keychain_authorized = authorization.mode == DaemonCredentialMode::Keychain;
+            (
+                authorize_and_refresh_daemon(paths, &authorization),
+                keychain_authorized,
+            )
+        }
+        KeyStorageAuthorization::Preserve(authorization) => (
+            refresh_daemon_using_authorization(paths, &authorization, false),
+            false,
+        ),
+    };
+    let restarted = restarted.map_err(|error| {
+        anyhow!(
+            "API credential remains saved in macOS Keychain, but the daemon launcher could not be refreshed: {error}"
+        )
+    })?;
+    if keychain_authorized {
+        println!("provider credential authorization now uses macOS Keychain for this target");
+        if restarted {
+            println!("daemon credential state refreshed");
+        }
+    } else {
+        println!(
+            "provider authorization was not changed; rerun `aicoach config setup` to review this target"
+        );
+    }
+    Ok(())
+}
+
+fn store_keychain_key() -> Result<()> {
     ensure_macos()?;
     println!(
         "Enter the API key in the macOS Keychain prompt. It will not be written to config or shell history."
     );
+    prompt_and_store_keychain_key()?;
+    println!("API credential saved in macOS Keychain");
+    Ok(())
+}
+
+fn prompt_and_store_keychain_key() -> Result<()> {
+    ensure_macos()?;
     let mut child = Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
@@ -1511,8 +2023,6 @@ fn set_keychain_key(paths: &Paths) -> Result<()> {
     if !status.success() {
         bail!("Keychain did not save the credential");
     }
-    write_keychain_wrapper(paths)?;
-    println!("API credential saved in macOS Keychain");
     Ok(())
 }
 
@@ -1533,6 +2043,10 @@ fn keychain_key_exists() -> bool {
 
 fn delete_keychain_key(paths: &Paths) -> Result<()> {
     ensure_macos()?;
+    let was_running = is_daemon_running(paths).0;
+    if was_running {
+        stop(paths).context("stop daemon before removing its Keychain credential")?;
+    }
     let status = Command::new("/usr/bin/security")
         .args([
             "delete-generic-password",
@@ -1544,37 +2058,94 @@ fn delete_keychain_key(paths: &Paths) -> Result<()> {
         .status()
         .context("remove Keychain credential")?;
     if !status.success() {
-        bail!("no matching Keychain credential was removed");
+        bail!(
+            "no matching Keychain credential was removed{}",
+            if was_running {
+                "; the daemon was stopped first and remains stopped"
+            } else {
+                ""
+            }
+        );
     }
-    remove_file_if_exists(&paths.data_dir.join("aicoachd-keychain"))?;
-    write_direct_daemon_plist(paths)?;
-    if is_daemon_running(paths).0 {
-        stop(paths)?;
-        thread::sleep(Duration::from_millis(250));
-        start(paths)?;
+    let authorization = resolve_daemon_authorization(paths)?;
+    let credential_available = match configure_daemon_launcher(paths, &authorization, false) {
+        Ok(available) => available,
+        Err(error) => {
+            bail!(
+                "API credential was removed, but local launcher cleanup failed: {error}; the daemon remains stopped"
+            );
+        }
+    };
+    if was_running {
+        start_prepared_daemon(paths, &authorization, credential_available).context(
+            "API credential was removed, but the daemon could not restart and remains stopped",
+        )?;
+        println!("API credential removed from macOS Keychain; daemon restarted without it");
+    } else {
+        println!("API credential removed from macOS Keychain; daemon remains stopped");
     }
-    println!("API credential removed from macOS Keychain; daemon credential state refreshed");
     Ok(())
 }
 
-fn write_direct_daemon_plist(paths: &Paths) -> Result<()> {
+fn authorize_and_refresh_daemon(
+    paths: &Paths,
+    authorization: &DaemonAuthorization,
+) -> Result<bool> {
+    paths.create_runtime()?;
+    let credential_available = configure_daemon_launcher(
+        paths,
+        authorization,
+        authorization.mode != DaemonCredentialMode::LocalOnly,
+    )?;
+    save_daemon_authorization(paths, authorization)?;
+    refresh_prepared_daemon(paths, authorization, credential_available)
+}
+
+fn refresh_daemon_using_authorization(
+    paths: &Paths,
+    authorization: &DaemonAuthorization,
+    require_credential: bool,
+) -> Result<bool> {
+    paths.create_runtime()?;
+    let credential_available = configure_daemon_launcher(paths, authorization, require_credential)?;
+    refresh_prepared_daemon(paths, authorization, credential_available)
+}
+
+fn refresh_prepared_daemon(
+    paths: &Paths,
+    authorization: &DaemonAuthorization,
+    credential_available: bool,
+) -> Result<bool> {
+    let was_running = is_daemon_running(paths).0;
+    if !was_running {
+        return Ok(false);
+    }
+    stop(paths)?;
+    thread::sleep(Duration::from_millis(250));
+    start_prepared_daemon(paths, authorization, credential_available)?;
+    Ok(true)
+}
+
+fn write_direct_daemon_plist(paths: &Paths, authorization: &DaemonAuthorization) -> Result<()> {
     let daemon = sibling_executable("aicoachd")?;
     let cli = sibling_executable("aicoach")?;
+    let arguments = authorization.daemon_args();
     let plist = launch_agent_plist(
         DAEMON_LABEL,
         &daemon,
-        &[],
+        &arguments,
         false,
         false,
         &paths.logs_dir.join("daemon-launchd.log"),
         &executable_path_env(&cli),
+        Some(&authorization.api_key_env),
     );
     atomic_write(&paths.daemon_plist, &plist, 0o600)
 }
 
-fn write_keychain_wrapper(paths: &Paths) -> Result<()> {
+fn write_keychain_wrapper(paths: &Paths, authorization: &DaemonAuthorization) -> Result<()> {
     let daemon = sibling_executable("aicoachd")?;
-    let key_env = configured_key_env(paths)?;
+    let key_env = &authorization.api_key_env;
     let wrapper = format!(
         "#!/bin/zsh\nset -euo pipefail\nsecret=$(/usr/bin/security find-generic-password -a AI_COACH_API_KEY -s com.aicoach.api-key -w)\nexport {key_env}=\"$secret\"\nunset secret\nexec {} \"$@\"\n",
         shell_single_quote(&daemon.display().to_string())
@@ -1582,14 +2153,16 @@ fn write_keychain_wrapper(paths: &Paths) -> Result<()> {
     let path = paths.data_dir.join("aicoachd-keychain");
     atomic_write(&path, &wrapper, 0o700)?;
     let cli = sibling_executable("aicoach")?;
+    let arguments = authorization.daemon_args();
     let plist = launch_agent_plist(
         DAEMON_LABEL,
         &path,
-        &[],
+        &arguments,
         false,
         false,
         &paths.logs_dir.join("daemon-launchd.log"),
         &executable_path_env(&cli),
+        None,
     );
     atomic_write(&paths.daemon_plist, &plist, 0o600)
 }
@@ -1763,10 +2336,112 @@ mod tests {
             true,
             Path::new("/tmp/log"),
             "/bin",
+            None,
         );
         assert!(plist.contains("x&amp;y"));
         assert!(plist.contains("/tmp/a&amp;b"));
         assert!(plist.contains("<true/>"));
+
+        let cleared = launch_agent_plist(
+            "x",
+            Path::new("/tmp/a"),
+            &[],
+            false,
+            false,
+            Path::new("/tmp/log"),
+            "/bin",
+            Some("TEST_PROVIDER_KEY"),
+        );
+        assert!(cleared.contains("<key>TEST_PROVIDER_KEY</key><string></string>"));
+    }
+
+    #[test]
+    fn persisted_provider_authorization_never_falls_back_to_a_different_source() {
+        assert_eq!(
+            select_daemon_credential_mode(Some(DaemonCredentialMode::Environment), true, false),
+            DaemonCredentialMode::Environment
+        );
+        assert_eq!(
+            select_daemon_credential_mode(Some(DaemonCredentialMode::Keychain), false, true),
+            DaemonCredentialMode::Keychain
+        );
+        assert_eq!(
+            select_daemon_credential_mode(None, true, true),
+            DaemonCredentialMode::Keychain
+        );
+        assert_eq!(
+            select_daemon_credential_mode(None, false, true),
+            DaemonCredentialMode::Environment
+        );
+    }
+
+    #[test]
+    fn provider_authorization_round_trips_as_owner_only_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(directory.path());
+        let authorization = DaemonAuthorization {
+            mode: DaemonCredentialMode::Environment,
+            api_key_env: "TEST_PROVIDER_KEY".to_owned(),
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+        };
+
+        save_daemon_authorization(&paths, &authorization).unwrap();
+        assert_eq!(
+            load_daemon_authorization(&paths).unwrap(),
+            Some(authorization.clone())
+        );
+        assert_eq!(
+            fs::metadata(&paths.provider_authorization)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            authorization.daemon_args(),
+            vec![
+                "--credential-source".to_owned(),
+                "environment".to_owned(),
+                "--provider-authorization".to_owned(),
+                format!("sha256:{}", "a".repeat(64)),
+            ]
+        );
+    }
+
+    #[test]
+    fn storing_a_key_rebinds_only_an_already_authorized_target() {
+        let mut config = aicoach_core::Config::default();
+        config.ai.provider = "openai-compatible".to_owned();
+        config.ai.base_url = "https://provider.example/v1".to_owned();
+        config.ai.models.completion = "model".to_owned();
+        config.ai.models.error_analysis = "model".to_owned();
+        config.ai.models.chat = "model".to_owned();
+        let environment = DaemonAuthorization::bound(&config.ai, DaemonCredentialMode::Environment);
+
+        let KeyStorageAuthorization::Rebind(keychain) =
+            authorization_after_key_storage(&config.ai, Some(environment.clone()))
+        else {
+            panic!("matching environment authorization should move to Keychain")
+        };
+        assert_eq!(keychain.mode, DaemonCredentialMode::Keychain);
+        assert!(authorization_matches_config(&keychain, &config.ai));
+
+        config.ai.base_url = "https://changed.example/v1".to_owned();
+        let KeyStorageAuthorization::Preserve(preserved) =
+            authorization_after_key_storage(&config.ai, Some(environment))
+        else {
+            panic!("an unreviewed target must not inherit the new Keychain credential")
+        };
+        assert_eq!(preserved.mode, DaemonCredentialMode::Environment);
+        assert!(!authorization_matches_config(&preserved, &config.ai));
+
+        let KeyStorageAuthorization::Rebind(local_only) =
+            authorization_after_key_storage(&config.ai, None)
+        else {
+            panic!("a target without prior authorization must remain local-only")
+        };
+        assert_eq!(local_only.mode, DaemonCredentialMode::LocalOnly);
     }
 
     #[test]
@@ -1823,6 +2498,17 @@ mod tests {
     }
 
     #[test]
+    fn stale_unix_socket_path_is_not_reported_as_a_ready_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("stale.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+
+        assert!(socket.exists());
+        assert!(!ping_socket(&socket));
+    }
+
+    #[test]
     fn dotted_config_update_parser_preserves_types() {
         assert_eq!(parse_toml_scalar("true"), toml::Value::Boolean(true));
         assert_eq!(parse_toml_scalar("2500"), toml::Value::Integer(2500));
@@ -1830,6 +2516,37 @@ mod tests {
             parse_toml_scalar("model"),
             toml::Value::String("model".to_owned())
         );
+    }
+
+    #[test]
+    fn provider_setup_is_an_explicit_config_action() {
+        let cli = Cli::try_parse_from(["aicoach", "config", "setup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Config(ConfigArgs {
+                action: Some(ConfigAction::Setup)
+            })
+        ));
+    }
+
+    #[test]
+    fn doctor_distinguishes_installed_files_from_the_loaded_shell_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(directory.path());
+        let expected = expected_shell_integration_version().expect("embedded version");
+        assert!(expected > 0);
+
+        let current = active_shell_check(&paths, Some(&expected.to_string()));
+        assert_eq!(current.status, "ok");
+
+        let stale = active_shell_check(&paths, Some(&(expected - 1).to_string()));
+        assert_eq!(stale.status, "warn");
+        assert!(stale.detail.contains("run `source"));
+        assert!(stale.detail.contains("open a new terminal tab"));
+
+        let unobservable = active_shell_check(&paths, None);
+        assert_eq!(unobservable.status, "warn");
+        assert!(unobservable.detail.contains("if shortcuts do not respond"));
     }
 
     #[test]

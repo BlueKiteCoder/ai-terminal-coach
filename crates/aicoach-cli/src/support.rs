@@ -309,13 +309,14 @@ fn public_check_name(name: &str, chinese: bool) -> &str {
     }
     match name {
         "Zsh integration" => "Zsh 集成",
+        "Active shell" => "当前 Shell",
         "Config" => "配置",
         "Daemon" => "后台服务",
         "Socket" => "IPC Socket",
         "AI credential" => "AI 凭据",
         "Terminal" => "终端",
         "Global hotkey" => "全局快捷键",
-        "Key bindings" => "按键绑定",
+        "Installed bindings" => "已安装绑定文件",
         "Config values" => "配置值",
         _ => name,
     }

@@ -16,6 +16,7 @@ pub mod failure_memory;
 pub mod git;
 pub mod models;
 pub mod privacy;
+pub mod provider_authorization;
 pub mod risk_lens;
 pub mod safety;
 pub mod source_cards;
@@ -42,6 +43,7 @@ pub use models::{
     CompletionOperation, CompletionResult, GitContext, Severity, TerminalContext,
 };
 pub use privacy::{PrivacyError, PrivacyRedactor};
+pub use provider_authorization::provider_authorization_digest;
 pub use risk_lens::{
     AnalysisCoverage, EffectAction, PrivilegeRequirement, RecoveryProspect, RiskEffect,
     RiskLensReport,

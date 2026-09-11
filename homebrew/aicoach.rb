@@ -34,14 +34,11 @@ class Aicoach < Formula
 
   def caveats
     <<~EOS
-      Install the Zsh and LaunchAgent integration with:
+      After every install or upgrade, refresh the Zsh and LaunchAgent integration with:
         aicoach install
 
       Store an API key in macOS Keychain (recommended):
         aicoach config set-key
-
-      Then restart the daemon:
-        aicoach restart
 
       Option+Tab invokes AI completion. Option+/ asks about the current
       buffer. Option+Space toggles the Coach window when Option sends Esc.

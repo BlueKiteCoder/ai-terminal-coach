@@ -5,21 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AiResult, ChatMessage};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AiModels {
     pub completion: String,
     pub analysis: String,
     pub chat: String,
-}
-
-impl Default for AiModels {
-    fn default() -> Self {
-        Self {
-            completion: "gpt-4.1-mini".to_owned(),
-            analysis: "gpt-4.1-mini".to_owned(),
-            chat: "gpt-4.1".to_owned(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,7 +1,7 @@
 use super::{
-    DEFAULT_CONFIG, InstallArgs, Paths, SHELL_INTEGRATION, atomic_write,
+    DEFAULT_CONFIG, InstallArgs, Paths, ProviderCredentialState, SHELL_INTEGRATION, atomic_write,
     has_complete_managed_block, install, is_daemon_running, keybinding_sequence,
-    keychain_key_exists, start, stop, write_shell_settings,
+    provider_credential_state, start, stop, write_shell_settings,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -132,6 +132,13 @@ pub(super) fn run(paths: &Paths, args: &OnboardArgs) -> Result<()> {
     let zshrc = fs::read_to_string(paths.home.join(".zshrc")).unwrap_or_default();
     let needs_install = !has_complete_managed_block(&zshrc)
         || !fs::read_to_string(&integration).is_ok_and(|contents| contents == SHELL_INTEGRATION);
+    let active_shell_needs_reload =
+        super::expected_shell_integration_version().is_some_and(|expected| {
+            env::var("AICOACH_INTEGRATION_VERSION")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|loaded| loaded < expected)
+        });
     if needs_install {
         println!("1/4  Installing or refreshing the local integration…");
         install(
@@ -210,7 +217,7 @@ pub(super) fn run(paths: &Paths, args: &OnboardArgs) -> Result<()> {
         "\n4/4  {}",
         language.text("Privacy and provider status", "隐私与 AI 服务状态")
     );
-    print_provider_status(&config, language);
+    print_provider_status(paths, &config, language);
 
     if !shortcuts_ok {
         bail!(
@@ -226,12 +233,12 @@ pub(super) fn run(paths: &Paths, args: &OnboardArgs) -> Result<()> {
         "\n\x1b[32m✓ {}\x1b[0m",
         language.text("Setup complete", "设置完成")
     );
-    if needs_install {
+    if needs_install || active_shell_needs_reload {
         println!(
             "{}",
             language.text(
-                "Open one new terminal tab to load the refreshed integration.",
-                "请新开一个终端标签页，以加载更新后的集成。"
+                "Before testing, reload this terminal with `source ~/.config/aicoach/aicoach.zsh`, or open a new terminal tab.",
+                "测试前，请运行 `source ~/.config/aicoach/aicoach.zsh` 重载当前终端，或新开一个终端标签页。"
             )
         );
     } else {
@@ -541,43 +548,143 @@ fn verify_zsh_binding(integration: &Path, sequence: &[u8], widget: &str) -> bool
     })
 }
 
-fn print_provider_status(config: &aicoach_core::Config, language: Language) {
-    if config.ai.provider == "disabled" {
-        println!(
-            "     \x1b[32m✓\x1b[0m {}",
-            language.text(
-                "Local-only mode is ready; Risk Lens needs no key and sends nothing to a provider.",
-                "本地模式已经可用；Risk Lens 不需要密钥，也不会向服务商发送内容。"
-            )
-        );
-        println!(
-            "     {}",
-            language.text(
-                "AI is optional. Configure a provider, then store its key with `aicoach config set-key`.",
-                "AI 功能可选。配置服务商后，使用 `aicoach config set-key` 安全保存密钥。"
-            )
-        );
-        return;
+#[derive(Debug, PartialEq, Eq)]
+struct ProviderStatus {
+    ready: bool,
+    detail: String,
+    guidance: Option<String>,
+}
+
+fn provider_status(state: ProviderCredentialState, language: Language) -> ProviderStatus {
+    match state {
+        ProviderCredentialState::Disabled => ProviderStatus {
+            ready: true,
+            detail: language
+                .text(
+                    "Local-only mode is ready; Risk Lens needs no key and sends nothing to a provider.",
+                    "本地模式已经可用；Risk Lens 不需要密钥，也不会向服务商发送内容。",
+                )
+                .to_owned(),
+            guidance: Some(
+                language
+                    .text(
+                        "AI is optional. Run `aicoach config setup` for guided, private provider setup.",
+                        "AI 功能可选。运行 `aicoach config setup` 可在引导下私密地完成服务商设置。",
+                    )
+                    .to_owned(),
+            ),
+        },
+        ProviderCredentialState::KeychainReady => ProviderStatus {
+            ready: true,
+            detail: language
+                .text(
+                    "The authorized macOS Keychain credential is present (no network probe was made).",
+                    "已授权的 macOS 钥匙串密钥已就绪（未进行网络探测）。",
+                )
+                .to_owned(),
+            guidance: None,
+        },
+        ProviderCredentialState::EnvironmentReady(name) => ProviderStatus {
+            ready: true,
+            detail: match language {
+                Language::English => format!(
+                    "The authorized environment variable {name} is set (no network probe was made)."
+                ),
+                Language::Chinese => {
+                    format!("已授权的环境变量 {name} 已设置（未进行网络探测）。")
+                }
+            },
+            guidance: None,
+        },
+        ProviderCredentialState::KeychainMissing => ProviderStatus {
+            ready: false,
+            detail: language
+                .text(
+                    "The authorized macOS Keychain credential is missing; run `aicoach config set-key`.",
+                    "已授权的 macOS 钥匙串密钥缺失；请运行 `aicoach config set-key`。",
+                )
+                .to_owned(),
+            guidance: None,
+        },
+        ProviderCredentialState::EnvironmentMissing(name) => ProviderStatus {
+            ready: false,
+            detail: match language {
+                Language::English => format!(
+                    "The authorized environment variable {name} is not set; export it before starting AI Terminal Coach or run `aicoach config set-key`."
+                ),
+                Language::Chinese => format!(
+                    "已授权的环境变量 {name} 未设置；请先导出该变量再启动 AI Terminal Coach，或运行 `aicoach config set-key`。"
+                ),
+            },
+            guidance: None,
+        },
+        ProviderCredentialState::AuthorizationReviewRequired => ProviderStatus {
+            ready: false,
+            detail: language
+                .text(
+                    "The provider target or credential source changed; the daemon stays local-only until you rerun `aicoach config setup`.",
+                    "服务商目标或密钥来源已变更；重新运行 `aicoach config setup` 审核前，后台服务将保持本地模式。",
+                )
+                .to_owned(),
+            guidance: None,
+        },
+        ProviderCredentialState::AuthorizationMetadataInvalid => ProviderStatus {
+            ready: false,
+            detail: language
+                .text(
+                    "Provider authorization metadata is invalid; the daemon stays local-only until you rerun `aicoach config setup`.",
+                    "服务商授权元数据无效；重新运行 `aicoach config setup` 前，后台服务将保持本地模式。",
+                )
+                .to_owned(),
+            guidance: None,
+        },
+        ProviderCredentialState::LegacyKeychainReady => ProviderStatus {
+            ready: false,
+            detail: language
+                .text(
+                    "A macOS Keychain credential exists but is not bound to a reviewed provider target; run `aicoach config setup`.",
+                    "macOS 钥匙串中存在密钥，但尚未绑定到经审核的服务商目标；请运行 `aicoach config setup`。",
+                )
+                .to_owned(),
+            guidance: None,
+        },
+        ProviderCredentialState::LegacyEnvironmentReady(name) => ProviderStatus {
+            ready: false,
+            detail: match language {
+                Language::English => format!(
+                    "Environment variable {name} is set but is not bound to a reviewed provider target; run `aicoach config setup`."
+                ),
+                Language::Chinese => format!(
+                    "环境变量 {name} 已设置，但尚未绑定到经审核的服务商目标；请运行 `aicoach config setup`。"
+                ),
+            },
+            guidance: None,
+        },
+        ProviderCredentialState::LegacyMissing(name) => ProviderStatus {
+            ready: false,
+            detail: match language {
+                Language::English => format!(
+                    "No target-bound credential is available ({name} is not set); run `aicoach config setup`."
+                ),
+                Language::Chinese => format!(
+                    "当前没有绑定到目标的密钥（{name} 未设置）；请运行 `aicoach config setup`。"
+                ),
+            },
+            guidance: None,
+        },
     }
-    let key_env = &config.ai.api_key_env;
-    let has_key =
-        env::var_os(key_env).is_some_and(|value| !value.is_empty()) || keychain_key_exists();
-    if has_key {
-        println!(
-            "     \x1b[32m✓\x1b[0m {}",
-            language.text(
-                "Provider configuration and credential are present (no network probe was made).",
-                "服务商配置和密钥均已就绪（未进行网络探测）。"
-            )
-        );
+}
+
+fn print_provider_status(paths: &Paths, config: &aicoach_core::Config, language: Language) {
+    let status = provider_status(provider_credential_state(paths, config), language);
+    let icon = if status.ready {
+        "\x1b[32m✓\x1b[0m"
     } else {
-        println!(
-            "     \x1b[33m! {}\x1b[0m",
-            language.text(
-                "Provider is enabled but its credential is missing; run `aicoach config set-key`.",
-                "服务商已启用，但缺少密钥；请运行 `aicoach config set-key`。"
-            )
-        );
+        "\x1b[33m!\x1b[0m"
+    };
+    println!("     {icon} {}", status.detail);
+    if let Some(guidance) = status.guidance {
+        println!("     {guidance}");
     }
 }
 
@@ -606,14 +713,55 @@ fn check_installation(paths: &Paths) -> Result<()> {
         );
         false
     };
+    let active_shell_ok = active_shell_is_current(
+        paths,
+        language,
+        env::var("AICOACH_INTEGRATION_VERSION").ok().as_deref(),
+    );
     let daemon_ok = is_daemon_running(paths).0;
     print_wiring_result("daemon socket", "ready", daemon_ok);
-    print_provider_status(&config, language);
-    if source_ok && integration_ok && shortcut_ok && daemon_ok {
+    print_provider_status(paths, &config, language);
+    if source_ok && integration_ok && shortcut_ok && active_shell_ok && daemon_ok {
         println!("\x1b[32m✓ onboarding check passed\x1b[0m");
         Ok(())
     } else {
         bail!("onboarding check found required items that need attention")
+    }
+}
+
+fn active_shell_is_current(paths: &Paths, language: Language, loaded: Option<&str>) -> bool {
+    let Some(expected) = super::expected_shell_integration_version() else {
+        return true;
+    };
+    match loaded.and_then(|value| value.parse::<u64>().ok()) {
+        Some(version) if version >= expected => {
+            print_wiring_result("active shell integration", &format!("v{version}"), true);
+            true
+        }
+        Some(version) => {
+            println!(
+                "     \x1b[31m✗\x1b[0m {}",
+                language.text(
+                    "this terminal tab still has an older integration loaded",
+                    "当前终端标签页仍加载着旧版集成"
+                )
+            );
+            println!(
+                "       v{version} → v{expected}; source {}",
+                paths.config_dir.join("aicoach.zsh").display()
+            );
+            false
+        }
+        None => {
+            println!(
+                "     \x1b[33m!\x1b[0m {}",
+                language.text(
+                    "the loaded shell version is not observable from this process",
+                    "当前进程无法确认终端已加载的 Shell 集成版本"
+                )
+            );
+            false
+        }
     }
 }
 
@@ -713,5 +861,60 @@ mod tests {
             b"\x1bc",
             "aicoach-complete"
         ));
+    }
+
+    #[test]
+    fn onboarding_check_rejects_a_known_stale_parent_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(directory.path());
+        let expected = super::super::expected_shell_integration_version().unwrap();
+        assert!(active_shell_is_current(
+            &paths,
+            Language::English,
+            Some(&expected.to_string())
+        ));
+        assert!(!active_shell_is_current(
+            &paths,
+            Language::English,
+            Some(&(expected - 1).to_string())
+        ));
+        assert!(!active_shell_is_current(&paths, Language::English, None));
+    }
+
+    #[test]
+    fn provider_status_reports_only_the_authorized_source_as_ready() {
+        let ready = provider_status(
+            ProviderCredentialState::EnvironmentReady("EXACT_KEY".to_owned()),
+            Language::English,
+        );
+        assert!(ready.ready);
+        assert!(ready.detail.contains("EXACT_KEY"));
+        assert!(ready.detail.contains("authorized environment variable"));
+
+        let missing = provider_status(
+            ProviderCredentialState::EnvironmentMissing("EXACT_KEY".to_owned()),
+            Language::English,
+        );
+        assert!(!missing.ready);
+        assert!(missing.detail.contains("EXACT_KEY"));
+        assert!(missing.detail.contains("is not set"));
+    }
+
+    #[test]
+    fn provider_status_requires_review_for_unbound_or_changed_authorization() {
+        let changed = provider_status(
+            ProviderCredentialState::AuthorizationReviewRequired,
+            Language::Chinese,
+        );
+        assert!(!changed.ready);
+        assert!(changed.detail.contains("aicoach config setup"));
+        assert!(changed.detail.contains("保持本地模式"));
+
+        let legacy = provider_status(
+            ProviderCredentialState::LegacyKeychainReady,
+            Language::English,
+        );
+        assert!(!legacy.ready);
+        assert!(legacy.detail.contains("not bound"));
     }
 }

@@ -10,7 +10,7 @@ mod provider;
 mod types;
 
 pub use error::{AiError, AiOperation, AiResult};
-pub use openai::OpenAiCompatibleProvider;
+pub use openai::{OpenAiCompatibleProvider, PROVIDER_FLIGHT_CHECK_MESSAGE};
 pub use provider::{AiProvider, NoopAiProvider};
 pub use types::{
     AiModels, AiTimeouts, ChatRequest, ChatResponse, ChatStream, CommandCompletionRequest,

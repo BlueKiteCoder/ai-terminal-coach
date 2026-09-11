@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{collections::VecDeque, env, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use secrecy::SecretString;
@@ -12,15 +12,25 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AiError, AiModels, AiOperation, AiProvider, AiTimeouts, AnalysisInput, ChatMessage,
     ChatRequest, CommandCompletionRequest, NoopAiProvider, OpenAiCompatibleProvider, OpenAiConfig,
-    RetryPolicy,
+    PROVIDER_FLIGHT_CHECK_MESSAGE, RetryPolicy,
 };
 
 const TEST_KEY: &str = "test-placeholder-key-never-a-real-credential";
+
+#[test]
+fn provider_defaults_do_not_choose_an_endpoint_or_model() {
+    let config = OpenAiConfig::default();
+    assert!(config.base_url.is_empty());
+    assert!(config.models.completion.is_empty());
+    assert!(config.models.analysis.is_empty());
+    assert!(config.models.chat.is_empty());
+}
 
 #[derive(Clone)]
 struct MockReply {
     status: u16,
     content_type: &'static str,
+    headers: Vec<(String, String)>,
     delay_before_headers: Duration,
     chunks: Vec<(Duration, Vec<u8>)>,
 }
@@ -30,6 +40,7 @@ impl MockReply {
         Self {
             status,
             content_type: "application/json",
+            headers: Vec::new(),
             delay_before_headers: Duration::ZERO,
             chunks: vec![(Duration::ZERO, body.into())],
         }
@@ -46,11 +57,22 @@ impl MockReply {
         Self {
             status: 200,
             content_type: "text/event-stream",
+            headers: Vec::new(),
             delay_before_headers: Duration::ZERO,
             chunks: chunks
                 .into_iter()
                 .map(|(delay, chunk)| (delay, chunk.into()))
                 .collect(),
+        }
+    }
+
+    fn redirect(location: impl Into<String>) -> Self {
+        Self {
+            status: 307,
+            content_type: "text/plain",
+            headers: vec![("Location".to_owned(), location.into())],
+            delay_before_headers: Duration::ZERO,
+            chunks: vec![(Duration::ZERO, Vec::new())],
         }
     }
 }
@@ -146,10 +168,17 @@ async fn write_http_reply(socket: &mut TcpStream, reply: MockReply) {
         503 => "Service Unavailable",
         _ => "Test Status",
     };
-    let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut headers = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         reply.status, reason, reply.content_type, content_length
     );
+    for (name, value) in reply.headers {
+        headers.push_str(&name);
+        headers.push_str(": ");
+        headers.push_str(&value);
+        headers.push_str("\r\n");
+    }
+    headers.push_str("\r\n");
     if socket.write_all(headers.as_bytes()).await.is_err() {
         return;
     }
@@ -238,6 +267,163 @@ async fn chat_uses_joined_endpoint_bearer_and_smart_model() {
     let body: serde_json::Value = serde_json::from_str(body).expect("JSON request");
     assert_eq!(body["model"], "smart-chat");
     assert_eq!(body["stream"], false);
+}
+
+#[tokio::test]
+async fn flight_check_sends_one_fixed_context_free_message() {
+    let mut server = MockServer::start([MockReply::json(200, envelope("OK"))]).await;
+
+    provider(&server)
+        .flight_check()
+        .await
+        .expect("flight check response");
+
+    let request = server.request().await;
+    let body = request.split_once("\r\n\r\n").expect("HTTP body").1;
+    let body: serde_json::Value = serde_json::from_str(body).expect("JSON request");
+    assert_eq!(body["model"], "smart-chat");
+    assert_eq!(body["stream"], false);
+    assert_eq!(
+        body["messages"],
+        serde_json::json!([{
+            "role": "user",
+            "content": PROVIDER_FLIGHT_CHECK_MESSAGE,
+        }])
+    );
+    let temperature = body["temperature"].as_f64().expect("temperature number");
+    assert!((temperature - 0.2).abs() < 0.000_001);
+    assert_eq!(body.as_object().expect("request object").len(), 4);
+}
+
+#[tokio::test]
+async fn flight_check_rejects_empty_content() {
+    let server = MockServer::start([MockReply::json(200, envelope("  \n"))]).await;
+
+    let error = provider(&server)
+        .flight_check()
+        .await
+        .expect_err("empty content must fail");
+
+    assert!(matches!(
+        error,
+        AiError::InvalidResponse {
+            operation: AiOperation::Chat,
+            reason: "message content is empty"
+        }
+    ));
+}
+
+#[tokio::test]
+async fn flight_check_error_does_not_expose_response_body_or_key() {
+    const PRIVATE_RESPONSE: &str = "private-provider-response";
+    let server = MockServer::start([MockReply::json(401, PRIVATE_RESPONSE)]).await;
+
+    let error = provider(&server)
+        .flight_check()
+        .await
+        .expect_err("HTTP error must fail");
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+
+    assert!(matches!(
+        error,
+        AiError::HttpStatus {
+            operation: AiOperation::Chat,
+            status: 401
+        }
+    ));
+    assert!(!display.contains(PRIVATE_RESPONSE));
+    assert!(!display.contains(TEST_KEY));
+    assert!(!debug.contains(PRIVATE_RESPONSE));
+    assert!(!debug.contains(TEST_KEY));
+}
+
+#[tokio::test]
+async fn provider_never_follows_http_redirects() {
+    let mut destination = MockServer::start([MockReply::json(200, envelope("unexpected"))]).await;
+    let destination_url = format!("{}chat/completions", destination.base_url);
+    let mut source = MockServer::start([MockReply::redirect(destination_url)]).await;
+
+    let error = provider(&source)
+        .chat(chat_request(), CancellationToken::new())
+        .await
+        .expect_err("redirect must not be followed");
+
+    assert!(matches!(
+        error,
+        AiError::HttpStatus {
+            operation: AiOperation::Chat,
+            status: 307
+        }
+    ));
+    let _ = source.request().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), destination.requests.recv())
+            .await
+            .is_err(),
+        "request body must not be forwarded to a redirect target"
+    );
+}
+
+#[tokio::test]
+async fn loopback_provider_bypasses_environment_proxies() {
+    let mut target = MockServer::start([MockReply::json(200, envelope("OK"))]).await;
+    let mut proxy = MockServer::start([MockReply::json(502, "proxy must not be used")]).await;
+    let proxy_url = proxy.base_url.trim_end_matches("/api/v1/");
+    let test_binary = env::current_exe().expect("locate test binary");
+    let mut child = tokio::process::Command::new(test_binary);
+    child
+        .args([
+            "--exact",
+            "tests::loopback_provider_proxy_child",
+            "--nocapture",
+        ])
+        .env("AICOACH_PROXY_TEST_CHILD", "1")
+        .env("AICOACH_PROXY_TEST_TARGET", &target.base_url)
+        .env("AICOACH_TEST_KEY", TEST_KEY)
+        .env("HTTP_PROXY", proxy_url)
+        .env("HTTPS_PROXY", proxy_url)
+        .env("ALL_PROXY", proxy_url)
+        .env("http_proxy", proxy_url)
+        .env("https_proxy", proxy_url)
+        .env("all_proxy", proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(Duration::from_secs(5), child.output())
+        .await
+        .expect("proxy child must finish")
+        .expect("run proxy child");
+    assert!(
+        output.status.success(),
+        "proxy child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(1), target.request())
+        .await
+        .expect("loopback target must receive the request");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), proxy.requests.recv())
+            .await
+            .is_err(),
+        "loopback request must bypass environment proxies"
+    );
+}
+
+#[tokio::test]
+async fn loopback_provider_proxy_child() {
+    if env::var_os("AICOACH_PROXY_TEST_CHILD").is_none() {
+        return;
+    }
+    let base_url = env::var("AICOACH_PROXY_TEST_TARGET").expect("child target URL");
+    let mut test_config = config(base_url);
+    test_config.retry.max_retries = 0;
+    OpenAiCompatibleProvider::new(test_config)
+        .expect("build production provider")
+        .flight_check()
+        .await
+        .expect("loopback flight check");
 }
 
 #[tokio::test]
@@ -738,14 +924,30 @@ fn core_config_converts_models_timeouts_and_concurrency() {
 
 #[test]
 fn base_url_already_at_completions_is_not_duplicated() {
-    let test_config = OpenAiConfig {
-        base_url: "https://example.invalid/api/v1/chat/completions/".to_owned(),
-        ..OpenAiConfig::default()
-    };
+    let test_config = config("https://example.invalid/api/v1/chat/completions/".to_owned());
     let provider = OpenAiCompatibleProvider::new_for_test(test_config, TEST_KEY)
         .expect("full endpoint is valid");
     assert_eq!(
         provider.endpoint().as_str(),
         "https://example.invalid/api/v1/chat/completions"
     );
+}
+
+#[test]
+fn remote_plaintext_http_endpoint_is_rejected_but_loopback_is_allowed() {
+    let remote = config("http://provider.example/v1".to_owned());
+    assert!(matches!(
+        OpenAiCompatibleProvider::new_for_test(remote, TEST_KEY),
+        Err(AiError::Configuration(message)) if message.contains("must use HTTPS")
+    ));
+
+    for base_url in [
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:11434/v1",
+        "http://[::1]:11434/v1",
+    ] {
+        let local = config(base_url.to_owned());
+        OpenAiCompatibleProvider::new_for_test(local, TEST_KEY)
+            .unwrap_or_else(|error| panic!("{base_url} should be accepted: {error}"));
+    }
 }

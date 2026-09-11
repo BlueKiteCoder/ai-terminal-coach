@@ -405,19 +405,14 @@ impl AiConfig {
             errors.push(
                 "ai.base_url is required when ai.provider is \"openai-compatible\"".to_owned(),
             );
-        } else if !base_url.is_empty()
-            && !url::Url::parse(base_url).is_ok_and(|url| {
-                matches!(url.scheme(), "http" | "https")
-                    && url.host_str().is_some()
-                    && url.username().is_empty()
-                    && url.password().is_none()
-                    && url.query().is_none()
-                    && url.fragment().is_none()
-            })
-        {
+        } else if base_url.chars().any(terminal_unsafe_character) {
             errors.push(
-                "ai.base_url must be an http(s) URL without credentials, query, or fragment"
+                "ai.base_url must not contain terminal control or bidirectional formatting characters"
                     .to_owned(),
+            );
+        } else if !base_url.is_empty() && !valid_ai_base_url(base_url) {
+            errors.push(
+                "ai.base_url must use HTTPS, or HTTP on localhost/loopback, without credentials, query, or fragment".to_owned(),
             );
         }
         let mut env_chars = self.api_key_env.chars();
@@ -437,6 +432,11 @@ impl AiConfig {
             if provider_enabled && model.trim().is_empty() {
                 errors.push(format!("ai.models.{name} must not be empty"));
             }
+            if model.chars().any(terminal_unsafe_character) {
+                errors.push(format!(
+                    "ai.models.{name} must not contain terminal control or bidirectional formatting characters"
+                ));
+            }
         }
         if !(0.0..=2.0).contains(&self.temperature) || !self.temperature.is_finite() {
             errors.push("ai.temperature must be between 0 and 2".to_owned());
@@ -454,6 +454,34 @@ impl AiConfig {
             errors.push("ai.max_concurrent_requests must be greater than zero".to_owned());
         }
     }
+}
+
+fn terminal_unsafe_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn valid_ai_base_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        let transport_is_safe = url.scheme() == "https"
+            || (url.scheme() == "http"
+                && match url.host() {
+                    Some(url::Host::Domain(host)) => {
+                        host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+                    }
+                    Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                    Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                    None => false,
+                });
+        transport_is_safe
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 impl Default for AiConfig {
@@ -850,6 +878,60 @@ mod tests {
         };
         assert!(errors.iter().any(|error| error.contains("ai.provider")));
         assert!(errors.iter().any(|error| error.contains("ai.base_url")));
+    }
+
+    #[test]
+    fn validation_requires_encryption_except_for_loopback_endpoints() {
+        for base_url in [
+            "https://provider.example/v1",
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            let mut config = Config::default();
+            config.ai.base_url = base_url.to_owned();
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{base_url} should be valid: {error}"));
+        }
+
+        let mut config = Config::default();
+        config.ai.base_url = "http://provider.example/v1".to_owned();
+        let ConfigError::Validation(errors) = config.validate().unwrap_err() else {
+            panic!("remote plaintext HTTP must be rejected")
+        };
+        assert!(errors.iter().any(|error| error.contains("must use HTTPS")));
+    }
+
+    #[test]
+    fn validation_rejects_model_ids_that_can_control_or_reorder_terminal_text() {
+        for model in ["model\u{1b}[2J", "model\nspoof", "safe\u{202e}spoof"] {
+            let mut config = Config::default();
+            config.ai.models.chat = model.to_owned();
+            let ConfigError::Validation(errors) = config.validate().unwrap_err() else {
+                panic!("unsafe model ID must be rejected")
+            };
+            assert!(errors.iter().any(|error| {
+                error.contains("ai.models.chat") && error.contains("terminal control")
+            }));
+        }
+    }
+
+    #[test]
+    fn validation_rejects_base_urls_that_can_control_or_reorder_terminal_text() {
+        for base_url in [
+            "https://provider.example/v1\u{1b}]0;spoof",
+            "https://provider.example/v1/\u{202e}spoof",
+        ] {
+            let mut config = Config::default();
+            config.ai.base_url = base_url.to_owned();
+            let ConfigError::Validation(errors) = config.validate().unwrap_err() else {
+                panic!("unsafe Base URL must be rejected")
+            };
+            assert!(errors.iter().any(|error| {
+                error.contains("ai.base_url") && error.contains("terminal control")
+            }));
+        }
     }
 
     #[test]
