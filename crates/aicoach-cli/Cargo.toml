@@ -10,6 +10,7 @@ name = "aicoach"
 path = "src/main.rs"
 
 [dependencies]
+aicoach-ai = { path = "../aicoach-ai" }
 aicoach-core = { path = "../aicoach-core" }
 aicoach-ipc = { path = "../aicoach-ipc" }
 anyhow.workspace = true
@@ -20,6 +21,7 @@ dirs.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+secrecy.workspace = true
 shell-words.workspace = true
 tokio.workspace = true
 toml.workspace = true

@@ -143,6 +143,12 @@ source ~/.config/aicoach/aicoach.zsh
 aicoach onboard
 ```
 
+如需启用 AI，继续运行交互式 Provider 设置；只使用本地分析时可以跳过：
+
+```zsh
+aicoach config setup
+```
+
 ## API Provider、语言与密钥
 
 仓库不内置 API endpoint、模型或密钥。默认配置为 `provider = "disabled"`，仅运行
@@ -163,8 +169,39 @@ chat = ""
 language = "en-US"
 ```
 
-启用兼容服务时，编辑 `~/.config/aicoach/config.toml`，一次性填写服务地址和当前账号
-有权使用的三个模型，再将 provider 改为 `openai-compatible`：
+启用兼容服务时，推荐运行：
+
+```zsh
+aicoach config setup
+```
+
+交互式向导会要求填写 Base URL，默认让补全、失败分析和聊天共用一个模型；需要针对速度、
+质量或费用分别选择模型时，可以选择高级的三模型配置。已有的三个不同模型会默认保留。
+
+向导把凭据授权按 Base URL 边界处理。当 Base URL 是新增或已变更，或当前 Provider 处于
+`disabled` / `none` 状态时，复用检测到的 Keychain 或当前 Shell 凭据必须明确确认，默认为否。
+如果拒绝，向导会保存填写的地址和模型，但保持 `provider = "disabled"`；旧凭据不会发往该地址。
+请先运行 `aicoach config set-key` 保存或替换凭据，再重新运行 `aicoach config setup` 复核并启用。
+没有任何凭据时，向导会询问是否通过安全输入存入 Keychain；如果拒绝，也会以同样的禁用状态保存。
+密钥不会成为命令行参数，也不会写入配置文件或 Shell history。
+
+确认结果保存在权限为 `0600` 的 `~/.config/aicoach/provider-authorization.toml`。该文件不含
+API key，只保存由已审查的 Provider、规范化 Base URL、`api_key_env` 和凭据来源生成的
+SHA-256 授权摘要。任一项失配时 daemon 会安全退回 local-only，不会尝试其他凭据来源。
+
+只有用户确认复用已有凭据或选择保存新凭据时，向导才会询问是否执行可选的
+Flight Check。它默认为否；只有明确选择后才会带凭据尝试一次底层 HTTP 请求，不做自动重试。请求只检查聊天模型，包含固定消息
+`Reply with OK.` 和普通 Chat Completions 协议字段；它不发送 cwd、命令、Shell history、
+终端输出或环境信息，也不会跟随 HTTP 重定向。回环地址会直连，不经过系统或环境代理。
+使用已有凭据时，检查在保存前执行，失败会让原配置逐字节保持不变；首次在向导中保存 Keychain
+凭据时，新配置和凭据会先保存再检查，若检查失败二者都会保留，但运行中的 daemon 不会刷新，
+终端会明确说明这一状态。跳过网络检查时，向导仍会先做本地配置校验。
+
+保存成功后，向导会刷新正在运行的 daemon；若 daemon 尚未运行，则按提示执行
+`aicoach start`。仓库依然不内置或推荐任何真实 endpoint、模型或密钥。
+
+手工编辑保留为高级路径：编辑 `~/.config/aicoach/config.toml`，填写服务地址和当前账号
+有权使用的模型，再将 provider 改为 `openai-compatible`：
 
 ```toml
 [ai]
@@ -189,22 +226,30 @@ source ~/.config/aicoach/aicoach.zsh
 
 切回英文时把 `zh-CN` 改为 `en-US`。新终端会自动读取最新语言设置。
 
+手工修改 `base_url` 或 `api_key_env` 后必须重新运行 `aicoach config setup`，复核目标和
+凭据来源并生成新的授权摘要；仅修改模型或超时仍应先运行 `aicoach config validate` 再重启。
+
+远程 Provider 必须使用 HTTPS，避免 Bearer 凭据和请求内容经过明文网络；只有
+`localhost`、`127.0.0.1` 和 `::1` 回环地址允许 HTTP。
+
 模型必须是当前 key 已授权的模型 ID。服务方通常提供接口或控制台列出授权模型。
 推荐把 key 放进 macOS Keychain，避免写进 `.zshrc`、TOML 或 shell history：
 
 ```zsh
 aicoach config set-key
-aicoach restart
 ```
 
 命令会让 `/usr/bin/security` 在终端中安全读取密钥；值不会进入命令行参数、项目
-文件或日志。删除：
+文件或日志。如果 daemon 正在运行，设置和删除凭据都会自动刷新它；尚未运行时使用
+`aicoach start`。当现有授权与当前目标匹配时，`set-key` 可把 Shell 环境变量凭据迁移到
+Keychain；Provider 已禁用或目标尚未审查时，仍需运行 `aicoach config setup` 才会启用。
+删除：
 
 ```zsh
 aicoach config delete-key
 ```
 
-删除命令会自动刷新正在运行的 daemon，确保旧进程不继续持有该凭据。
+删除命令会确保旧进程不继续持有该凭据。
 
 临时运行也可使用环境变量。为避免密钥进入 shell history，先关闭当前命令的历史
 记录，再在交互提示中输入（或使用 Keychain 方案）：
@@ -215,6 +260,9 @@ export AI_COACH_API_KEY
 aicoach restart
 unset AI_COACH_API_KEY
 ```
+
+`aicoach start` / `restart` 会让本次启动的 daemon 继承当前 Shell 中的变量，但它不会在
+下次登录后自动恢复。长期使用请保存到 Keychain。
 
 支持 OpenAI、DeepSeek、OpenRouter、Ollama、LM Studio 及其他兼容
 `/chat/completions` 服务：修改 `base_url` 和三个模型即可；不校验密钥的本地服务
@@ -424,8 +472,10 @@ Shell 连接；清理命令自身也不会重新写回上下文。clear history 
 清日志重启正在运行的 daemon，也不会改变任何 session 的 Airlock 状态。
 单独清理 fingerprints 或 logs 不会重启 daemon，也不会顺带丢失 session 上下文。
 
-所有 clear 操作都保留 config.toml、安装支持文件、~/.zshrc.aicoach.backup 和 macOS
-Keychain 凭据；Keychain 仍需显式运行 aicoach config delete-key 删除。按 session 清理时，
+所有 clear 操作都保留 config.toml、权限为 `0600` 且不含密钥的
+provider-authorization.toml、安装支持文件、~/.zshrc.aicoach.backup 和 macOS Keychain
+凭据；Keychain 仍需显式运行 aicoach config delete-key 删除。`aicoach data status` 对授权
+元数据也只展示路径、是否存在和字节数，不读取或输出其 SHA-256 摘要。按 session 清理时，
 已损坏或异常过大的 history.json 不会被覆盖或部分改写。正在打开的 Coach 窗口会收到
 清理事件，丢弃其内存中的旧聊天，避免退出时把已经删除的内容重新保存。
 
@@ -466,6 +516,7 @@ modified/staged/untracked/conflict/ahead/behind 计数。没有变化就保持�
 配置文件：`~/.config/aicoach/config.toml`。
 
 ```zsh
+aicoach config setup
 aicoach config show
 aicoach config path
 aicoach config validate
@@ -475,7 +526,8 @@ aicoach config edit
 
 Daemon 在启动时读取配置，修改 AI、隐私、上下文或 Coach 设置后请执行
 `aicoach restart`。快捷键、语言和 Shell 本地开关由生成的 Zsh 设置加载，并在现有
-终端的下一个 Prompt 自动刷新；升级旧版 Shell 集成后只需新开一个终端标签页。
+终端的下一个 Prompt 自动刷新；升级程序后请先运行一次幂等的 `aicoach install`，再执行
+`source ~/.config/aicoach/aicoach.zsh` 或新开一个终端标签页。
 
 主要默认值见 [`config/default.toml`](config/default.toml)。上下文边界：
 
@@ -506,7 +558,7 @@ aicoach uninstall [--purge]
 aicoach start | stop | restart | status [--json]
 aicoach doctor [--json]
 aicoach support [--copy] [--output FILE]
-aicoach config show|path|validate|set|edit|set-key|delete-key
+aicoach config setup|show|path|validate|set|edit|set-key|delete-key
 aicoach logs [-n 100] [--follow]
 aicoach capsule [--last 20] [--failed-only] [--copy] [--output FILE]
 aicoach checkpoint [--session UUID] [start NAME | resolve [RESOLUTION] | status [--json] | clear]
@@ -547,8 +599,13 @@ aicoach logs -n 200
 
 - `AI credential ... is not set`：运行 `aicoach config set-key`。
 - `doctor` 默认是无网络诊断：它验证 Provider 配置和凭据是否就绪，但不会把终端
-  上下文发送到服务或主动探测模型；实际授权模型/网络状态在首次 AI 请求时确认。
+  上下文发送到服务或主动探测模型。`aicoach config setup` 中明确询问的可选 Flight
+  Check 则会发送上文所述的固定请求；若跳过，实际授权模型/网络状态在首次 AI 请求时确认。
 - AI 返回模型不存在：登录 Provider 查看当前 key 的授权模型，修改 `ai.models.*`。
+- 安装或升级后，已打开的 Terminal 标签页可能仍在运行旧版 Shell 集成。在该标签页运行
+  `source ~/.config/aicoach/aicoach.zsh`，或直接新开标签页。
+- `Option+Tab`、`Option+/` 和 `Option+R` 只在普通 Zsh 提示符的 ZLE 输入行中有效；
+  `aicoach-ui`、vim、ssh、python 等前台程序运行时不会接管其内部按键。
 - `Option+…` 产生特殊字符：启用终端的 “Use Option as Meta key”。
 - 不确定终端发送了什么：运行 `aicoach onboard` 进行实际按键校准；支持 `Esc` 跳过
   单项，`Ctrl+C` 安全退出。
@@ -573,8 +630,10 @@ brew install --HEAD BlueKiteCoder/aicoach-dev/aicoach
 ```
 
 Formula 会先在有网络的 `fetch` 阶段缓存锁定依赖，再在无网络的安装阶段构建。生成的
-LaunchAgent 使用 Homebrew 的稳定 `bin` 链接，因此正常 `brew upgrade` 不再要求重新
-运行 `aicoach install`。源码安装到 `~/.local/bin` 的行为保持不变。
+LaunchAgent 使用 Homebrew 的稳定 `bin` 链接，但 Shell 集成位于用户配置目录；因此每次
+`brew upgrade` 后仍需运行一次幂等的 `aicoach install`。它会更新 Shell 文件并替换正在运行的
+旧 daemon；随后执行 `source ~/.config/aicoach/aicoach.zsh` 或新开终端标签页。源码安装到
+`~/.local/bin` 的行为相同。
 
 测试完可运行 `brew untap BlueKiteCoder/aicoach-dev` 移除临时 tap。首个正式版本发布
 后，将创建 `BlueKiteCoder/homebrew-aicoach`，填入不可变 tag 源码的
@@ -752,6 +811,68 @@ aicoach onboard
 Onboarding captures the physical Option sequences emitted by the current terminal,
 refuses unsafe bindings that would replace normal typing, and verifies the generated
 widgets in a clean Zsh process. Use `aicoach onboard --check` for a read-only check.
+After installing or upgrading, an already-open Terminal tab may still have the previous
+shell integration in memory. Run `source ~/.config/aicoach/aicoach.zsh` in that tab or
+open a new one. The terminal Option shortcuts work only on an ordinary Zsh/ZLE input
+line, not inside `aicoach-ui`, vim, ssh, Python, or another foreground program.
+To enable AI after onboarding, run the recommended interactive setup:
+
+```zsh
+aicoach config setup
+```
+
+The wizard asks for a provider-neutral Base URL and uses one model for completion,
+failure analysis, and chat by default. Choose the advanced three-model path when those
+jobs need different speed, quality, or cost characteristics; an existing distinct model
+set is preserved by default.
+
+Credential authorization is treated as scoped to the reviewed Base URL. When the Base
+URL is new or changed, or the current provider is `disabled` / `none`, reusing a detected
+Keychain or current-shell credential requires an explicit confirmation that defaults to
+No. Declining saves the entered target and models with `provider = "disabled"`, and the
+old credential is not sent to that target. Run `aicoach config set-key` to save or replace
+the credential, then rerun setup to review and activate it. If no credential exists, the
+wizard offers secure Keychain input; declining it likewise leaves the provider disabled.
+Keychain input never places the secret in a command argument, the configuration file, or
+shell history.
+
+The confirmation is stored in `~/.config/aicoach/provider-authorization.toml` with mode
+`0600`. It contains no API key: only a SHA-256 authorization digest derived from the reviewed
+provider, normalized Base URL, `api_key_env`, and credential source. If any field no longer
+matches, the daemon fails closed to local-only and does not try another credential source.
+
+Only after the user confirms an existing credential or chooses to store a new one does the
+wizard offer the optional Flight Check, which is a real network/API request.
+It defaults to No and only an explicit Yes makes exactly one underlying HTTP attempt, with
+no automatic retry. It contains the fixed user message `Reply with OK.`, the selected chat
+model, and ordinary Chat Completions protocol fields—never cwd, commands, shell history,
+terminal output, or environment data. Redirects are not followed, and loopback targets
+connect directly without system or environment proxies. With an existing credential, the
+check runs before saving and a failure leaves the previous config byte-for-byte unchanged.
+During first-time Keychain storage, the locally validated config and credential are saved
+before the check; if it fails, both remain saved but the running daemon is not refreshed,
+and the CLI says so. Skipping the network check still performs local validation. Remote
+providers require HTTPS; plain HTTP is accepted only for localhost or loopback addresses.
+
+A successful setup refreshes a running daemon; otherwise the wizard tells you to run
+`aicoach start`. `aicoach config set-key` and `delete-key` also refresh a running daemon
+automatically. A credential exported only in the current shell is not inherited by the
+next login session; `aicoach start` / `restart` can inherit it for the current session,
+while Keychain is required for durable background launches.
+
+For an authorization that still matches the current target, `aicoach config set-key` can
+migrate an authorized shell-environment credential to Keychain. A disabled provider or an
+unreviewed target still requires `aicoach config setup` before provider access is enabled.
+
+No real endpoint, model, or credential is built in or recommended. Advanced users can
+still edit `~/.config/aicoach/config.toml` manually, validate it with
+`aicoach config validate`, manage the credential with `aicoach config set-key` /
+`aicoach config delete-key`, and restart the daemon after manual changes. After manually
+changing `base_url` or `api_key_env`, rerun `aicoach config setup` to review and bind the
+new target; model- or timeout-only edits should still be validated before restart.
+The configuration CLI also retains `aicoach config show|path|set|edit` for inspection
+and targeted advanced changes.
+
 Use `aicoach support --copy` to generate a Markdown report for public issues without
 including usernames, paths, sessions, terminal content, logs, endpoints, models, or
 credentials; no provider or network request is made.

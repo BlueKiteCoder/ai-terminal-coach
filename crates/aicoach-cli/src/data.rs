@@ -721,6 +721,10 @@ fn support_files(paths: &Paths) -> Vec<(&'static str, PathBuf)> {
             paths.config_dir.join("keybindings.version"),
         ),
         (
+            "provider authorization metadata",
+            paths.provider_authorization.clone(),
+        ),
+        (
             "window controller",
             paths.data_dir.join("aicoach-window.js"),
         ),
@@ -959,6 +963,32 @@ mod tests {
         let encoded = serde_json::to_string(&inventory(&paths)).unwrap();
         assert!(encoded.contains(r#""items":1"#));
         assert!(!encoded.contains("private-history-payload"));
+    }
+
+    #[test]
+    fn provider_authorization_inventory_reports_only_file_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(directory.path());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let private_contents = "authorization-file-private-sentinel";
+        fs::write(&paths.provider_authorization, private_contents).unwrap();
+
+        let report = inventory(&paths);
+        let authorization = report
+            .installed_support_files
+            .iter()
+            .find(|file| file.path == paths.provider_authorization.display().to_string())
+            .unwrap();
+        let encoded = serde_json::to_string(&report).unwrap();
+
+        assert_eq!(authorization.purpose, "provider authorization metadata");
+        assert_eq!(
+            authorization.path,
+            paths.provider_authorization.display().to_string()
+        );
+        assert!(authorization.exists);
+        assert_eq!(authorization.bytes, private_contents.len() as u64);
+        assert!(!encoded.contains(private_contents));
     }
 
     #[test]

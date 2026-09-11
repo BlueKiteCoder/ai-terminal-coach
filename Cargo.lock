@@ -32,6 +32,7 @@ dependencies = [
 name = "aicoach-cli"
 version = "0.1.0"
 dependencies = [
+ "aicoach-ai",
  "aicoach-core",
  "aicoach-ipc",
  "anyhow",
@@ -40,6 +41,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "libc",
+ "secrecy",
  "serde",
  "serde_json",
  "shell-words",

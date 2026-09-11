@@ -89,6 +89,10 @@ typeset -g calibrated_config=$(<"$test_home/.config/aicoach/config.toml")
 [[ $calibrated_config == *'risk_lens = "^[l"'* ]]
 typeset -g generated_settings=$(<"$test_home/.config/aicoach/keybindings.zsh")
 [[ $generated_settings == *"AICOACH_CONFIG_COMPLETION_KEY=\$'\\x1bg'"* ]]
-$cli onboard --check >/dev/null
+typeset -gr integration_version=$(sed -n 's/^typeset -gx AICOACH_INTEGRATION_VERSION=//p' "$repo_root/shell/aicoach.zsh")
+if ! onboarding_check=$(env AICOACH_INTEGRATION_VERSION="$integration_version" "$cli" onboard --check 2>&1); then
+  print -u2 -r -- "$onboarding_check"
+  exit 1
+fi
 
 builtin print 'onboarding end-to-end test: ok'

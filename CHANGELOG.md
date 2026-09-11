@@ -7,6 +7,15 @@ All notable user-visible changes are recorded here. This project follows
 
 ### Added
 
+- `aicoach config setup` now provides a provider-neutral first-run wizard for Base URL, one shared
+  model by default or three advanced model choices, target-scoped credential review, and optional
+  first-time macOS Keychain storage. Reusing a credential for a new or changed target, or from a
+  disabled provider state, requires an explicit confirmation that defaults to No; declining saves
+  the target disabled without sending the old credential. A Flight Check also defaults to No and,
+  when explicitly accepted, makes exactly one non-redirected, non-retried request for the chat model
+  containing the fixed `Reply with OK.` message and no terminal context; loopback checks bypass
+  proxies. Successful setup refreshes an already-running daemon. `aicoach config set-key` explicitly
+  replaces the Keychain credential and now also refreshes a running daemon.
 - Coach suggestions now carry an always-visible local Risk Lens badge. Insert-only and copy-only
   receipts state the destination, classification, coverage limits, and that nothing was executed;
   the daemon independently reclassifies terminal handoffs so a client cannot spoof a lower risk.
@@ -18,6 +27,12 @@ All notable user-visible changes are recorded here. This project follows
   a final resolution entered interactively outside normal Shell history.
 - Local Data Controls inventory every persistent, Keychain, runtime, and daemon-memory category
   without content, then clear one session, history, fingerprints, logs, or all transient data.
+- Provider authorization is persisted as an owner-only (`0600`), key-free SHA-256 digest binding
+  the reviewed provider, normalized Base URL, `api_key_env`, and credential source. Data inventory
+  reports only this metadata file's path and size. A mismatch fails closed to local-only; changing
+  Base URL or `api_key_env` requires rerunning setup. For a matching target, `set-key` can migrate
+  an authorized environment credential to Keychain, while disabled or unreviewed targets still
+  require setup.
 - Contributor architecture and IPC v3 guides define module ownership, request/event routing,
   extension recipes, compatibility rules, and the non-negotiable provider and ZLE boundaries.
 - Native performance dashboards measure Zsh hook latency, warmed executable startup, and stripped
@@ -31,6 +46,16 @@ All notable user-visible changes are recorded here. This project follows
 
 ### Security
 
+- Provider setup does not bundle an endpoint, model, or credential and never puts a Keychain secret
+  in configuration or command arguments. New, changed, and disabled targets fail closed: declining
+  credential reuse, or declining first-time storage when no credential exists, saves
+  `provider = "disabled"` and sends no credential. Flight Checks with existing credentials preserve
+  the prior config on failure; first-time storage reports the committed config/Keychain state instead
+  of implying rollback. Remote endpoints require HTTPS, loopback HTTP remains available and bypasses
+  proxies for local models, and the AI client never follows redirects with provider-bound bodies.
+- Provider authorization metadata contains no credential and cannot silently switch between
+  Keychain and shell sources; missing, altered, or invalid authorization leaves provider requests
+  disabled while local diagnostics remain available.
 - GitHub Actions are pinned to immutable commits, run on current Node 24 action releases,
   and receive weekly Dependabot update pull requests.
 - Failure memory never persists the failed command, diagnostic output, cwd, or session ID; it is
@@ -52,6 +77,10 @@ All notable user-visible changes are recorded here. This project follows
 
 ### Fixed
 
+- Re-running `aicoach install` now replaces an already-running daemon, startup waits for a real IPC
+  response instead of trusting a stale socket path, and onboarding identifies an older integration
+  still loaded in the current terminal. Real ZLE tests now exercise Option+R and Option+Tab through
+  the Unix socket and verify both the final result and cleared busy state.
 - Source Card process integration tests tolerate contended CI scheduling without changing the
   product's 800ms local-documentation timeout.
 - Plain `p`/`P` remains normal Coach input; Privacy Receipt moved to `Ctrl+P`, with `Ctrl+O`
