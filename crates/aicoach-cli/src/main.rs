@@ -136,9 +136,9 @@ enum Commands {
     Install(InstallArgs),
     /// Remove integration while preserving config, local memory, and logs.
     Uninstall(UninstallArgs),
-    /// Start (or wake) the daemon.
+    /// Start (or wake) the daemon and re-enable automatic recovery.
     Start,
-    /// Stop the daemon.
+    /// Stop the daemon until an explicit start or restart.
     Stop,
     /// Restart the daemon.
     Restart,
@@ -361,6 +361,7 @@ struct Paths {
     window_state: PathBuf,
     socket: PathBuf,
     pid: PathBuf,
+    manual_stop: PathBuf,
     launch_agents: PathBuf,
     daemon_plist: PathBuf,
     hotkey_plist: PathBuf,
@@ -390,6 +391,7 @@ impl Paths {
             window_state: state_dir.join("window-state.json"),
             socket: run_dir.join("aicoach.sock"),
             pid: run_dir.join("aicoachd.pid"),
+            manual_stop: run_dir.join("daemon.manual-stop"),
             daemon_plist: launch_agents.join(format!("{DAEMON_LABEL}.plist")),
             hotkey_plist: launch_agents.join(format!("{HOTKEY_LABEL}.plist")),
             config_dir,
@@ -545,13 +547,16 @@ fn install(paths: &Paths, args: &InstallArgs) -> Result<()> {
         stop(paths)?;
         thread::sleep(Duration::from_millis(250));
     }
-    if !args.no_start {
+    if args.no_start {
+        mark_daemon_stopped(paths)?;
+        if helper_installed {
+            stop_agent(&paths.hotkey_plist, HOTKEY_LABEL);
+        }
+    } else {
         start(paths)?;
         if helper_installed {
             bootstrap_agent(&paths.hotkey_plist, HOTKEY_LABEL, false)?;
         }
-    } else if helper_installed {
-        stop_agent(&paths.hotkey_plist, HOTKEY_LABEL);
     }
 
     println!("\x1b[32mAI Terminal Coach installed.\x1b[0m");
@@ -634,6 +639,7 @@ fn start_with_authorization(
 ) -> Result<()> {
     ensure_macos()?;
     paths.create_runtime()?;
+    clear_manual_stop(paths)?;
     if authorization.digest.is_none()
         && aicoach_core::Config::load_from(&paths.config)
             .is_ok_and(|config| !matches!(config.ai.provider.trim(), "disabled" | "none"))
@@ -655,6 +661,7 @@ fn start_prepared_daemon(
     authorization: &DaemonAuthorization,
     credential_available: bool,
 ) -> Result<()> {
+    clear_manual_stop(paths)?;
     if authorization.mode == DaemonCredentialMode::Environment && credential_available {
         // launchd does not inherit variables exported by the invoking shell.
         // A detached child does, and the daemon writes its own rolling log.
@@ -741,6 +748,7 @@ fn configure_daemon_launcher(
 }
 
 fn stop(paths: &Paths) -> Result<()> {
+    mark_daemon_stopped(paths)?;
     let _ = request_shutdown(&paths.socket);
     stop_agent(&paths.daemon_plist, DAEMON_LABEL);
     let (running, pid) = is_daemon_running(paths);
@@ -763,6 +771,16 @@ fn stop(paths: &Paths) -> Result<()> {
     }
     println!("aicoachd is not running");
     Ok(())
+}
+
+fn mark_daemon_stopped(paths: &Paths) -> Result<()> {
+    secure_dir(&paths.state_dir)?;
+    secure_dir(&paths.run_dir)?;
+    atomic_write(&paths.manual_stop, "manual\n", 0o600)
+}
+
+fn clear_manual_stop(paths: &Paths) -> Result<()> {
+    remove_file_if_exists(&paths.manual_stop)
 }
 
 fn status(paths: &Paths, as_json: bool) -> Result<()> {
@@ -2506,6 +2524,26 @@ mod tests {
 
         assert!(socket.exists());
         assert!(!ping_socket(&socket));
+    }
+
+    #[test]
+    fn manual_stop_marker_is_owner_only_and_clearable() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(directory.path());
+
+        mark_daemon_stopped(&paths).unwrap();
+        assert_eq!(fs::read_to_string(&paths.manual_stop).unwrap(), "manual\n");
+        assert_eq!(
+            fs::metadata(&paths.manual_stop)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        clear_manual_stop(&paths).unwrap();
+        assert!(!paths.manual_stop.exists());
     }
 
     #[test]

@@ -568,6 +568,9 @@ aicoach memory [status [--json] | list [--json] | clear]
 aicoach toggle [--session UUID] [--tty /dev/ttys001]
 ```
 
+`aicoach stop` keeps the daemon stopped across prompts and new terminal tabs until an explicit
+`aicoach start` or `aicoach restart`. This does not uninstall the Shell integration or delete data.
+
 `uninstall` 保留配置、Failure Fingerprints 和日志；只有显式 `--purge` 才删除它们，
 `.zshrc` 备份始终保留。也可以只用 `aicoach memory clear` 删除 Failure Fingerprints。
 

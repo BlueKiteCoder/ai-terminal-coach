@@ -15,6 +15,7 @@ typeset -g AICOACH_TEST_MODE=1
 typeset -g last_zle_message=""
 typeset -g test_settings_dir=$(mktemp -d "${TMPDIR:-/tmp}/aicoach-zsh-test.XXXXXX")
 trap 'rm -rf -- "$test_settings_dir"' EXIT
+typeset -g AICOACH_HOME=$test_settings_dir/state
 typeset -g AICOACH_SETTINGS_FILE=$test_settings_dir/keybindings.zsh
 typeset -g AICOACH_SETTINGS_VERSION_FILE=$test_settings_dir/keybindings.version
 builtin print -r -- '1' >| $AICOACH_SETTINGS_VERSION_FILE
@@ -60,7 +61,7 @@ print() {
 }
 source "${0:A:h:h}/shell/aicoach.zsh"
 
-assert_eq "$AICOACH_INTEGRATION_VERSION" '3'
+assert_eq "$AICOACH_INTEGRATION_VERSION" '4'
 assert_eq "$AICOACH_LANGUAGE" 'en-US'
 _aicoach_text thinking
 assert_eq "$REPLY" 'Thinking…'
@@ -131,7 +132,38 @@ upgrade_probe=$(
       print -r -- "$AICOACH_INTEGRATION_VERSION:$AICOACH_STATUS_REQUEST_ID:$AICOACH_CHAT_KEY_USER_SET"
     '
 )
-assert_eq "$upgrade_probe" '3:upgrade-probe:0'
+assert_eq "$upgrade_probe" '4:upgrade-probe:0'
+
+# An explicit CLI stop creates this marker before closing the socket. Prompts
+# and new terminal tabs must respect it instead of immediately spawning start.
+typeset -gx AICOACH_TEST_AUTOSTART_RECORD=$test_settings_dir/autostart-record
+typeset -g test_aicoach_stub=$test_settings_dir/aicoach
+builtin print -l -r -- \
+  '#!/bin/zsh' \
+  'builtin print -r -- "$*" >> "$AICOACH_TEST_AUTOSTART_RECORD"' >| $test_aicoach_stub
+/bin/chmod 700 $test_aicoach_stub
+typeset -ga saved_command_path=("${path[@]}")
+path=($test_settings_dir "${path[@]}")
+rehash
+/bin/mkdir -p ${AICOACH_STOP_FILE:h}
+builtin print -r -- manual >| $AICOACH_STOP_FILE
+typeset -g AICOACH_LAST_START=0
+_aicoach_maybe_start
+/bin/sleep 0.05
+[[ ! -e $AICOACH_TEST_AUTOSTART_RECORD ]] || {
+  builtin print -u2 -r -- 'FAIL: manual stop marker did not suppress daemon auto-start'
+  test_failed=1
+}
+/bin/rm -f $AICOACH_STOP_FILE
+typeset -g AICOACH_LAST_START=0
+_aicoach_maybe_start
+for _ in {1..50}; do
+  [[ -e $AICOACH_TEST_AUTOSTART_RECORD ]] && break
+  /bin/sleep 0.01
+done
+assert_eq "$(<$AICOACH_TEST_AUTOSTART_RECORD)" 'start'
+path=("${saved_command_path[@]}")
+rehash
 
 _aicoach_encode $'hello\t世界\n100%'
 encoded=$REPLY

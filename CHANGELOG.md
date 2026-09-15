@@ -77,6 +77,9 @@ All notable user-visible changes are recorded here. This project follows
 
 ### Fixed
 
+- `aicoach stop` now records an owner-only manual-stop state before shutting down, so returning to
+  a Zsh prompt or opening another terminal cannot immediately auto-start the daemon. An explicit
+  `aicoach start`, `restart`, or normal install clears the state; `install --no-start` preserves it.
 - Re-running `aicoach install` now replaces an already-running daemon, startup waits for a real IPC
   response instead of trusting a stale socket path, and onboarding identifies an older integration
   still loaded in the current terminal. Real ZLE tests now exercise Option+R and Option+Tab through
