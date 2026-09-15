@@ -325,10 +325,10 @@ fn clear_all(paths: &Paths) -> Result<()> {
     let log_files = clear_log_files(&paths.logs_dir, was_running)?;
     print_removed("All transient daemon data", &removed);
     println!(
-        "Persistent history, fingerprints, window state, runtime markers, and {log_files} log files were cleared."
+        "Persistent history, fingerprints, window state, active terminal markers, and {log_files} log files were cleared."
     );
     println!(
-        "Configuration, installed support files, Shell backup, Keychain, and Session Airlock state were preserved."
+        "Configuration, installed support files, Shell backup, Keychain, manual-stop state, and Session Airlock state were preserved."
     );
     Ok(())
 }
@@ -498,6 +498,13 @@ fn inventory(paths: &Paths) -> DataInventoryReport {
                 clear_command: Some("aicoach data clear all".to_owned()),
                 read_error: None,
             },
+            file_store(
+                "daemon_manual_stop",
+                &paths.manual_stop,
+                "until explicit start, restart, or a normal install",
+                vec!["manual-stop state only"],
+                None,
+            ),
         ],
         keychain_credential: KeychainReport {
             service: "com.aicoach.api-key",
@@ -1013,6 +1020,7 @@ mod tests {
         )
         .unwrap();
         fs::write(paths.run_dir.join("active-tty"), "/dev/ttys001").unwrap();
+        fs::write(&paths.manual_stop, "manual\n").unwrap();
         fs::write(
             paths.logs_dir.join("aicoachd.jsonl.2026-09-05-10"),
             "private",
@@ -1032,6 +1040,7 @@ mod tests {
         assert!(!paths.window_state.exists());
         assert!(!paths.run_dir.join("active-session").exists());
         assert!(!paths.run_dir.join("active-tty").exists());
+        assert!(paths.manual_stop.exists());
         assert!(!paths.logs_dir.join("aicoachd.jsonl.2026-09-05-10").exists());
     }
 }

@@ -6,7 +6,7 @@ if [[ -n ${AICOACH_ZSH_LOADED:-} ]]; then
   # Same-version sourcing only refreshes generated settings. A newer script
   # closes the old socket and replaces every function/widget in-place.
   if [[ ${AICOACH_INTEGRATION_VERSION:-0} == <-> ]] &&
-      (( AICOACH_INTEGRATION_VERSION >= 3 )) &&
+      (( AICOACH_INTEGRATION_VERSION >= 4 )) &&
       (( $+functions[_aicoach_reload_settings] )); then
     _aicoach_reload_settings
     return 0
@@ -15,7 +15,7 @@ if [[ -n ${AICOACH_ZSH_LOADED:-} ]]; then
   unset AICOACH_ZSH_LOADED
 fi
 typeset -g AICOACH_ZSH_LOADED=1
-typeset -gx AICOACH_INTEGRATION_VERSION=3
+typeset -gx AICOACH_INTEGRATION_VERSION=4
 
 # Remember settings explicitly supplied before this file was sourced. Generated
 # config can then hot-reload without overriding intentional .zshrc customizations.
@@ -44,6 +44,7 @@ autoload -Uz add-zsh-hook
 
 typeset -g AICOACH_HOME=${AICOACH_HOME:-$HOME/.aicoach}
 typeset -g AICOACH_SOCKET=${AICOACH_SOCKET:-$AICOACH_HOME/run/aicoach.sock}
+typeset -g AICOACH_STOP_FILE=${AICOACH_STOP_FILE:-$AICOACH_HOME/run/daemon.manual-stop}
 typeset -g AICOACH_SESSION_ID=${AICOACH_SESSION_ID:-${$(command uuidgen 2>/dev/null):l}}
 [[ -n $AICOACH_SESSION_ID ]] || typeset -g AICOACH_SESSION_ID="00000000-0000-4000-8000-$(printf '%012x' $(( ($$ << 16) ^ RANDOM )))"
 typeset -g AICOACH_FD=""
@@ -338,6 +339,7 @@ _aicoach_close() {
 }
 
 _aicoach_maybe_start() {
+  [[ -e $AICOACH_STOP_FILE ]] && return 0
   (( $+commands[aicoach] )) || return 0
   _aicoach_now_ms
   local now=$REPLY
