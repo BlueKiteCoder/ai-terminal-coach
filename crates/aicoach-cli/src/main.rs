@@ -474,7 +474,7 @@ fn run() -> Result<()> {
         Commands::Onboard(args) => onboarding::run(&paths, &args),
         Commands::Install(args) => install(&paths, &args),
         Commands::Uninstall(args) => uninstall(&paths, &args),
-        Commands::Start => start(&paths),
+        Commands::Start => start_command(&paths),
         Commands::Stop => stop(&paths),
         Commands::Restart => {
             stop(&paths)?;
@@ -630,6 +630,27 @@ fn uninstall(paths: &Paths, args: &UninstallArgs) -> Result<()> {
 fn start(paths: &Paths) -> Result<()> {
     let authorization = resolve_daemon_authorization(paths)?;
     start_with_authorization(paths, &authorization, false)
+}
+
+fn start_command(paths: &Paths) -> Result<()> {
+    let loaded_version = env::var("AICOACH_INTEGRATION_VERSION").ok();
+    if stale_shell_must_preserve_manual_stop(paths, loaded_version.as_deref()) {
+        eprintln!(
+            "\x1b[33mThe daemon remains manually stopped because this terminal has an older AI Coach integration loaded. Reload the terminal, then run `aicoach start`; `aicoach restart` can also start it now.\x1b[0m"
+        );
+        return Ok(());
+    }
+    start(paths)
+}
+
+fn stale_shell_must_preserve_manual_stop(paths: &Paths, loaded_version: Option<&str>) -> bool {
+    let Some((loaded, expected)) = loaded_version
+        .and_then(|value| value.parse::<u64>().ok())
+        .zip(expected_shell_integration_version())
+    else {
+        return false;
+    };
+    paths.manual_stop.exists() && loaded < expected
 }
 
 fn start_with_authorization(
@@ -2544,6 +2565,25 @@ mod tests {
 
         clear_manual_stop(&paths).unwrap();
         assert!(!paths.manual_stop.exists());
+    }
+
+    #[test]
+    fn stale_shell_auto_start_cannot_clear_a_manual_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(directory.path());
+        let expected = expected_shell_integration_version().unwrap();
+        assert!(expected > 0);
+        mark_daemon_stopped(&paths).unwrap();
+
+        assert!(stale_shell_must_preserve_manual_stop(
+            &paths,
+            Some(&(expected - 1).to_string())
+        ));
+        assert!(!stale_shell_must_preserve_manual_stop(
+            &paths,
+            Some(&expected.to_string())
+        ));
+        assert!(!stale_shell_must_preserve_manual_stop(&paths, None));
     }
 
     #[test]
