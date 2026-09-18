@@ -1,7 +1,7 @@
 # Architecture
 
 This document is the map for changing AI Terminal Coach without weakening its product, privacy,
-or safety boundaries. It describes `main` and protocol version 4. The Rust types remain the source
+or safety boundaries. It describes `main` and protocol version 5. The Rust types remain the source
 of truth when this guide and code disagree.
 
 ## Non-negotiable invariants
@@ -21,6 +21,8 @@ Every change must preserve these properties:
    never shell output, chat history, logs, or retained session content.
 9. A sealed Session Airlock atomically prevents new provider work and cancels active provider work
    without disabling local analysis or changing another terminal session.
+10. Twin Terminal baselines are bounded daemon-memory-only evidence; sensitive environment values
+    are digest-only and no snapshot or report reaches a provider.
 
 ## Process topology
 
@@ -64,16 +66,16 @@ that combines local policy, session state, routing, and provider access.
 
 | Area | Owns | Does not own |
 |---|---|---|
-| `aicoach-core` | Config, privacy, local analysis, safety, Risk Lens, Command Patch, Source Cards, Git metadata, Failure Fingerprints | Sockets, UI state, provider HTTP |
+| `aicoach-core` | Config, privacy, local analysis, safety, Risk Lens, Command Patch, Source Cards, Git metadata, Failure Fingerprints, Twin Terminal comparison | Sockets, UI state, provider HTTP |
 | `aicoach-ai` | Provider trait, OpenAI-compatible HTTP/JSON/SSE, cancellation, retry, timeouts, credential-safe errors | Session retention, ZLE mutation, local safety policy |
 | `aicoach-ipc` | Typed requests/responses/events, identifiers, frame limits, JSON and Zsh codecs | Authorization policy, request execution |
 | `aicoach-daemon` | Session lifecycle, request routing, cancellation, event delivery, local-first orchestration, atomic Session Airlock, provider boundary | Installation, terminal key capture |
-| `aicoach-cli` | Install/uninstall, LaunchAgents, Keychain setup, configuration, doctor, public-safe Support Report, Capsule, checkpoints, Airlock and data controls | Interactive chat rendering, provider calls |
+| `aicoach-cli` | Install/uninstall, LaunchAgents, Keychain setup, configuration, doctor, public-safe Support Report, Capsule, Twin Terminal capture, checkpoints, Airlock and data controls | Interactive chat rendering, provider calls |
 | `aicoach-tui` | Ratatui state, input, streaming display, Airlock control, scrolling, safe copy/insert requests, bounded disk chat history | Shell ownership, direct ZLE mutation |
 | `shell/aicoach.zsh` | `preexec`/`precmd`, allowlisted environment snapshot, ZLE buffer ownership, physical shortcuts | AI HTTP, long-lived policy decisions |
 | `macos/` and `scripts/` | Global hotkey helper and Terminal.app/iTerm2 window coordination | Command collection or execution |
 
-## Six important flows
+## Seven important flows
 
 ### Command failure
 
@@ -120,6 +122,23 @@ The TUI and CLI can query and change the flag; only non-shell observers receive 
 state event. Risk Lens, Source Cards, diagnostics, context, failure memory, and data controls remain
 local and available. Clearing data preserves the flag. A deliberate daemon restart discards all
 sessions, so a later session starts open by default.
+
+### Twin Terminal Diff
+
+The CLI explicitly captures a bounded snapshot when the user marks or compares a terminal. The Zsh
+integration exports the calling shell architecture and Rosetta state; the CLI omits those fields
+when that evidence is unavailable rather than substituting its own process architecture. Capture
+normalizes paths under the home directory, resolves a fixed tool allowlist without executing those
+tools, and converts private environment values into domain-separated digests before IPC. Fixed
+Git repository/branch evidence is read only from a non-symlink `.git` directory or bounded regular
+gitfile plus a bounded regular HEAD; a gitfile is used only to locate the target Git directory's
+HEAD (for example, a linked worktree or submodule).
+Directory/file handles reject symlinks and non-regular metadata files. Capture does not start Git
+or consult repository configuration and attributes, so hooks and filters cannot run. The daemon
+validates every field again,
+retains at most eight named baselines, and returns only typed differences. Baselines are global to
+the local daemon so two terminal sessions can compare, but they are never persisted, logged,
+attached to Capsules, or added to provider context.
 
 ### Local data clearing
 

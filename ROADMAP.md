@@ -29,7 +29,10 @@ honest privacy boundary.
   local diagnostics continue and other sessions remain unaffected.
 - [x] **Session Capsule:** locally export a redacted, terminal-safe Markdown incident report.
 - [ ] Signed and notarized Apple Silicon and Intel release artifacts.
-- [ ] Working Homebrew tap with an upgrade-safe install flow.
+- [x] A public Homebrew HEAD preview tap that builds the current `main` branch from source and is
+  explicitly labelled as non-stable, unsigned and unnotarized.
+- [ ] A stable Homebrew channel backed by immutable tagged source, verified SHA-256, signed and
+  notarized dual-architecture releases, and a tested upgrade-safe install flow.
 - [x] A two-minute interactive onboarding and physical shortcut verifier with safe calibration
   and automatic live settings reload.
 - [x] A reproducible demo asset generated from the real failure diagnosis, Risk Lens,
@@ -59,6 +62,9 @@ could happen before they choose to run it.
   follow-up seen last time—without claiming causality or uploading long-lived command history.
 - [x] **Environment Drift Lens:** compare safe environment/Git metadata between the last success
   and current failure to expose changed branches, virtual environments, directories, or tools.
+- [x] **Twin Terminal Diff:** explicitly pair a known-good and failing terminal, then compare
+  bounded architecture, tool-resolution, SDK, environment-digest, and Git evidence entirely
+  locally without executing resolved tools.
 - [x] **Session Checkpoints:** let users name a bounded troubleshooting session and append the
   final resolution to its Capsule.
 - [x] Local retention controls, per-session deletion, and a complete data inventory command.

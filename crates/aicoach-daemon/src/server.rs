@@ -23,8 +23,8 @@ use aicoach_ipc::{
     ClientCapabilities, ClientKind, CompletionOperation, CompletionResult, DaemonDataResult,
     DataClearScope, DataOperation, Event, EventBody, Hint, Message, PROTOCOL_VERSION,
     PrivacyReceipt, Request, RequestBody, Response, ResponseResult, RiskLensResult,
-    SafetyClassification, SessionContext, SessionId, Severity, WireProtocol, decode_incoming,
-    encode_outgoing,
+    SafetyClassification, SessionContext, SessionId, Severity, TwinDiffOperation, TwinDiffResult,
+    WireProtocol, decode_incoming, encode_outgoing,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -46,7 +46,7 @@ use crate::{
     capture::capture_screen_tail,
     state::{
         ActiveRequestKind, AnalysisJob, BeginRequestError, CheckpointError, ConnectionId,
-        FinishCommand, SessionLimits, SessionManager,
+        FinishCommand, SessionLimits, SessionManager, TwinDiffError,
     },
 };
 
@@ -999,6 +999,7 @@ impl Daemon {
                             DaemonDataResult::Inventory {
                                 sessions,
                                 source_card_cache_entries: self.source_card_cache.read().len(),
+                                twin_baselines: self.sessions.twin_baseline_count(),
                                 limits: self.sessions.data_limits(),
                             },
                             Vec::new(),
@@ -1138,6 +1139,38 @@ impl Daemon {
                     Response::ok(&request, ResponseResult::Data(Box::new(result))),
                 )
                 .await;
+            }
+            RequestBody::TwinDiff(params) => {
+                let result = match params.operation {
+                    TwinDiffOperation::Mark { name, snapshot } => self
+                        .sessions
+                        .mark_twin_baseline(&name, *snapshot)
+                        .map(|name| TwinDiffResult::Marked { name }),
+                    TwinDiffOperation::Diff { name, current } => self
+                        .sessions
+                        .diff_twin_baseline(&name, &current)
+                        .map(|(name, report)| TwinDiffResult::Diff { name, report }),
+                    TwinDiffOperation::List => Ok(TwinDiffResult::List {
+                        baselines: self.sessions.twin_baselines(),
+                    }),
+                    TwinDiffOperation::Clear { name } => self
+                        .sessions
+                        .clear_twin_baselines(name.as_deref())
+                        .map(|removed| TwinDiffResult::Cleared { removed }),
+                };
+                match result {
+                    Ok(result) => {
+                        send_response(
+                            &sender,
+                            Response::ok(&request, ResponseResult::TwinDiff(Box::new(result))),
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let (code, message) = twin_diff_error(error);
+                        send_error(&sender, &request, code, message, false).await;
+                    }
+                }
             }
             RequestBody::InsertBuffer(mut params) => {
                 if contains_terminal_control(&params.command) {
@@ -3166,6 +3199,7 @@ fn request_method(body: &RequestBody) -> &'static str {
         RequestBody::Airlock(_) => "airlock",
         RequestBody::Checkpoint(_) => "checkpoint",
         RequestBody::Data(_) => "data",
+        RequestBody::TwinDiff(_) => "twin_diff",
         RequestBody::InsertBuffer(_) => "insert_buffer",
         RequestBody::Disconnect => "disconnect",
         RequestBody::Ping => "ping",
@@ -3187,6 +3221,23 @@ fn checkpoint_error(error: CheckpointError) -> (&'static str, &'static str) {
         CheckpointError::NoActiveCheckpoint => (
             "checkpoint_not_found",
             "start a checkpoint before recording its resolution",
+        ),
+    }
+}
+
+fn twin_diff_error(error: TwinDiffError) -> (&'static str, &'static str) {
+    match error {
+        TwinDiffError::InvalidName => (
+            "invalid_twin_baseline_name",
+            "baseline name must contain 1 to 40 terminal-safe visible characters",
+        ),
+        TwinDiffError::InvalidSnapshot => (
+            "invalid_twin_snapshot",
+            "Twin Terminal snapshot exceeds safe local size or display limits",
+        ),
+        TwinDiffError::BaselineNotFound => (
+            "twin_baseline_not_found",
+            "the requested Twin Terminal baseline is not available in daemon memory",
         ),
     }
 }

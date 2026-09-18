@@ -78,9 +78,10 @@ struct DaemonInventoryReport {
     memory_only: bool,
     sessions: Vec<SessionDataSummary>,
     source_card_cache_entries: Option<usize>,
+    twin_baselines: Option<usize>,
     limits: Option<SessionDataLimits>,
     read_error: Option<String>,
-    retained_categories: [&'static str; 15],
+    retained_categories: [&'static str; 16],
     provider_boundary: &'static str,
 }
 
@@ -145,7 +146,7 @@ fn print_inventory(paths: &Paths, json: bool) -> Result<()> {
     if report.daemon_memory.available {
         let sessions = &report.daemon_memory.sessions;
         println!(
-            "Daemon memory: {} sessions, {} command records, {} chat messages",
+            "Daemon memory: {} sessions, {} command records, {} chat messages, {} Twin Terminal baselines",
             sessions.len(),
             sessions
                 .iter()
@@ -154,7 +155,8 @@ fn print_inventory(paths: &Paths, json: bool) -> Result<()> {
             sessions
                 .iter()
                 .map(|session| session.chat_messages)
-                .sum::<usize>()
+                .sum::<usize>(),
+            report.daemon_memory.twin_baselines.unwrap_or_default()
         );
         println!("  use aicoach data sessions for per-session counts");
     } else {
@@ -194,6 +196,7 @@ fn print_sessions(paths: &Paths, json: bool) -> Result<()> {
     let DaemonDataResult::Inventory {
         sessions,
         source_card_cache_entries,
+        twin_baselines,
         limits,
     } = result
     else {
@@ -205,6 +208,7 @@ fn print_sessions(paths: &Paths, json: bool) -> Result<()> {
             serde_json::to_string_pretty(&DaemonDataResult::Inventory {
                 sessions,
                 source_card_cache_entries,
+                twin_baselines,
                 limits,
             })?
         );
@@ -212,6 +216,7 @@ fn print_sessions(paths: &Paths, json: bool) -> Result<()> {
     }
     if sessions.is_empty() {
         println!("No terminal sessions are retained in daemon memory.");
+        println!("Twin Terminal baselines: {twin_baselines}");
         return Ok(());
     }
     println!(
@@ -241,6 +246,7 @@ fn print_sessions(paths: &Paths, json: bool) -> Result<()> {
     println!(
         "No command text, output, cwd, environment value, checkpoint text, or chat content is shown."
     );
+    println!("Twin Terminal baselines: {twin_baselines} (captured values are not shown)");
     Ok(())
 }
 
@@ -357,36 +363,40 @@ fn inventory(paths: &Paths) -> DataInventoryReport {
         Ok(DaemonDataResult::Inventory {
             sessions,
             source_card_cache_entries,
+            twin_baselines,
             limits,
         }) => DaemonInventoryReport {
             available: true,
             memory_only: true,
             sessions,
             source_card_cache_entries: Some(source_card_cache_entries),
+            twin_baselines: Some(twin_baselines),
             limits: Some(limits),
             read_error: None,
             retained_categories: daemon_categories(),
-            provider_boundary: "checkpoint, failure-memory, environment-drift, and control metadata are never added to provider requests; command/chat context follows privacy redaction",
+            provider_boundary: "checkpoint, failure-memory, environment-drift, Twin Terminal baselines, and control metadata are never added to provider requests; command/chat context follows privacy redaction",
         },
         Ok(DaemonDataResult::Cleared { .. }) => DaemonInventoryReport {
             available: false,
             memory_only: true,
             sessions: Vec::new(),
             source_card_cache_entries: None,
+            twin_baselines: None,
             limits: None,
             read_error: Some("daemon returned an unexpected response".to_owned()),
             retained_categories: daemon_categories(),
-            provider_boundary: "checkpoint, failure-memory, environment-drift, and control metadata are never added to provider requests; command/chat context follows privacy redaction",
+            provider_boundary: "checkpoint, failure-memory, environment-drift, Twin Terminal baselines, and control metadata are never added to provider requests; command/chat context follows privacy redaction",
         },
         Err(error) => DaemonInventoryReport {
             available: false,
             memory_only: true,
             sessions: Vec::new(),
             source_card_cache_entries: None,
+            twin_baselines: None,
             limits: None,
             read_error: Some(format!("{error:#}")),
             retained_categories: daemon_categories(),
-            provider_boundary: "checkpoint, failure-memory, environment-drift, and control metadata are never added to provider requests; command/chat context follows privacy redaction",
+            provider_boundary: "checkpoint, failure-memory, environment-drift, Twin Terminal baselines, and control metadata are never added to provider requests; command/chat context follows privacy redaction",
         },
     };
 
@@ -527,7 +537,7 @@ fn inventory(paths: &Paths) -> DataInventoryReport {
     }
 }
 
-const fn daemon_categories() -> [&'static str; 15] {
+const fn daemon_categories() -> [&'static str; 16] {
     [
         "session ID",
         "tty",
@@ -540,6 +550,7 @@ const fn daemon_categories() -> [&'static str; 15] {
         "bounded daemon chat",
         "checkpoint",
         "last-success environment baseline",
+        "memory-only Twin Terminal baselines",
         "active request IDs and cancellation handles",
         "per-session Provider access (Session Airlock)",
         "content-free discarded FINISH markers",
@@ -840,9 +851,10 @@ fn print_removed(label: &str, removed: &DataRemovalSummary) {
         removed.environment_values
     );
     println!(
-        "  {} checkpoints, {} baselines, {} in-flight commands, {} AI requests",
+        "  {} checkpoints, {} environment baselines, {} Twin Terminal baselines, {} in-flight commands, {} AI requests",
         removed.checkpoints,
         removed.environment_baselines,
+        removed.twin_baselines,
         removed.in_flight_commands,
         removed.active_ai_requests
     );

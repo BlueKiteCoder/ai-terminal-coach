@@ -3,9 +3,12 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use aicoach_core::{AnalysisCoverage, RiskLensReport, RiskLevel, SourceCard};
+use aicoach_core::{
+    AnalysisCoverage, RiskLensReport, RiskLevel, SourceCard, TwinTerminalDiffReport,
+    TwinTerminalSnapshot,
+};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 4 * 1024 * 1024;
 pub const SHELL_ENVIRONMENT_ALLOWLIST: [&str; 7] = [
     "LANG",
@@ -272,6 +275,30 @@ pub struct DataParams {
     pub exclude_active_command: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TwinDiffOperation {
+    Mark {
+        name: String,
+        snapshot: Box<TwinTerminalSnapshot>,
+    },
+    Diff {
+        name: String,
+        current: Box<TwinTerminalSnapshot>,
+    },
+    List,
+    Clear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwinDiffParams {
+    #[serde(flatten)]
+    pub operation: TwinDiffOperation,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InsertMode {
@@ -337,6 +364,7 @@ pub enum RequestBody {
     Airlock(AirlockParams),
     Checkpoint(CheckpointParams),
     Data(DataParams),
+    TwinDiff(TwinDiffParams),
     InsertBuffer(InsertBufferParams),
     Disconnect,
     Ping,
@@ -508,6 +536,8 @@ pub struct DataRemovalSummary {
     pub active_ai_requests: usize,
     pub pending_failures: usize,
     pub source_card_cache_entries: usize,
+    #[serde(default)]
+    pub twin_baselines: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,11 +546,38 @@ pub enum DaemonDataResult {
     Inventory {
         sessions: Vec<SessionDataSummary>,
         source_card_cache_entries: usize,
+        #[serde(default)]
+        twin_baselines: usize,
         limits: SessionDataLimits,
     },
     Cleared {
         scope: DataClearScope,
         removed: DataRemovalSummary,
+    },
+}
+
+/// Content-free metadata for one memory-only Twin Terminal baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwinBaselineSummary {
+    pub name: String,
+    pub age_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum TwinDiffResult {
+    Marked {
+        name: String,
+    },
+    Diff {
+        name: String,
+        report: TwinTerminalDiffReport,
+    },
+    List {
+        baselines: Vec<TwinBaselineSummary>,
+    },
+    Cleared {
+        removed: usize,
     },
 }
 
@@ -547,6 +604,7 @@ pub enum ResponseResult {
         checkpoint: Option<Box<SessionCheckpoint>>,
     },
     Data(Box<DaemonDataResult>),
+    TwinDiff(Box<TwinDiffResult>),
     Pong {
         unix_ms: u64,
     },
@@ -926,6 +984,7 @@ mod tests {
                 provider_access_enabled: false,
             }],
             source_card_cache_entries: 1,
+            twin_baselines: 2,
             limits: SessionDataLimits {
                 max_commands_per_session: 30,
                 max_output_chars_per_command: 20_000,
@@ -948,6 +1007,50 @@ mod tests {
             unreachable!()
         };
         assert!(sessions[0].provider_access_enabled);
+    }
+
+    #[test]
+    fn twin_diff_requests_and_content_free_list_round_trip() {
+        let request = Request::new(
+            None,
+            RequestBody::TwinDiff(TwinDiffParams {
+                operation: TwinDiffOperation::Mark {
+                    name: "known-good".to_owned(),
+                    snapshot: Box::new(TwinTerminalSnapshot::new("/work")),
+                },
+            }),
+        );
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains(r#""method":"twin_diff""#));
+        assert!(encoded.contains(r#""action":"mark""#));
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
+
+        let result = TwinDiffResult::List {
+            baselines: vec![TwinBaselineSummary {
+                name: "known-good".to_owned(),
+                age_ms: 250,
+            }],
+        };
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(encoded.contains(r#""name":"known-good""#));
+        assert!(encoded.contains(r#""age_ms":250"#));
+        for forbidden in ["snapshot", "cwd", "commands", "sensitive_environment"] {
+            assert!(!encoded.contains(forbidden));
+        }
+        assert_eq!(
+            serde_json::from_str::<TwinDiffResult>(&encoded).unwrap(),
+            result
+        );
+
+        let clear = Request::new(
+            None,
+            RequestBody::TwinDiff(TwinDiffParams {
+                operation: TwinDiffOperation::Clear { name: None },
+            }),
+        );
+        let encoded = serde_json::to_string(&clear).unwrap();
+        assert!(encoded.contains(r#""action":"clear""#));
+        assert!(!encoded.contains(r#""name""#));
     }
 
     #[test]

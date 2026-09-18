@@ -6,7 +6,7 @@ if [[ -n ${AICOACH_ZSH_LOADED:-} ]]; then
   # Same-version sourcing only refreshes generated settings. A newer script
   # closes the old socket and replaces every function/widget in-place.
   if [[ ${AICOACH_INTEGRATION_VERSION:-0} == <-> ]] &&
-      (( AICOACH_INTEGRATION_VERSION >= 4 )) &&
+      (( AICOACH_INTEGRATION_VERSION >= 5 )) &&
       (( $+functions[_aicoach_reload_settings] )); then
     _aicoach_reload_settings
     return 0
@@ -15,7 +15,17 @@ if [[ -n ${AICOACH_ZSH_LOADED:-} ]]; then
   unset AICOACH_ZSH_LOADED
 fi
 typeset -g AICOACH_ZSH_LOADED=1
-typeset -gx AICOACH_INTEGRATION_VERSION=4
+typeset -gx AICOACH_INTEGRATION_VERSION=5
+
+# Export the architecture of this Zsh process for Twin Terminal Diff. The CLI
+# may be a different architecture, so it must not infer this from itself.
+typeset -gx AICOACH_SHELL_ARCH=${CPUTYPE:-}
+unset AICOACH_SHELL_TRANSLATED
+typeset -g _AICOACH_SHELL_TRANSLATED=$(command /usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null)
+if [[ $_AICOACH_SHELL_TRANSLATED == 0 || $_AICOACH_SHELL_TRANSLATED == 1 ]]; then
+  typeset -gx AICOACH_SHELL_TRANSLATED=$_AICOACH_SHELL_TRANSLATED
+fi
+unset _AICOACH_SHELL_TRANSLATED
 
 # Remember settings explicitly supplied before this file was sourced. Generated
 # config can then hot-reload without overriding intentional .zshrc customizations.

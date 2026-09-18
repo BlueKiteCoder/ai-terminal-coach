@@ -4,7 +4,7 @@ AI Terminal Coach uses a versioned local protocol between Zsh, the CLI, the TUI,
 This guide explains the contract contributors must preserve. The authoritative types are in
 `crates/aicoach-ipc/src/protocol.rs`; codecs and frame handling live beside them.
 
-Current protocol version: **4**
+Current protocol version: **5**
 
 ## Transport
 
@@ -75,6 +75,7 @@ error code, and structured fields.
 | `airlock` | yes | Inspect, seal, or open the session's provider boundary | Seal atomically blocks new provider work and cancels active work |
 | `checkpoint` | yes | Start, resolve, inspect, or clear a marker | Marker never enters provider prompts |
 | `data` | varies | Inventory or clear typed local-data scopes | Inventory contains counts, never content |
+| `twin_diff` | no | Mark, compare, list, or clear cross-terminal baselines | JSON-only, daemon-memory-only, never provider-bound |
 | `insert_buffer` | yes | Ask the daemon to hand a visible proposal to ZLE | Daemon recomputes safety classification |
 | `disconnect` | optional | Detach the current connection/session route | Retention policy still applies |
 | `ping` | no | Liveness check | No session mutation |
@@ -133,7 +134,8 @@ session starts open again.
 - Only `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `COLORTERM`, `VIRTUAL_ENV`, and
   `CONDA_DEFAULT_ENV` can enter retained environment context. Values are control-free and bounded.
 - Command/output/path/chat content is redacted at the provider boundary. Risk Lens, Source Cards,
-  Failure Fingerprints, Environment Drift, checkpoints, and data inventory run locally.
+  Failure Fingerprints, Environment Drift, Twin Terminal Diff, checkpoints, and data inventory run
+  locally.
 - Provider responses are untrusted input: structured outputs are validated, terminal controls are
   stripped, cursor offsets are clamped, and command proposals are rescanned.
 - Error responses must describe a safe error kind without echoing credentials, HTTP bodies, prompts,
@@ -186,6 +188,26 @@ The flag is intentionally memory-only: manually restarting the daemon resets all
 new or re-created session starts open. The TUI displays the state continuously; shells never receive
 the asynchronous `airlock_changed` observer event.
 
+### Twin Terminal Diff
+
+`twin_diff` compares two explicitly captured, bounded terminal snapshots to explain why the same
+workflow behaves differently across real terminals. `mark` stores a named known-good snapshot;
+`diff` compares a current snapshot with it; `list` returns names and ages only; `clear` removes one
+or all snapshots. The daemon keeps at most eight baselines in memory, replaces a duplicate name,
+and discards all of them on restart or an all-transient data clear.
+
+Snapshots may contain home-normalized cwd/tool paths, terminal and Zsh-supplied architecture metadata,
+Homebrew/Xcode/Python/Conda observations, repository/branch metadata read from a non-symlink `.git`
+directory or bounded regular gitfile/HEAD, and resolved paths for a fixed command allowlist. A
+gitfile is used only to locate the target Git directory's HEAD (for example, a linked worktree or
+submodule); handle-relative reads reject symlinks and
+non-regular metadata files. Capture never starts Git or reads repository config and attributes.
+Environment values such as `PATH`, `SDKROOT`, and
+compiler flags cross the
+IPC boundary only as domain-separated SHA-256 digests; diff responses reveal only that a value was
+present or changed, never the value or digest. No snapshot, report, or baseline is added to a
+provider request, log, persistent history, Capsule, or Zsh frame.
+
 ## Compatibility rules
 
 An additive field is compatible when old readers can ignore it and new readers provide a serde
@@ -195,6 +217,8 @@ the minimum compatible release.
 Protocol v3 is the minimum version for `privacy_receipt`. Protocol v4 adds `airlock`,
 `airlock_changed`, and the default-true provider-access field in context/inventory. The enum variants
 required a bump so exhaustive v3 clients fail the handshake instead of misinterpreting the stream.
+Protocol v5 adds the JSON-only `twin_diff` request/result variants and content-free baseline counts;
+v4 clients fail the handshake rather than treating a cross-terminal report as another result.
 
 Bump `PROTOCOL_VERSION` when changing an existing serialized field name or type, removing a field or
 variant, changing envelope/tag shape, changing identifier meaning, or making previously optional
