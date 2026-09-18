@@ -7,6 +7,14 @@ All notable user-visible changes are recorded here. This project follows
 
 ### Added
 
+- **Twin Terminal Diff** lets one terminal mark a known-good, daemon-memory-only environment and
+  another compare its bounded local evidence with `aicoach twin diff`. It covers home-normalized
+  paths, architecture/Rosetta, Homebrew/Xcode, Python/Conda, Git repository/branch, and fixed command
+  resolution without calling AI or executing resolved tools; private environment values cross IPC
+  only as domain-separated digests and are never shown in reports. The calling Zsh supplies its own
+  architecture metadata, while Git repository/branch evidence is read only from a non-symlink
+  `.git` directory or bounded regular gitfile/HEAD without starting Git or consulting repository
+  configuration and attributes.
 - `aicoach config setup` now provides a provider-neutral first-run wizard for Base URL, one shared
   model by default or three advanced model choices, target-scoped credential review, and optional
   first-time macOS Keychain storage. Reusing a credential for a new or changed target, or from a
@@ -33,7 +41,7 @@ All notable user-visible changes are recorded here. This project follows
   Base URL or `api_key_env` requires rerunning setup. For a matching target, `set-key` can migrate
   an authorized environment credential to Keychain, while disabled or unreviewed targets still
   require setup.
-- Contributor architecture and IPC v3 guides define module ownership, request/event routing,
+- Contributor architecture and versioned IPC guides define module ownership, request/event routing,
   extension recipes, compatibility rules, and the non-negotiable provider and ZLE boundaries.
 - Native performance dashboards measure Zsh hook latency, warmed executable startup, and stripped
   binary size on `main` and dual-architecture release checks, failing when public budgets regress.
@@ -97,6 +105,9 @@ All notable user-visible changes are recorded here. This project follows
 
 ## [0.1.0] - 2026-09-04
 
+> Source milestone only: no `v0.1.0` tag or GitHub Release was published. The first downloadable
+> binary release remains pending Developer ID signing and Apple notarization.
+
 ### Added
 
 - Local-first macOS/Zsh failure analysis with bounded, redacted terminal context.
@@ -118,5 +129,4 @@ All notable user-visible changes are recorded here. This project follows
 - Suggestions remain visible and non-executing, and AI Terminal Coach never intercepts Enter.
 - Provider-bound content is redacted by default; Session Capsules are always redacted.
 
-[Unreleased]: https://github.com/BlueKiteCoder/ai-terminal-coach/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/BlueKiteCoder/ai-terminal-coach/releases/tag/v0.1.0
+[Unreleased]: https://github.com/BlueKiteCoder/ai-terminal-coach/commits/main

@@ -61,7 +61,14 @@ print() {
 }
 source "${0:A:h:h}/shell/aicoach.zsh"
 
-assert_eq "$AICOACH_INTEGRATION_VERSION" '4'
+assert_eq "$AICOACH_INTEGRATION_VERSION" '5'
+assert_eq "$AICOACH_SHELL_ARCH" "$CPUTYPE"
+if (( ${+AICOACH_SHELL_TRANSLATED} )); then
+  [[ $AICOACH_SHELL_TRANSLATED == 0 || $AICOACH_SHELL_TRANSLATED == 1 ]] || {
+    builtin print -u2 -r -- 'FAIL: shell translation marker must be 0 or 1'
+    test_failed=1
+  }
+fi
 assert_eq "$AICOACH_LANGUAGE" 'en-US'
 _aicoach_text thinking
 assert_eq "$REPLY" 'Thinking…'
@@ -132,7 +139,7 @@ upgrade_probe=$(
       print -r -- "$AICOACH_INTEGRATION_VERSION:$AICOACH_STATUS_REQUEST_ID:$AICOACH_CHAT_KEY_USER_SET"
     '
 )
-assert_eq "$upgrade_probe" '4:upgrade-probe:0'
+assert_eq "$upgrade_probe" '5:upgrade-probe:0'
 
 # An explicit CLI stop creates this marker before closing the socket. Prompts
 # and new terminal tabs must respect it instead of immediately spawning start.

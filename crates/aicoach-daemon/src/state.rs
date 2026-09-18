@@ -1,15 +1,18 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use aicoach_core::{EnvironmentSnapshot, GitContext, strip_terminal_sequences};
+use aicoach_core::{
+    EnvironmentSnapshot, GitContext, TwinTerminalDiffReport, TwinTerminalSnapshot,
+    compare_twin_terminal_snapshots, strip_terminal_sequences,
+};
 use aicoach_ipc::{
     CommandFinishedParams, CommandId, CommandStartedParams, ContextCommand, DataRemovalSummary,
     RegisterSessionParams, RequestId, SessionCheckpoint, SessionContext, SessionDataLimits,
-    SessionDataSummary, SessionId, sanitize_shell_environment,
+    SessionDataSummary, SessionId, TwinBaselineSummary, sanitize_shell_environment,
 };
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -17,6 +20,13 @@ use uuid::Uuid;
 
 const MAX_CHECKPOINT_NAME_CHARS: usize = 120;
 const MAX_CHECKPOINT_RESOLUTION_CHARS: usize = 2_000;
+const MAX_TWIN_BASELINES: usize = 8;
+const MAX_TWIN_BASELINE_NAME_CHARS: usize = 40;
+const MAX_TWIN_SNAPSHOT_PATH_CHARS: usize = 4_096;
+const MAX_TWIN_SNAPSHOT_TEXT_CHARS: usize = 256;
+const MAX_TWIN_TOOL_NAME_CHARS: usize = 64;
+const MAX_TWIN_ENVIRONMENT_NAME_CHARS: usize = 128;
+const MAX_TWIN_SNAPSHOT_MAP_ENTRIES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub Uuid);
@@ -118,6 +128,13 @@ pub enum CheckpointError {
     NoActiveCheckpoint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwinDiffError {
+    InvalidName,
+    InvalidSnapshot,
+    BaselineNotFound,
+}
+
 #[derive(Debug)]
 struct StartedCommand {
     command: String,
@@ -128,6 +145,13 @@ struct StartedCommand {
 struct ActiveRequest {
     kind: ActiveRequestKind,
     cancellation: CancellationToken,
+}
+
+#[derive(Debug)]
+struct TwinBaseline {
+    name: String,
+    snapshot: TwinTerminalSnapshot,
+    marked_at: Instant,
 }
 
 #[derive(Debug)]
@@ -155,6 +179,7 @@ struct Session {
 struct State {
     sessions: HashMap<SessionId, Session>,
     focused: Option<SessionId>,
+    twin_baselines: VecDeque<TwinBaseline>,
 }
 
 #[derive(Debug, Clone)]
@@ -502,6 +527,90 @@ impl SessionManager {
         sessions
     }
 
+    pub fn mark_twin_baseline(
+        &self,
+        name: &str,
+        snapshot: TwinTerminalSnapshot,
+    ) -> Result<String, TwinDiffError> {
+        let name = normalize_twin_baseline_name(name)?;
+        validate_twin_snapshot(&snapshot)?;
+        let mut state = self.state.lock();
+        if let Some(position) = state
+            .twin_baselines
+            .iter()
+            .position(|baseline| baseline.name == name)
+        {
+            state.twin_baselines.remove(position);
+        } else if state.twin_baselines.len() >= MAX_TWIN_BASELINES {
+            state.twin_baselines.pop_front();
+        }
+        state.twin_baselines.push_back(TwinBaseline {
+            name: name.clone(),
+            snapshot,
+            marked_at: Instant::now(),
+        });
+        Ok(name)
+    }
+
+    pub fn diff_twin_baseline(
+        &self,
+        name: &str,
+        current: &TwinTerminalSnapshot,
+    ) -> Result<(String, TwinTerminalDiffReport), TwinDiffError> {
+        let name = normalize_twin_baseline_name(name)?;
+        validate_twin_snapshot(current)?;
+        let state = self.state.lock();
+        let baseline = state
+            .twin_baselines
+            .iter()
+            .find(|baseline| baseline.name == name)
+            .ok_or(TwinDiffError::BaselineNotFound)?;
+        Ok((
+            name,
+            compare_twin_terminal_snapshots(&baseline.snapshot, current),
+        ))
+    }
+
+    pub fn twin_baselines(&self) -> Vec<TwinBaselineSummary> {
+        self.state
+            .lock()
+            .twin_baselines
+            .iter()
+            .map(|baseline| TwinBaselineSummary {
+                name: baseline.name.clone(),
+                age_ms: baseline
+                    .marked_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            })
+            .collect()
+    }
+
+    pub fn twin_baseline_count(&self) -> usize {
+        self.state.lock().twin_baselines.len()
+    }
+
+    pub fn clear_twin_baselines(&self, name: Option<&str>) -> Result<usize, TwinDiffError> {
+        let mut state = self.state.lock();
+        let Some(name) = name else {
+            let removed = state.twin_baselines.len();
+            state.twin_baselines.clear();
+            return Ok(removed);
+        };
+        let name = normalize_twin_baseline_name(name)?;
+        let Some(position) = state
+            .twin_baselines
+            .iter()
+            .position(|baseline| baseline.name == name)
+        else {
+            return Ok(0);
+        };
+        state.twin_baselines.remove(position);
+        Ok(1)
+    }
+
     pub fn data_limits(&self) -> SessionDataLimits {
         SessionDataLimits {
             max_commands_per_session: self.limits.max_commands,
@@ -573,6 +682,8 @@ impl SessionManager {
             );
             session.last_accessed = Instant::now();
         }
+        removed.twin_baselines = state.twin_baselines.len();
+        state.twin_baselines.clear();
         affected.sort_unstable();
         (affected, removed)
     }
@@ -840,6 +951,104 @@ fn bounded_checkpoint_text(value: &str, multiline: bool, max_chars: usize) -> Op
     Some(safe.chars().take(max_chars).collect())
 }
 
+fn normalize_twin_baseline_name(value: &str) -> Result<String, TwinDiffError> {
+    let trimmed = value.trim();
+    let safe = strip_terminal_sequences(trimmed, false);
+    let count = safe.chars().count();
+    if safe != trimmed || !(1..=MAX_TWIN_BASELINE_NAME_CHARS).contains(&count) {
+        return Err(TwinDiffError::InvalidName);
+    }
+    Ok(safe)
+}
+
+fn validate_twin_snapshot(snapshot: &TwinTerminalSnapshot) -> Result<(), TwinDiffError> {
+    let valid = valid_twin_path(&snapshot.cwd)
+        && snapshot
+            .terminal_program
+            .as_deref()
+            .is_none_or(|value| valid_twin_text(value, MAX_TWIN_SNAPSHOT_TEXT_CHARS))
+        && snapshot
+            .shell_architecture
+            .as_deref()
+            .is_none_or(|value| valid_twin_text(value, MAX_TWIN_SNAPSHOT_TEXT_CHARS))
+        && snapshot
+            .homebrew_prefix
+            .as_deref()
+            .is_none_or(valid_twin_path)
+        && snapshot
+            .xcode_developer_dir
+            .as_deref()
+            .is_none_or(valid_twin_path)
+        && snapshot
+            .virtual_environment
+            .as_deref()
+            .is_none_or(valid_twin_path)
+        && snapshot
+            .conda_environment
+            .as_deref()
+            .is_none_or(|value| valid_twin_text(value, MAX_TWIN_SNAPSHOT_TEXT_CHARS))
+        && snapshot.git.as_ref().is_none_or(|git| {
+            valid_twin_path(&git.repository)
+                && git
+                    .branch
+                    .as_deref()
+                    .is_none_or(|value| valid_twin_text(value, MAX_TWIN_SNAPSHOT_TEXT_CHARS))
+        })
+        && snapshot.commands.len() <= MAX_TWIN_SNAPSHOT_MAP_ENTRIES
+        && snapshot.commands.iter().all(|(name, command)| {
+            valid_twin_tool_name(name)
+                && command.resolved_path.as_deref().is_none_or(valid_twin_path)
+        })
+        && snapshot.sensitive_environment.len() <= MAX_TWIN_SNAPSHOT_MAP_ENTRIES
+        && snapshot
+            .sensitive_environment
+            .keys()
+            .all(|name| valid_twin_environment_name(name));
+    if valid {
+        Ok(())
+    } else {
+        Err(TwinDiffError::InvalidSnapshot)
+    }
+}
+
+fn valid_twin_path(path: &Path) -> bool {
+    let Some(value) = path.to_str() else {
+        return false;
+    };
+    !value.is_empty()
+        && value.chars().count() <= MAX_TWIN_SNAPSHOT_PATH_CHARS
+        && strip_terminal_sequences(value, false) == value
+}
+
+fn valid_twin_text(value: &str, max_chars: usize) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.chars().count() <= max_chars
+        && strip_terminal_sequences(value, false) == value
+}
+
+fn valid_twin_tool_name(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    value.chars().count() <= MAX_TWIN_TOOL_NAME_CHARS
+        && (first.is_ascii_alphanumeric() || first == '_')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+' | '.')
+        })
+}
+
+fn valid_twin_environment_name(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    value.chars().count() <= MAX_TWIN_ENVIRONMENT_NAME_CHARS
+        && (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 fn session_data_summary(session: &Session) -> SessionDataSummary {
     SessionDataSummary {
         session_id: session.id,
@@ -932,6 +1141,7 @@ fn accumulate_removed(total: &mut DataRemovalSummary, removed: DataRemovalSummar
     total.active_ai_requests += removed.active_ai_requests;
     total.pending_failures += removed.pending_failures;
     total.source_card_cache_entries += removed.source_card_cache_entries;
+    total.twin_baselines += removed.twin_baselines;
 }
 
 fn sole_started_command_id(session: &Session) -> Option<CommandId> {
@@ -1759,5 +1969,142 @@ mod tests {
         assert!(affected.contains(&disk_only_chat));
         assert_eq!(removed.sessions_affected, 1);
         assert_eq!(removed.chat_messages, 1);
+    }
+
+    #[test]
+    fn twin_baselines_are_bounded_replaced_and_compared_in_memory() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let mut first = TwinTerminalSnapshot::new("/known-good");
+        first.shell_architecture = Some("x86_64".to_owned());
+        assert_eq!(
+            manager.mark_twin_baseline("  primary  ", first).unwrap(),
+            "primary"
+        );
+
+        let mut replacement = TwinTerminalSnapshot::new("/known-good");
+        replacement.shell_architecture = Some("arm64".to_owned());
+        manager
+            .mark_twin_baseline("primary", replacement.clone())
+            .unwrap();
+        assert_eq!(manager.twin_baseline_count(), 1);
+        let (_, identical) = manager.diff_twin_baseline("primary", &replacement).unwrap();
+        assert!(identical.is_empty());
+
+        for index in 0..MAX_TWIN_BASELINES {
+            manager
+                .mark_twin_baseline(
+                    &format!("terminal-{index}"),
+                    TwinTerminalSnapshot::new(format!("/terminal/{index}")),
+                )
+                .unwrap();
+        }
+        assert_eq!(manager.twin_baseline_count(), MAX_TWIN_BASELINES);
+        assert_eq!(
+            manager.diff_twin_baseline("primary", &replacement),
+            Err(TwinDiffError::BaselineNotFound)
+        );
+        let summaries = manager.twin_baselines();
+        assert_eq!(summaries.len(), MAX_TWIN_BASELINES);
+        assert!(summaries.iter().all(|summary| summary.name != "primary"));
+    }
+
+    #[test]
+    fn twin_baseline_names_are_safe_and_only_global_clear_removes_them() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let session = SessionId::new();
+        manager.register(ConnectionId::new(), registration(session));
+        for invalid in ["", "   ", "bad\nname", "bad\u{1b}[31mname", &"x".repeat(41)] {
+            assert_eq!(
+                manager.mark_twin_baseline(invalid, TwinTerminalSnapshot::new("/work")),
+                Err(TwinDiffError::InvalidName)
+            );
+        }
+
+        manager
+            .mark_twin_baseline("good", TwinTerminalSnapshot::new("/work"))
+            .unwrap();
+        manager.clear_session_data(session, false).unwrap();
+        assert_eq!(manager.twin_baseline_count(), 1);
+
+        let (_, removed) = manager.clear_all_transient(false);
+        assert_eq!(removed.twin_baselines, 1);
+        assert_eq!(manager.twin_baseline_count(), 0);
+    }
+
+    #[test]
+    fn twin_snapshots_are_strictly_bounded_at_the_state_boundary() {
+        let manager = SessionManager::new(SessionLimits::default());
+        let mut invalid = Vec::new();
+
+        invalid.push(TwinTerminalSnapshot::new("/tmp/bad\u{1b}[31mpath"));
+        invalid.push(TwinTerminalSnapshot::new(
+            "x".repeat(MAX_TWIN_SNAPSHOT_PATH_CHARS + 1),
+        ));
+
+        let mut terminal_control = TwinTerminalSnapshot::new("/work");
+        terminal_control.terminal_program = Some("Terminal\nspoof".to_owned());
+        invalid.push(terminal_control);
+
+        let mut long_branch = TwinTerminalSnapshot::new("/work");
+        long_branch.git = Some(aicoach_core::TwinTerminalGitSnapshot {
+            repository: PathBuf::from("/repo"),
+            branch: Some("b".repeat(MAX_TWIN_SNAPSHOT_TEXT_CHARS + 1)),
+            ..aicoach_core::TwinTerminalGitSnapshot::default()
+        });
+        invalid.push(long_branch);
+
+        let mut too_many_commands = TwinTerminalSnapshot::new("/work");
+        too_many_commands.commands = (0..=MAX_TWIN_SNAPSHOT_MAP_ENTRIES)
+            .map(|index| {
+                (
+                    format!("tool{index}"),
+                    aicoach_core::TwinTerminalCommandSnapshot::default(),
+                )
+            })
+            .collect();
+        invalid.push(too_many_commands);
+
+        let mut unsafe_tool = TwinTerminalSnapshot::new("/work");
+        unsafe_tool.commands.insert(
+            "tool\nspoof".to_owned(),
+            aicoach_core::TwinTerminalCommandSnapshot::default(),
+        );
+        invalid.push(unsafe_tool);
+
+        let mut too_many_environment_names = TwinTerminalSnapshot::new("/work");
+        too_many_environment_names.sensitive_environment = (0..=MAX_TWIN_SNAPSHOT_MAP_ENTRIES)
+            .map(|index| {
+                (
+                    format!("TOKEN_{index}"),
+                    aicoach_core::SensitiveEnvironmentValue::present(),
+                )
+            })
+            .collect();
+        invalid.push(too_many_environment_names);
+
+        let mut unsafe_environment_name = TwinTerminalSnapshot::new("/work");
+        unsafe_environment_name.sensitive_environment.insert(
+            "TOKEN-NAME".to_owned(),
+            aicoach_core::SensitiveEnvironmentValue::present(),
+        );
+        invalid.push(unsafe_environment_name);
+
+        for snapshot in invalid {
+            assert_eq!(
+                manager.mark_twin_baseline("invalid", snapshot),
+                Err(TwinDiffError::InvalidSnapshot)
+            );
+        }
+        assert_eq!(manager.twin_baseline_count(), 0);
+
+        manager
+            .mark_twin_baseline("good", TwinTerminalSnapshot::new("/work"))
+            .unwrap();
+        let mut invalid_current = TwinTerminalSnapshot::new("/work");
+        invalid_current.conda_environment = Some("safe\u{202e}spoof".to_owned());
+        assert_eq!(
+            manager.diff_twin_baseline("good", &invalid_current),
+            Err(TwinDiffError::InvalidSnapshot)
+        );
     }
 }

@@ -61,6 +61,9 @@ Terminal.app / iTerm2 / 其他 macOS 终端
 - **Environment Drift Lens** 在失败时对比当前状态与本 session 最近一次成功命令：
   工作目录、Python/Conda 环境，以及可安全观察到的 Git 仓库、分支和工作区计数；只在
   本机显示变化，不读取文件内容，也不把对比报告加入 AI 请求。
+- **Twin Terminal Diff** 让“能运行”的终端标记一个内存基线，再由“不能运行”的终端
+  一键比较架构/Rosetta、Homebrew/Xcode、Python/Conda、Git 仓库/分支和固定工具解析路径。
+  全程不调用 AI、不执行被解析到的工具；PATH/SDK/编译 flags 只比较不可逆摘要。
 - 本地 Safety Engine 分级识别 `rm -rf /`、根目录/家目录递归删除、`mkfs`、
   `dd`、`diskutil eraseDisk`、`git reset --hard`、`git clean -fd`、SQL DROP、
   `chmod -R 777`、强制 kill、fork bomb、下载后直接 pipe 到 shell 等。当前行为是
@@ -101,7 +104,23 @@ Terminal.app / iTerm2 / 其他 macOS 终端
 核心 Shell 功能只依赖 Zsh，因此 Warp、Alacritty、Kitty、WezTerm 也可使用命令
 分析、AI completion 和快捷问答；独立窗口会回退到 Terminal.app。
 
-## 从源码安装
+## Homebrew HEAD 预览安装
+
+公开 tap 提供一条命令的源码构建预览：
+
+```zsh
+brew install --HEAD BlueKiteCoder/aicoach/aicoach
+aicoach install
+aicoach onboard
+```
+
+这个通道直接从当前 `main` 构建，不是稳定版本，也不提供已签名或公证的 Release 二进制。
+Homebrew 只安装程序与支持文件；只有显式运行 `aicoach install` 才会修改 Zsh 集成并启动
+daemon。源码构建要求当前 macOS 对应的 Xcode Command Line Tools；若 Homebrew 报告 CLT
+过旧，请先在“系统设置 → 通用 → 软件更新”中更新。预览通道说明与 Formula 源码见
+[`BlueKiteCoder/homebrew-aicoach`](https://github.com/BlueKiteCoder/homebrew-aicoach)。
+
+## 从源码手工安装
 
 ```zsh
 cargo build --release --locked
@@ -511,6 +530,30 @@ modified/staged/untracked/conflict/ahead/behind 计数。没有变化就保持�
 当前 daemon session，不写入 Failure Fingerprints 文件；Git 探针超时或尚未完成时会省略
 该项，不会猜测结果。对比报告只发给当前终端/Coach 界面，不会加入 provider prompt。
 
+## Twin Terminal Diff：这边能跑，那边为什么不能
+
+在正常终端标记一个有名字的基线，再到异常终端比较：
+
+```zsh
+# 正常终端
+aicoach twin mark --name working
+
+# 异常终端
+aicoach twin diff --against working
+```
+
+报告只列出发生变化的项目。调用终端的架构/Rosetta 状态由已安装的 Zsh 集成提供；若尚未
+加载集成则安全地省略，不会拿 CLI 自身架构冒充。它解析固定的常用工具路径，但不会为了
+探测版本而运行 PATH 中的程序；Git 信息只读取不跟随符号链接的 `.git` 目录或有界普通
+gitfile，以及有界普通 HEAD；gitfile 仅用于定位目标 Git 目录的 HEAD（例如 linked
+worktree 或 submodule）。它不启动 Git，也不读取仓库配置或 attributes，因此不会触发
+hook/filter。用户目录会显示成 `$HOME`。
+`PATH`、`SDKROOT`、
+`DEVELOPER_DIR` 和编译 flags 等私有值在进入本地 IPC 前就变成域分离 SHA-256，报告只会说
+“发生变化”，不会显示原值或摘要。最多保留 8 个基线，全部只存在于 daemon 内存；
+`aicoach twin list` 可查看名称与年龄，`aicoach twin clear` 或 `aicoach data clear all`
+可清除，daemon 重启也会自动清空。
+
 ## 配置
 
 配置文件：`~/.config/aicoach/config.toml`。
@@ -544,8 +587,9 @@ retention_days = 30
 resolution_window_minutes = 10
 ```
 
-Daemon 不把完整 Terminal history 持久化；Session Checkpoints 和 Environment Drift 基线
-只存在于 daemon 内存，Failure Fingerprints 的例外边界如上所述且可完整查看和删除。
+Daemon 不把完整 Terminal history 持久化；Session Checkpoints、Environment Drift 与
+Twin Terminal 基线只存在于 daemon 内存，Failure Fingerprints 的例外边界如上所述且可
+完整查看和删除。
 日志只记录请求类型、session/request ID、状态和错误种类，不记录命令输出、提示词、
 API key 或响应正文。
 
@@ -563,6 +607,7 @@ aicoach logs [-n 100] [--follow]
 aicoach capsule [--last 20] [--failed-only] [--copy] [--output FILE]
 aicoach checkpoint [--session UUID] [start NAME | resolve [RESOLUTION] | status [--json] | clear]
 aicoach airlock [--session UUID] [status [--json] | seal | open]
+aicoach twin [mark [--name NAME] | diff [--against NAME] [--json] | list [--json] | clear [--name NAME]]
 aicoach data [status [--json] | sessions [--json] | clear session|history|fingerprints|logs|all]
 aicoach memory [status [--json] | list [--json] | clear]
 aicoach toggle [--session UUID] [--tty /dev/ttys001]
@@ -618,30 +663,25 @@ aicoach logs -n 200
 
 ## Homebrew
 
-在首个签名、公证的公开 Release 和独立 tap 上线前，项目不宣称存在可用的稳定
-Homebrew 安装入口；请使用上面的“从源码安装”。
-[`homebrew/aicoach.rb`](homebrew/aicoach.rb) 是供维护者在临时 tap 中验证的 HEAD-only
-开发 Formula，而 Homebrew 6 已不接受直接从任意本地路径安装 Formula。
-
-维护者可这样测试：
+公开的 [`BlueKiteCoder/homebrew-aicoach`](https://github.com/BlueKiteCoder/homebrew-aicoach)
+是 **HEAD 源码构建预览通道**：
 
 ```zsh
-brew tap-new --no-git BlueKiteCoder/aicoach-dev
-install -m 0644 homebrew/aicoach.rb \
-  "$(brew --repository BlueKiteCoder/aicoach-dev)/Formula/aicoach.rb"
-brew install --HEAD BlueKiteCoder/aicoach-dev/aicoach
+brew install --HEAD BlueKiteCoder/aicoach/aicoach
 ```
+
+它会从当前 `main` 拉取源码并在本机编译，不是稳定版本，也不是签名、公证的 Release
+二进制。预览可能包含尚未发布的行为变化；项目尚未宣称稳定 Homebrew 发布已经完成。
 
 Formula 会先在有网络的 `fetch` 阶段缓存锁定依赖，再在无网络的安装阶段构建。生成的
 LaunchAgent 使用 Homebrew 的稳定 `bin` 链接，但 Shell 集成位于用户配置目录；因此每次
-`brew upgrade` 后仍需运行一次幂等的 `aicoach install`。它会更新 Shell 文件并替换正在运行的
-旧 daemon；随后执行 `source ~/.config/aicoach/aicoach.zsh` 或新开终端标签页。源码安装到
-`~/.local/bin` 的行为相同。
+`brew upgrade --fetch-HEAD` 后仍需运行一次幂等的 `aicoach install`。它会更新 Shell 文件并
+替换正在运行的旧 daemon；随后执行 `source ~/.config/aicoach/aicoach.zsh` 或新开终端标签页。
+源码手工安装到 `~/.local/bin` 的行为相同。
 
-测试完可运行 `brew untap BlueKiteCoder/aicoach-dev` 移除临时 tap。首个正式版本发布
-后，将创建 `BlueKiteCoder/homebrew-aicoach`，填入不可变 tag 源码的
-真实 SHA-256（Release 流水线会生成并证明 `aicoach.rb` 资产），再在 Apple Silicon 与
-Intel 上验证安装、升级和卸载；在此之前不把 tap 写成已经可用。完整发布流程见
+首个正式版本发布后，同一个 tap 将改为引用不可变 tag 源码及其真实 SHA-256；Release
+流水线会生成并证明对应 `aicoach.rb` 资产。在签名、公证的 Apple Silicon 与 Intel Release
+以及稳定版本安装、升级和卸载全部验证前，稳定通道仍标记为未完成。完整流程见
 [`docs/RELEASING.md`](docs/RELEASING.md)。
 
 ## 开发、测试与发布
@@ -690,7 +730,7 @@ homebrew/               Formula 模板
 ```
 
 贡献者可以从 [架构与模块边界](docs/ARCHITECTURE.md) 开始，并在修改跨进程消息前阅读
-[IPC Protocol v4](docs/PROTOCOL.md)。两份文档包含本地规则、持久化数据、协议操作和
+[IPC Protocol v5](docs/PROTOCOL.md)。两份文档包含本地规则、持久化数据、协议操作和
 终端适配器的扩展步骤，以及不能被弱化的隐私与执行权约束。
 
 ## 已知限制
@@ -751,7 +791,7 @@ safety warnings, a provider-free preflight Risk Lens, explainable token-level
 Command Patches, local-manual Source Cards, AI-assisted completion, quick
 terminal chat, share-ready privacy-scrubbed Session Capsules, local-only Failure
 Fingerprints, memory-only Session Checkpoints, a provider-free Environment Drift
-Lens, a public-safe local Support Report, live content-free Privacy Receipts, and a standalone
+Lens, a provider-free Twin Terminal Diff, a public-safe local Support Report, live content-free Privacy Receipts, and a standalone
 Ratatui Coach window. A per-session Session Airlock can atomically cancel active AI work and block
 new provider requests while every local diagnostic remains available.
 It never presses Enter or executes an AI suggestion.
@@ -781,6 +821,20 @@ bounded Git metadata. The baseline is memory-only, file contents are not read,
 incomplete Git probes are omitted, and the comparison is never added to an AI
 provider request.
 
+Twin Terminal Diff compares two explicitly captured terminal environments. Mark a known-good
+terminal with `aicoach twin mark --name working`, then run
+`aicoach twin diff --against working` in the failing terminal. It compares bounded local evidence
+such as architecture/Rosetta, Homebrew/Xcode, Python/Conda, Git repository/branch, and fixed command resolution
+without AI calls or executing resolved tools. The installed Zsh integration supplies the calling
+shell architecture/Rosetta state; those fields are omitted when the integration is not loaded.
+Git repository/branch evidence comes only from a non-symlink `.git` directory or bounded regular
+gitfile plus a bounded regular HEAD; a gitfile is used only to locate the target Git directory's
+HEAD (for example, a linked worktree or submodule).
+Directory/file handles do not follow symlinks, and no Git process, repository configuration,
+attributes, hook, or filter is invoked.
+Private environment values are digest-only, and the eight-baseline store disappears when the
+daemon restarts.
+
 Session Checkpoints name one bounded troubleshooting interval and attach a final
 resolution to its Capsule. Checkpoint metadata is terminal-safe, per-session and
 daemon-memory-only; it is removed before completion, analysis, or chat provider
@@ -800,7 +854,22 @@ Lens and other local features available. Opening permits future requests but sen
 The flag is daemon-memory-only; data clearing preserves it, while a deliberate daemon restart means
 newly created sessions start open.
 
-Build and install:
+Install the public HEAD source-build preview:
+
+```zsh
+brew install --HEAD BlueKiteCoder/aicoach/aicoach
+aicoach install
+aicoach onboard
+```
+
+This channel builds the current `main` branch locally. It is not a stable release and does not
+provide signed or notarized release binaries. Homebrew does not change the Zsh integration or
+start the daemon until `aicoach install` is explicitly run. A current Xcode Command Line Tools
+installation matching the installed macOS version is required for the source build. See the public
+[`BlueKiteCoder/homebrew-aicoach`](https://github.com/BlueKiteCoder/homebrew-aicoach) tap for its
+preview contract.
+
+To build manually instead:
 
 ```zsh
 cargo build --release --locked

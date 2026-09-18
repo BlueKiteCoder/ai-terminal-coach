@@ -19,6 +19,7 @@ clap.workspace = true
 crossterm.workspace = true
 dirs.workspace = true
 libc.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 secrecy.workspace = true

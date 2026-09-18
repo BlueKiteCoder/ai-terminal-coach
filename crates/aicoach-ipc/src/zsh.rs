@@ -454,6 +454,9 @@ pub fn encode_message(message: &Message) -> Result<String, ZshProtocolError> {
                     serde_json::to_string(result)
                         .map_err(|_| ZshProtocolError::UnsupportedMessage)?,
                 ],
+                // Twin Terminal snapshots and reports are JSON-only. Never
+                // serialize them into the persistent shell line protocol.
+                ResponseResult::TwinDiff(_) => return Err(ZshProtocolError::UnsupportedMessage),
                 ResponseResult::Pong { .. } => vec!["PONG".to_owned()],
                 ResponseResult::ShutdownAccepted => {
                     vec!["SHUTDOWN".to_owned(), response.request_id.to_string()]
@@ -834,6 +837,21 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(encoded, format!("AIRLOCK\t{session}\t\tfalse\t2"));
+    }
+
+    #[test]
+    fn twin_terminal_responses_are_json_only() {
+        let request = Request::new(None, RequestBody::Ping);
+        let response = crate::protocol::Response::ok(
+            &request,
+            ResponseResult::TwinDiff(Box::new(crate::protocol::TwinDiffResult::List {
+                baselines: Vec::new(),
+            })),
+        );
+        assert_eq!(
+            encode_message(&Message::from(response)),
+            Err(ZshProtocolError::UnsupportedMessage)
+        );
     }
 
     #[test]

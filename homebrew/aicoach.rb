@@ -28,7 +28,11 @@ class Aicoach < Formula
     prefix.install_metafiles
 
     # The script prefers Swift and falls back to Objective-C/AppKit when the
-    # active Swift compiler and SDK do not match.
+    # active Swift compiler and SDK do not match. Homebrew's sandbox permits
+    # the staged build path, not mktemp's per-user default on every macOS.
+    inreplace "scripts/build-macos-helper.sh",
+              "module_cache=$(mktemp -d)",
+              "module_cache=$(mktemp -d \"#{buildpath}/aicoach-hotkey.XXXXXX\")"
     system "scripts/build-macos-helper.sh", bin/"aicoach-hotkey"
   end
 
@@ -37,8 +41,8 @@ class Aicoach < Formula
       After every install or upgrade, refresh the Zsh and LaunchAgent integration with:
         aicoach install
 
-      Store an API key in macOS Keychain (recommended):
-        aicoach config set-key
+      Configure an optional AI provider and Keychain credential:
+        aicoach config setup
 
       Option+Tab invokes AI completion. Option+/ asks about the current
       buffer. Option+Space toggles the Coach window when Option sends Esc.
@@ -46,7 +50,8 @@ class Aicoach < Formula
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/aicoach --version")
+    assert_match(/^aicoach \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/,
+                 shell_output("#{bin}/aicoach --version").strip)
     assert_match ".config/aicoach/config.toml", shell_output("#{bin}/aicoach config path")
   end
 end

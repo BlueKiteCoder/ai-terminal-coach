@@ -7,6 +7,7 @@ mod data;
 mod onboarding;
 mod provider_setup;
 mod support;
+mod twin;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -162,6 +163,8 @@ enum Commands {
     Airlock(AirlockArgs),
     /// Inventory and precisely clear local data without exposing its contents.
     Data(DataArgs),
+    /// Compare this terminal with a known-good terminal environment, locally.
+    Twin(TwinArgs),
     /// Toggle the native Terminal.app/iTerm2 Coach window.
     Toggle(ToggleArgs),
 }
@@ -300,6 +303,38 @@ struct AirlockArgs {
     session: String,
     #[command(subcommand)]
     action: Option<AirlockAction>,
+}
+
+#[derive(Args, Debug)]
+struct TwinArgs {
+    #[command(subcommand)]
+    action: Option<TwinAction>,
+}
+
+#[derive(Subcommand, Debug)]
+enum TwinAction {
+    /// Mark this terminal as a memory-only known-good baseline.
+    Mark {
+        /// Baseline name used by another terminal when comparing.
+        #[arg(long, default_value = "latest")]
+        name: String,
+    },
+    /// Compare this terminal with a previously marked baseline.
+    Diff {
+        /// Baseline name to compare against.
+        #[arg(long = "against", default_value = "latest")]
+        name: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List memory-only baselines without exposing captured values.
+    List(OutputArgs),
+    /// Clear one baseline, or every baseline when no name is supplied.
+    Clear {
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -491,6 +526,7 @@ fn run() -> Result<()> {
         Commands::Checkpoint(args) => checkpoint::run(&paths, &args),
         Commands::Airlock(args) => airlock::run(&paths, &args),
         Commands::Data(args) => data::run(&paths, &args),
+        Commands::Twin(args) => twin::run(&paths, &args),
         Commands::Toggle(args) => toggle(&paths, &args),
     }
 }
@@ -2737,6 +2773,40 @@ mod tests {
             Commands::Airlock(AirlockArgs {
                 action: Some(AirlockAction::Open),
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn twin_commands_parse_named_baselines_and_json_diff() {
+        let mark =
+            Cli::try_parse_from(["aicoach", "twin", "mark", "--name", "known-good"]).unwrap();
+        assert!(matches!(
+            mark.command,
+            Commands::Twin(TwinArgs {
+                action: Some(TwinAction::Mark { ref name })
+            }) if name == "known-good"
+        ));
+        let diff = Cli::try_parse_from([
+            "aicoach",
+            "twin",
+            "diff",
+            "--against",
+            "known-good",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            diff.command,
+            Commands::Twin(TwinArgs {
+                action: Some(TwinAction::Diff { ref name, json: true })
+            }) if name == "known-good"
+        ));
+        let clear = Cli::try_parse_from(["aicoach", "twin", "clear"]).unwrap();
+        assert!(matches!(
+            clear.command,
+            Commands::Twin(TwinArgs {
+                action: Some(TwinAction::Clear { name: None })
             })
         ));
     }

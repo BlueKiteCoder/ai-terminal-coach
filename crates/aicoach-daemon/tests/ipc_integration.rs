@@ -16,6 +16,7 @@ use aicoach_core::{
     AnalysisCategory, AnalysisCoverage, AnalysisInput, AnalysisResult,
     CompletionOperation as CoreCompletionOperation, CompletionResult as CoreCompletionResult,
     FailureMemoryOptions, PrivacyRedactor, RiskLevel, Severity as CoreSeverity,
+    TwinTerminalSnapshot,
 };
 use aicoach_daemon::{Daemon, DaemonOptions};
 use aicoach_ipc::{
@@ -26,6 +27,7 @@ use aicoach_ipc::{
     Event, EventBody, HelloParams, InsertBufferParams, InsertMode, IpcClient, PROTOCOL_VERSION,
     RegisterSessionParams, Request, RequestBody, Response, ResponseOutcome, ResponseResult,
     RiskLensParams, SafetyClassification, SessionCheckpoint, SessionDataSummary, SessionId,
+    TwinDiffOperation, TwinDiffParams, TwinDiffResult,
 };
 use async_trait::async_trait;
 use futures_util::stream;
@@ -404,6 +406,20 @@ async fn data_operation(
     } = response.outcome
     else {
         panic!("expected daemon data response")
+    };
+    *result
+}
+
+async fn twin_diff_operation(client: &IpcClient, operation: TwinDiffOperation) -> TwinDiffResult {
+    let response = client
+        .send_request(None, RequestBody::TwinDiff(TwinDiffParams { operation }))
+        .await
+        .unwrap();
+    let ResponseOutcome::Ok {
+        result: ResponseResult::TwinDiff(result),
+    } = response.outcome
+    else {
+        panic!("expected Twin Terminal response")
     };
     *result
 }
@@ -1595,6 +1611,156 @@ async fn clear_all_transient_clears_live_failure_memory_without_reopening_airloc
     assert!(snapshot.entries.is_empty());
 
     shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn twin_terminal_baselines_are_global_content_free_in_lists_and_transient() {
+    let provider = Arc::new(TestProvider::default());
+    let running = RunningDaemon::start_local_only(Arc::clone(&provider)).await;
+    let shell = IpcClient::connect(&running.socket).await.unwrap();
+    let session = register(&shell, None, "/dev/ttys030").await;
+
+    let mut baseline = TwinTerminalSnapshot::new("/Users/alice/private-project");
+    baseline.shell_architecture = Some("arm64".to_owned());
+    let marked = twin_diff_operation(
+        &shell,
+        TwinDiffOperation::Mark {
+            name: "  known-good  ".to_owned(),
+            snapshot: Box::new(baseline),
+        },
+    )
+    .await;
+    assert_eq!(
+        marked,
+        TwinDiffResult::Marked {
+            name: "known-good".to_owned()
+        }
+    );
+
+    let listed = twin_diff_operation(&shell, TwinDiffOperation::List).await;
+    let TwinDiffResult::List { baselines } = &listed else {
+        panic!("expected baseline list")
+    };
+    assert_eq!(baselines.len(), 1);
+    assert_eq!(baselines[0].name, "known-good");
+    let encoded_list = serde_json::to_string(&listed).unwrap();
+    assert!(!encoded_list.contains("private-project"));
+    assert!(!encoded_list.contains("arm64"));
+    assert!(!encoded_list.contains("snapshot"));
+
+    let mut current = TwinTerminalSnapshot::new("/Users/alice/other-project");
+    current.shell_architecture = Some("x86_64".to_owned());
+    let diff = twin_diff_operation(
+        &shell,
+        TwinDiffOperation::Diff {
+            name: "known-good".to_owned(),
+            current: Box::new(current),
+        },
+    )
+    .await;
+    let TwinDiffResult::Diff { name, report } = diff else {
+        panic!("expected terminal diff")
+    };
+    assert_eq!(name, "known-good");
+    assert_eq!(report.entries.len(), 2);
+
+    let DaemonDataResult::Inventory { twin_baselines, .. } =
+        data_operation(&shell, None, DataOperation::Inventory, false).await
+    else {
+        panic!("expected inventory")
+    };
+    assert_eq!(twin_baselines, 1);
+
+    data_operation(&shell, Some(session), DataOperation::ClearSession, false).await;
+    let TwinDiffResult::List { baselines } =
+        twin_diff_operation(&shell, TwinDiffOperation::List).await
+    else {
+        panic!("expected baseline list")
+    };
+    assert_eq!(baselines.len(), 1);
+
+    let DaemonDataResult::Cleared { removed, .. } =
+        data_operation(&shell, None, DataOperation::ClearAllTransient, false).await
+    else {
+        panic!("expected clear result")
+    };
+    assert_eq!(removed.twin_baselines, 1);
+    let TwinDiffResult::List { baselines } =
+        twin_diff_operation(&shell, TwinDiffOperation::List).await
+    else {
+        panic!("expected baseline list")
+    };
+    assert!(baselines.is_empty());
+    assert_eq!(provider.analysis_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.completion_calls.load(Ordering::SeqCst), 0);
+    assert!(provider.chat_requests.lock().unwrap().is_empty());
+
+    shell.close().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn twin_terminal_rejects_unsafe_and_missing_baseline_names() {
+    let running = RunningDaemon::start_local_only(Arc::new(TestProvider::default())).await;
+    let client = IpcClient::connect(&running.socket).await.unwrap();
+    register(&client, None, "/dev/ttys031").await;
+
+    let invalid = client
+        .send_request(
+            None,
+            RequestBody::TwinDiff(TwinDiffParams {
+                operation: TwinDiffOperation::Mark {
+                    name: "bad\u{1b}[31mname".to_owned(),
+                    snapshot: Box::new(TwinTerminalSnapshot::new("/tmp")),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Error { error } = invalid.outcome else {
+        panic!("expected invalid-name error")
+    };
+    assert_eq!(error.code, "invalid_twin_baseline_name");
+
+    let mut unsafe_snapshot = TwinTerminalSnapshot::new("/tmp");
+    unsafe_snapshot.terminal_program = Some("private-marker\nspoof".to_owned());
+    let invalid = client
+        .send_request(
+            None,
+            RequestBody::TwinDiff(TwinDiffParams {
+                operation: TwinDiffOperation::Mark {
+                    name: "safe-name".to_owned(),
+                    snapshot: Box::new(unsafe_snapshot),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Error { error } = invalid.outcome else {
+        panic!("expected invalid-snapshot error")
+    };
+    assert_eq!(error.code, "invalid_twin_snapshot");
+    assert!(!error.message.contains("private-marker"));
+
+    let missing = client
+        .send_request(
+            None,
+            RequestBody::TwinDiff(TwinDiffParams {
+                operation: TwinDiffOperation::Diff {
+                    name: "missing".to_owned(),
+                    current: Box::new(TwinTerminalSnapshot::new("/tmp")),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let ResponseOutcome::Error { error } = missing.outcome else {
+        panic!("expected missing-baseline error")
+    };
+    assert_eq!(error.code, "twin_baseline_not_found");
+
+    client.close().await.unwrap();
     running.stop().await;
 }
 

@@ -21,6 +21,7 @@ pub mod risk_lens;
 pub mod safety;
 pub mod source_cards;
 pub mod terminal;
+pub mod twin_terminal_diff;
 
 pub use analyzer::{AnalysisCategory, LocalAnalysis, LocalAnalyzer};
 pub use command_patch::{CommandPatch, CommandPatchHunk};
@@ -54,3 +55,8 @@ pub use source_cards::{
     source_queries,
 };
 pub use terminal::strip_terminal_sequences;
+pub use twin_terminal_diff::{
+    SensitiveEnvironmentValue, TwinTerminalCommandSnapshot, TwinTerminalDiffEntry,
+    TwinTerminalDiffField, TwinTerminalDiffKind, TwinTerminalDiffReport, TwinTerminalDiffValue,
+    TwinTerminalGitSnapshot, TwinTerminalSnapshot, compare_twin_terminal_snapshots,
+};
